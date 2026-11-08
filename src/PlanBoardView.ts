@@ -4539,7 +4539,7 @@ class GoalEditModal extends Modal {
 	private simpleCount = 0;
 	private simpleUnit = "个";
 	/** 结构状态：level0 counts 长度 1；level n counts 长度 = 上级叶子数；0 = 未填。 */
-	private levels: { unit: string; counts: number[] }[] = [];
+	private levels: { unit: string; counts: number[]; labels?: string[] }[] = [];
 	/** 当前步骤。 */
 	private step = STEP_INTRO;
 	/** 预览行引用（时间字段变化时局部刷新文本）。 */
@@ -4629,9 +4629,14 @@ class GoalEditModal extends Modal {
 	private cleanLevels(): GoalLevel[] {
 		// 注意 filter 回调第一参是元素、第二参才是下标——levelComplete 需要下标（此前
 		// 误用 bind 直接传元素当索引，导致所有级被判未完成、确认页永远弹回第一步）
+		// ADR-0009: labels 随级保留（长度由引擎按节点数取用，多截少补生成名）
 		return this.levels
 			.filter((lv, li) => this.levelComplete(li))
-			.map((lv) => ({ unit: lv.unit.trim(), counts: [...lv.counts] }));
+			.map((lv) => ({
+				unit: lv.unit.trim(),
+				counts: [...lv.counts],
+				...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
+			}));
 	}
 
 	// ---- 派生显示 -----------------------------------------------------------
@@ -5031,6 +5036,10 @@ class GoalEditModal extends Modal {
 					});
 				};
 				op("✕", "删除该条目（含子级）", () => nodes.splice(i, 1));
+				op("✎", "重命名条目", () => {
+					const v = window.prompt("条目名称（会作为任务名的一部分）", n.label);
+					if (v !== null && v.trim()) n.label = v.trim();
+				});
 				const grand = parentChain[parentChain.length - 1];
 				op(
 					"↑",
@@ -5071,7 +5080,11 @@ class GoalEditModal extends Modal {
 				return;
 			}
 			this.nameValue = this.pickedBook.title || this.nameValue;
-			this.levels = confirmed.levels.map((lv) => ({ unit: lv.unit, counts: [...lv.counts] }));
+			this.levels = confirmed.levels.map((lv) => ({
+				unit: lv.unit,
+				counts: [...lv.counts],
+				...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
+			}));
 			this.readerSid = this.pickedBook.sid;
 			// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
 			this.readerResume = resumeLeafCount(confirmed.leafSpine, this.pickedBook.chapterIndex);
@@ -5695,6 +5708,11 @@ function serializePlans(plans: PlanDef[], dailyByPlan?: Record<string, boolean>)
 					for (const lv of g.structure) {
 						lines.push(`          - unit: ${yamlScalar(lv.unit)}`);
 						lines.push(`            counts: [${lv.counts.join(", ")}]`);
+						// ADR-0009: 真实标题随结构落盘（占位空串保序，引擎按下标取用）
+						if (lv.labels?.length) {
+							lines.push("            labels:");
+							for (const label of lv.labels) lines.push(`              - ${yamlScalar(label)}`);
+						}
 					}
 				}
 			}

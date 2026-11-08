@@ -653,10 +653,17 @@ function readPlanGoals(obj?: Record<string, unknown>): PlanGoal[] {
 				const rawCounts: unknown = obj.counts ?? obj["数目"];
 				if (!unit2 || (rawCounts === undefined || rawCounts === null)) continue;
 				const list = (Array.isArray(rawCounts) ? rawCounts : String(rawCounts).replace(/[[\]]/g, "").split(/[,，\s]+/))
-					.filter((c) => String(c).trim() !== "")
-					.map(toInt)
-					.filter((c) => Number.isFinite(c) && c > 0);
-				if (list.length > 0) levels.push({ unit: unit2, counts: list });
+						.map(toInt)
+						.filter((c) => Number.isFinite(c) && c >= 0);
+				if (list.length > 0) {
+					const level: GoalLevel = { unit: unit2, counts: list };
+					// ADR-0009: 真实标题按位保留（空串占位不剔除，防下标错位）
+					const rawLabels: unknown = obj.labels;
+					if (Array.isArray(rawLabels) && rawLabels.length > 0) {
+						level.labels = rawLabels.map((s) => (typeof s === "string" ? s : String(s ?? "")));
+					}
+					levels.push(level);
+				}
 			}
 			if (levels.length > 0) goal.structure = levels;
 		}

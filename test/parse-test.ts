@@ -725,7 +725,7 @@ check("bridge: leafHref DFS", conv?.leafHref.join("|") === "c1.xhtml#s1|c1.xhtml
 // 对齐不变式：结构展开叶数 = 桥叶序数（推进/跳转映射前提）
 const bridgeLeaves = expandGoalStructure("测试书", conv!.levels);
 check("bridge: alignment invariant (leaves match)", bridgeLeaves.length === conv!.leafSpine.length, `${bridgeLeaves.length} vs ${conv!.leafSpine.length}`);
-check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("第 2 章")));
+check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("第2章 独白")));
 // 接续阅读：读到第 2 章（index 2）→ spine<2 的叶 = 第1节+第2节 = 2
 check("resume: chapter 2 → 2 pre-read", resumeLeafCount(conv!.leafSpine, 2) === 2, resumeLeafCount(conv!.leafSpine, 2));
 check("resume: 0 for unread book", resumeLeafCount(conv!.leafSpine, 0) === 0);
@@ -761,6 +761,54 @@ const defsReader = parsePlansFromFrontmatter(fmReader);
 const readerGoal = defsReader[0]?.goals[0];
 check("readerSid: parsed from frontmatter", readerGoal?.readerSid === "epubsrc-d3aedbaff902c0fb5db47804", readerGoal?.readerSid);
 check("readerSid: absent → undefined", defs1[0]?.goals?.[0]?.readerSid === undefined);
+
+// --- 真实标题进任务名（ADR-0009 labels） -------------------------------------
+const autoOf = (text: string): boolean =>
+	isAutoTask({ text, plan: null, checked: false, start: null, due: null, line: 0, raw: "", file: null as unknown as TFile });
+const labeled = expandGoalStructure("测试书", [
+	{ unit: "章", counts: [2], labels: ["第1章 初见", "第2章 独白"] },
+	{ unit: "节", counts: [2, 0], labels: ["1.1 相遇", "1.2 离别"] },
+]);
+check("labels: 重排叶带章路径前缀", labeled[0]?.name === "测试书（第1章 初见·1.1 相遇）", labeled[0]?.name);
+check("labels: 重排叶2", labeled[1]?.name === "测试书（第1章 初见·1.2 离别）", labeled[1]?.name);
+check("labels: 无节章升格用真实标题", labeled[2]?.name === "测试书（第2章 独白）", labeled[2]?.name);
+check("labels: 组标签用真实标题", labeled[0]?.group === "第1章 初见", labeled[0]?.group);
+check("labels: 非重排叶直接用真实标题", expandGoalStructure("书", [{ unit: "章", counts: [1], labels: ["第一回 石归"] }])[0]?.name === "书（第一回 石归）");
+check("labels: 中文数字后缀识别为自动任务", autoOf("书（第一回 石归）") === true);
+check("labels: 数字后缀识别", autoOf("书（1.1 相遇）") === true);
+check("labels: 带路径后缀识别", autoOf(labeled[0]?.name ?? "") === true);
+check("labels: 手动任务不误判", autoOf("写文章（草稿）") === false);
+check("labels: extractGoalName 剥真实标题后缀", extractGoalName("书（1.1 相遇）") === "书");
+check("labels: 缺 labels 落生成名", expandGoalStructure("书", [{ unit: "章", counts: [2] }])[1]?.name === "书（第 2 章）");
+const convL = weaveTocToStructure(bookTree);
+check("bridge: labels attached per level", convL?.levels[0].labels?.[0] === "第1章 初见" && convL.levels[1].labels?.length === 3, JSON.stringify(convL?.levels[1].labels));
+// YAML round-trip
+const fmLabels = `---
+plans:
+  阅读:
+    type: 数量
+    goals:
+      - name: 测试书
+        count: 3
+        unit: 节
+        structure:
+          - unit: 章
+            counts: [2]
+            labels:
+              - 第1章 初见
+              - 第2章 独白
+          - unit: 节
+            counts: [2, 0]
+            labels:
+              - 1.1 相遇
+              - 1.2 离别
+---
+`;
+const defsLabels = parsePlansFromFrontmatter(fmLabels);
+check("labels: YAML round-trip level0", defsLabels[0]?.goals[0]?.structure?.[0]?.labels?.[0] === "第1章 初见", JSON.stringify(defsLabels[0]?.goals[0]?.structure?.[0]?.labels));
+check("labels: YAML round-trip level1 len 2", defsLabels[0]?.goals[0]?.structure?.[1]?.labels?.length === 2);
+const rl = expandGoalStructure("测试书", defsLabels[0]!.goals[0]!.structure!);
+check("labels: round-trip 命名稳定", rl[0]?.name === "测试书（第1章 初见·1.1 相遇）", rl[0]?.name);
 
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

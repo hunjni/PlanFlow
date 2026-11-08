@@ -235,21 +235,25 @@ export interface AutoTaskPlan {
 
 export const DAY_MS = 86400000;
 
-/** 自动任务名尾部「（第<数字>…）」后缀（分解任务的通配形态，ADR-0005 v2）。 */
-const AUTO_TASK_SUFFIX_RE = /（第\s*\d+[^）]*）$/;
+/**
+ * 自动任务名尾部「（<编号>…）」后缀（分解任务的通配形态，ADR-0005 v2；ADR-0009 扩展：
+ * 真实目录标题进任务名后，编号除「第 N」外还可能是纯数字（1.1）或中文数字（第三回））。
+ */
+const AUTO_TASK_SUFFIX_RE = /（(?:第\s*)?[0-9一二三四五六七八九十百千][^）]*）$/;
 
 /**
- * 通用自动任务名识别：以「（第<数字>…）」后缀结尾即视为分解任务（ADR-0005 v2：
- * 覆盖任意单位词与多级路径，含自定义单位；误判手动任务只会让删除多打一条墓碑，无副作用）。
+ * 通用自动任务名识别：以编号后缀结尾即视为分解任务（ADR-0005 v2：覆盖任意单位词
+ * 与多级路径，含自定义单位；ADR-0009 起兼容真实目录标题后缀；误判手动任务只会让
+ * 删除多打一条墓碑，无副作用）。
  */
 export function isAutoTask(task: PoolTask): boolean {
 	return AUTO_TASK_SUFFIX_RE.test(task.text.trim());
 }
 
 /**
- * ADR-0008: 从任务文本提取目标（书）名——剥掉尾部「（第…）」后缀。
- * 无后缀或前缀为空（如裸「（第 3 篇）」）返回 null，即识别不到所属目标；
- * 识别不到的任务不进书组（今日级联里平铺在顶部）。
+ * ADR-0008: 从任务文本提取目标（书）名——剥掉尾部「（…）」编号后缀（ADR-0009 扩展
+ * 兼容真实标题后缀）。无后缀或前缀为空（如裸「（第 3 篇）」）返回 null，
+ * 即识别不到所属目标；识别不到的任务不进书组（今日级联里平铺在顶部）。
  */
 export function extractGoalName(text: string): string | null {
 	const trimmed = text.trim();
@@ -320,7 +324,7 @@ export function groupPoolTasksByGoal(tasks: PoolTask[], today: string): { groups
  * 全书连续编号（第 2 篇的章是第 3、4、5 章）。
  */
 
-/** 多级结构的一级定义：单位词 + 该级各节点数目。 */
+/** 多级结构的一级定义：单位词 + 该级各节点数目（+ 可选真实标题）。 */
 export interface GoalLevel {
 	/** 单位词（部/编/卷/辑/篇/单元/模块/章/回/课/讲/集/幕/场/节/小节/目/条…，可自定义任意短词）。 */
 	unit: string;
@@ -329,6 +333,12 @@ export interface GoalLevel {
 	 * （长度 = 上一级节点总数）。
 	 */
 	counts: number[];
+	/**
+	 * ADR-0009: 该级各节点真实标题（目录提取/确认页编辑），DFS 序（长度 = 该级节点
+	 * 总数 = Σ counts）。非空节点任务名用真实标题（重排型叶带上级路径前缀保唯一），
+	 * 缺失/空串落回「第 X {unit}」生成名。展示语义，不影响进度口径。
+	 */
+	labels?: string[];
 }
 
 /** 一个分级单位的定义：词 + 默认编号方式。 */
@@ -435,6 +445,9 @@ interface StructureWrapper {
  * 返回空数组表示结构非法（级数/数目不合法）。
  * 某节点的子数目为 0（如第 5 章没有节）时，该节点本身成为叶子——任务即「第 5 章」
  * （变深树：叶出现在不同层级，勾选粒度逐节点自适应）。
+ * ADR-0009: labels 提供真实目录标题时节点用它命名——非重排型叶（章/回…全书连续
+ * 编号）直接用真实标题；重排型叶（节/场…每上级重排，裸标题会跨章撞名）带
+ * 「{汇总组路径}·{真实标题}」前缀保唯一；缺失/空串落回「第 X {unit}」生成名。
  */
 export function expandGoalStructure(goalName: string, levels: GoalLevel[]): GoalLeaf[] {
 	const clean = (v: unknown): number => {
@@ -442,6 +455,9 @@ export function expandGoalStructure(goalName: string, levels: GoalLevel[]): Goal
 		return Number.isFinite(n) && n >= 0 ? n : 0;
 	};
 	if (!Array.isArray(levels) || levels.length === 0 || levels.length > 8) return [];
+
+	// ADR-0009: 真实标题按级取用（DFS 序 = 节点创建序；缺失/空串回退生成名）
+	const labelAt = (li: number, g: number): string => String(levels[li]?.labels?.[g - 1] ?? "").trim();
 
 	let level: StructureWrapper[] = [];
 	let roots: StructureWrapper[] = [];
@@ -457,7 +473,7 @@ export function expandGoalStructure(goalName: string, levels: GoalLevel[]): Goal
 			for (let i = 1; i <= n; i++) {
 				g++;
 				next.push({
-					node: { label: `第 ${i} ${unit}`, unit, restart, parentLabel: null, parentRestart: false, global: g },
+					node: { label: labelAt(0, g) || `第 ${i} ${unit}`, unit, restart, parentLabel: null, parentRestart: false, global: g },
 					children: [],
 					parent: null,
 				});
@@ -473,7 +489,7 @@ export function expandGoalStructure(goalName: string, levels: GoalLevel[]): Goal
 					const num = restart ? c : g;
 					next.push({
 						node: {
-							label: `第 ${num} ${unit}`,
+							label: labelAt(li, g) || `第 ${num} ${unit}`,
 							unit,
 							restart,
 							parentLabel: parent.label,
@@ -499,7 +515,7 @@ export function expandGoalStructure(goalName: string, levels: GoalLevel[]): Goal
 	/**
 	 * 路径式标签：从 w 沿上级链收集连续重排标签，锚定最近的全书连续级（或根）。
 	 * 章→节→小节：第X章第Y节第Z小节，与书内 1.2.1 式目录一致；章→节：第X章第Y节；
-	 * 全局型节点：自身全局标签（第X章/第X篇）。
+	 * 全局型节点：自身全局标签（第X章/第X篇）。节点有真实标题时链上各段即真实标题。
 	 */
 	const pathSuffix = (w: StructureWrapper): string => {
 		if (!w.node.restart) return w.node.label;
@@ -515,10 +531,24 @@ export function expandGoalStructure(goalName: string, levels: GoalLevel[]): Goal
 	const visit = (w: StructureWrapper, depth: number, rollup: StructureWrapper | null): void => {
 		const rollupAncestor = depth === rollupIdx ? w : rollup;
 		if (depth === lastIdx || w.children.length === 0) {
+			// ADR-0009 叶命名：真实标题优先；重排型叶（节/场…）裸标题跨章撞名 →
+			// 带汇总组路径前缀（第1章 初见·第一节 相遇）；其余落回生成路径
+			const realLabel = labelAt(depth, w.node.global);
+			let suffix: string;
+			if (realLabel) {
+				if (!w.node.restart) {
+					suffix = realLabel;
+				} else {
+					const roll = rollupAncestor && rollupAncestor !== w ? pathSuffix(rollupAncestor) : "";
+					suffix = roll ? `${roll}·${realLabel}` : realLabel;
+				}
+			} else {
+				suffix = pathSuffix(w);
+			}
 			// 组标签用路径式：节的编号每章重排，裸标签「第 1 节」会跨章撞名
 			// 升格节点（非末级）无 rollup 祖先时以自身路径为组——进度里能看到「第 2 卷 1/1」这类行
 			leaves.push({
-				name: `${goalName}（${pathSuffix(w)}）`,
+				name: `${goalName}（${suffix}）`,
 				index: leaves.length + 1,
 				group: rollupAncestor ? pathSuffix(rollupAncestor) : depth !== lastIdx ? pathSuffix(w) : "",
 			});

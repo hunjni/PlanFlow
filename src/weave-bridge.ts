@@ -89,7 +89,7 @@ export function getWeaveBridge(app: App, enabled: boolean): WeaveBridgeApi | nul
 // 目录树 → 多级结构（纯转换；ADR-0009 桥导入的落点 = GoalLevel[]，下游全复用）
 // ---------------------------------------------------------------------------
 
-/** 目录树转换结果：结构 + 与展开叶子序对齐的锚点（同下标即同一叶）。 */
+/** 目录树转换结果：结构（含真实标题 labels）+ 与展开叶子序对齐的锚点（同下标即同一叶）。 */
 export interface WeaveTocStructure {
 	levels: GoalLevel[];
 	/** DFS 叶序锚点：leafSpine 章序（推进判定）+ leafHref 章内锚点（跳转）。 */
@@ -100,7 +100,8 @@ export interface WeaveTocStructure {
 /**
  * 目录树转多级结构。层级形状 = 每层节点子数目（允许 0 = 无下级内容的节点本身
  * 成为叶子，与手填层级同一语义）；单位词 = 该层标签里最高频的单位词
- * （「第3章」→ 章，Q10），提取不到落 toc.ts 默认链。
+ * （「第3章」→ 章，Q10），提取不到落 toc.ts 默认链；真实标题按层收进 labels
+ * （DFS 序，随结构落盘进任务名）。
  * 返回 null = 一级条目都没有（空目录 / 非法树）。
  */
 export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStructure | null {
@@ -117,6 +118,17 @@ export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStruct
 		}
 	};
 	walkFreq(tree, 0);
+
+	// 每层真实标题（DFS 先序 = 引擎节点创建序）
+	const labelRows: string[][] = [];
+	const walkLabels = (nodes: WeaveTocNode[], depth: number): void => {
+		for (const n of nodes) {
+			while (labelRows.length <= depth) labelRows.push([]);
+			labelRows[depth].push(n.label || "");
+			walkLabels(n.children, depth + 1);
+		}
+	};
+	walkLabels(tree, 0);
 
 	const depth0 = freq.length;
 	if (depth0 === 0 || depth0 > 8) return null;
@@ -156,6 +168,10 @@ export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStruct
 			for (const c of n.children) visit(c, depth + 1);
 		};
 		for (const n of tree) visit(n, 0);
+	}
+	// labels 挂到各级（全空层级不挂，序列化保持紧凑）
+	for (let lv = 0; lv < levels.length; lv++) {
+		if (labelRows[lv]?.some((l) => l.trim() !== "")) levels[lv].labels = labelRows[lv];
 	}
 
 	if (levels[0].counts[0] <= 0) return null;
