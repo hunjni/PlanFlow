@@ -286,6 +286,92 @@
 	word-break: break-word;
 }
 
+/* ADR-0003: 今日打卡下一级子任务（任务池任务嵌套展示） */
+.planboard-check-item.has-sublist {
+	flex-wrap: wrap;
+}
+
+.planboard-check-item .planboard-sublist {
+	flex-basis: 100%;
+	list-style: none;
+	margin: 2px 0 0;
+	padding: 0 0 0 26px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.planboard-subitem {
+	padding: 3px 4px;
+	border-radius: 4px;
+}
+
+.planboard-subitem:hover {
+	background: var(--background-modifier-hover);
+}
+
+.planboard-subitem .planboard-check-text {
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.planboard-subcheckbox {
+	width: 13px;
+	height: 13px;
+}
+
+.planboard-subitem.is-checked .planboard-check-text {
+	color: var(--text-faint);
+	text-decoration: line-through;
+}
+
+/* ADR-0008: 今日级联按书分组 —— 书行 + 组内叶子 + 父行今日书进度 */
+.planboard-bookitem {
+	padding: 3px 4px;
+	border-radius: 6px;
+}
+
+.planboard-bookitem > .planboard-check-label {
+	cursor: pointer;
+}
+
+.planboard-bookitem .planboard-bookname {
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text-muted);
+}
+
+.planboard-bookitem.is-done .planboard-bookname {
+	color: var(--text-faint);
+}
+
+.planboard-bookitem.is-done .planboard-subcheckbox {
+	opacity: 0.7;
+}
+
+/* 完成书行的展开指示：点击展开今日已勾叶（反悔路径） */
+.planboard-bookitem.is-expandable .planboard-bookname::after {
+	content: "▸";
+	margin-left: 6px;
+	font-size: 10px;
+	opacity: 0.5;
+}
+
+.planboard-bookitem.is-expandable.is-expanded .planboard-bookname::after {
+	content: "▾";
+}
+
+/* 父行右侧「N/M 本」今日书进度 */
+.planboard-book-fraction {
+	flex-shrink: 0;
+	font-size: 11px;
+	font-weight: 600;
+	padding: 1px 8px;
+	border-radius: 999px;
+	color: var(--text-muted);
+	background: var(--background-modifier-hover);
+}
+
 .planboard-check-item.is-checked .planboard-check-text {
 	color: var(--text-faint);
 	text-decoration: line-through;
@@ -797,6 +883,38 @@
 	width: 100%;
 }
 
+/* v1.7.5: 总结卡底部按钮排——「写入备注」+「写复盘」并排各占一半 */
+.planboard-summary-actions {
+	display: flex;
+	gap: 8px;
+	margin-top: 10px;
+}
+
+.planboard-summary-actions .planboard-btn {
+	flex: 1;
+	width: auto;
+	margin-top: 0;
+}
+
+/* ADR-0004 扩展三: 写复盘弹窗多行输入 */
+.planboard-review-input {
+	width: 100%;
+	min-height: 160px;
+	resize: vertical;
+	padding: 8px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-primary);
+	color: var(--text-normal);
+	font-size: 13px;
+	line-height: 1.6;
+}
+
+.planboard-review-input:focus {
+	border-color: var(--interactive-accent);
+	outline: none;
+}
+
 .planboard-task-number--inline .planboard-badge {
 	margin-left: 0;
 }
@@ -1213,6 +1331,48 @@
 	border-color: var(--plan-gantt-border, #8ab4d8);
 }
 
+/* ADR-0005 v3: 结构型目标聚合行 */
+.planboard-gantt-row.is-group {
+	cursor: pointer;
+}
+
+.planboard-gantt-row.is-group:hover .planboard-gantt-label {
+	color: var(--text-normal);
+}
+
+.planboard-gantt-row.is-child .planboard-gantt-label {
+	padding-left: 16px;
+	font-weight: 400;
+	opacity: 0.92;
+}
+
+.planboard-gantt-count {
+	font-weight: 400;
+	font-size: 11px;
+	color: var(--text-muted);
+}
+
+.planboard-gantt-bar.is-group {
+	overflow: hidden;
+}
+
+/* 组条内的逐叶刻度：已完成实心、未完成半透明 */
+.planboard-gantt-tick {
+	position: absolute;
+	top: 12%;
+	bottom: 12%;
+	border-radius: 2px;
+	pointer-events: none;
+}
+
+.planboard-gantt-tick.is-done {
+	background: rgba(255, 255, 255, 0.95);
+}
+
+.planboard-gantt-tick.is-open {
+	background: rgba(255, 255, 255, 0.35);
+}
+
 .planboard-gantt-bar.is-done {
 	opacity: 0.5;
 }
@@ -1555,6 +1715,200 @@
 	font-size: 12px;
 	color: var(--text-muted);
 	padding-left: 2px;
+}
+
+/* ========== ADR-0005 章节型目标 ========== */
+/* 年度卡：目标块 = 目标行 + 可选章级进度区 */
+.planboard-goal-block {
+	min-width: 0;
+}
+
+/* 章级迷你进度：每章一行（章名 + 迷你条 + x/y） */
+.planboard-goal-chapters {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 2px 2px 6px;
+}
+
+.planboard-goal-chapter {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 1px 4px;
+	border-radius: 6px;
+}
+
+.planboard-goal-chapter--current {
+	background: var(--background-modifier-hover);
+}
+
+.planboard-goal-chapter--current .planboard-goal-chapter-name {
+	color: var(--text-normal);
+	font-weight: 600;
+}
+
+.planboard-goal-chapter--done .planboard-goal-chapter-name {
+	color: var(--text-faint);
+}
+
+.planboard-goal-chapter-name {
+	font-size: 12px;
+	color: var(--text-muted);
+	white-space: nowrap;
+	min-width: 3.5em;
+}
+
+.planboard-goal-chapter .planboard-goal-bar {
+	flex: 1;
+	height: 4px;
+	min-width: 0;
+}
+
+.planboard-goal-chapter-count {
+	font-size: 11px;
+	color: var(--text-muted);
+	white-space: nowrap;
+	min-width: 3em;
+	text-align: right;
+}
+
+/* 章数 > 12：折叠为紧凑单行 */
+.planboard-goal-chapters--compact {
+	flex-direction: row;
+	flex-wrap: wrap;
+	gap: 4px 10px;
+	font-size: 12px;
+	color: var(--text-muted);
+	padding-bottom: 6px;
+}
+
+/* 目标弹窗：每章节数输入区 + 实时预览 */
+.planboard-chapters-box {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 12px;
+	padding: 2px 0 8px;
+}
+
+.planboard-chapter-field {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.planboard-chapter-field input {
+	width: 3.2em;
+}
+
+.planboard-goal-preview {
+	font-size: 12px;
+	color: var(--text-muted);
+	padding: 0 0 6px;
+}
+
+/* ADR-0005 v2 分级结构构建区 */
+.planboard-struct-box {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 4px 0 10px;
+}
+
+.planboard-struct-level {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 8px 10px;
+	background: var(--background-secondary);
+}
+
+.planboard-struct-level-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 6px;
+}
+
+.planboard-struct-level-title {
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.planboard-struct-unit {
+	min-width: 6em;
+}
+
+.planboard-struct-unit-custom {
+	width: 8em;
+}
+
+.planboard-struct-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+.planboard-struct-actions .planboard-btn {
+	font-size: 12px;
+	padding: 4px 10px;
+}
+
+/* 确认页的总节数大字（先看总量，再安排天数） */
+.planboard-struct-total {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	margin-bottom: 4px;
+}
+
+.planboard-struct-total-num {
+	font-size: 18px;
+	font-weight: 700;
+	color: var(--text-normal);
+}
+
+/* ADR-0005 v2 分步向导步骤条 */
+.planboard-wizard-steps {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 6px;
+	margin: 2px 0 12px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.planboard-wizard-step {
+	white-space: nowrap;
+	padding: 2px 8px;
+	border-radius: 999px;
+	border: 1px solid transparent;
+}
+
+.planboard-wizard-step--link {
+	cursor: pointer;
+	border-color: var(--background-modifier-border);
+}
+
+.planboard-wizard-step--link:hover {
+	background: var(--background-modifier-hover);
+}
+
+.planboard-wizard-step--current {
+	color: var(--text-normal);
+	font-weight: 600;
+	background: var(--background-modifier-hover);
+	border-color: var(--background-modifier-border);
+}
+
+/* 步骤间分隔点 */
+.planboard-wizard-step + .planboard-wizard-step::before {
+	content: "";
 }
 
 /* ========== v1.3 子标签栏（甘特/看板共用） ========== */
@@ -2314,3 +2668,116 @@
 .planflow-flip-fast { transition: transform 0.15s ease; }
 .planflow-flip-med { transition: transform 0.18s ease; }
 .planflow-flip-slow { transition: transform 0.2s ease; }
+
+/* ---------------------------------------------------------------------------
+   Quota plans (ADR-0001 日定额型)
+--------------------------------------------------------------------------- */
+.planboard-quota-behind {
+	color: #ef4444;
+}
+.planboard-quota-behind-fill {
+	background: linear-gradient(90deg, #f97316, #ef4444) !important;
+}
+.planboard-quota-meta {
+	font-size: 12px;
+	color: var(--text-muted);
+	margin-top: 2px;
+}
+.planboard-quota-modal-hint {
+	font-size: 12px;
+	color: var(--text-muted);
+	margin-bottom: 12px;
+	line-height: 1.5;
+}
+.planboard-quota-actual-input {
+	width: 100%;
+	padding: 6px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-primary);
+	color: var(--text-normal);
+	font-size: 14px;
+	margin-bottom: 4px;
+}
+.planboard-quota-actual-input:focus {
+	border-color: var(--interactive-accent);
+	outline: none;
+}
+
+/* ===========================================================================
+ * ADR-0006: 目标模式——模式选择卡片 / 模式徽章 / 目录粘贴
+ * =========================================================================== */
+
+/* 向导第一步：模式选择卡片（2×3 网格按钮） */
+.planboard-mode-cards {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 10px;
+	margin: 10px 0 14px;
+}
+.planboard-mode-card {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
+	padding: 12px 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	background: var(--background-secondary);
+	cursor: pointer;
+	text-align: left;
+	box-shadow: none;
+	min-height: 76px;
+	transition: border-color 120ms ease, background-color 120ms ease;
+}
+.planboard-mode-card:hover {
+	border-color: var(--interactive-accent);
+	background: var(--background-secondary-alt);
+}
+.planboard-mode-card-emoji {
+	font-size: 22px;
+	line-height: 1;
+}
+.planboard-mode-card-label {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+.planboard-mode-card-desc {
+	font-size: 12px;
+	color: var(--text-muted);
+	line-height: 1.4;
+}
+
+/* 年度目标行的模式徽章（📖/🔁/📝/🏃） */
+.planboard-goal-mode-badge {
+	flex: none;
+	font-size: 13px;
+	line-height: 1;
+	opacity: 0.9;
+}
+.planboard-goal-row--mini .planboard-goal-name {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+/* 模式目标的补充指标行（连续天数/覆盖率/累计量） */
+.planboard-goal-mode-meta {
+	font-size: 12px;
+	color: var(--text-muted);
+	margin: 2px 0 0 2px;
+}
+
+/* 目录粘贴输入 */
+.planboard-toc-input {
+	font-family: var(--font-monospace);
+	font-size: 12.5px;
+	resize: vertical;
+	min-height: 160px;
+	width: 100%;
+}
+.planboard-toc-preview {
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+

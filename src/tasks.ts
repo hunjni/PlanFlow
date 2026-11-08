@@ -1,5 +1,6 @@
 import { App, Notice, TFile, TFolder } from "obsidian";
-import { TASK_LINE_RE, parseDateString, removeLine, toggleTaskLine, weekRange } from "./daily";
+import { TASK_LINE_RE, dayCount, parseDateString, removeLine, toggleTaskLine, weekRange } from "./daily";
+import { yearDirName } from "./paths";
 
 /**
  * Task pool (`{root}/{year}/任务.md`) — PRD §0, DEV.md M2.
@@ -41,7 +42,7 @@ export interface NewTaskInput {
 /** Path of the task pool file for a given year. */
 export function poolPath(rootPath: string, year: string): string {
 	const root = rootPath.replace(/\/+$/, "");
-	return `${root}/${year}/任务.md`;
+	return `${root}/${yearDirName(year)}/任务.md`;
 }
 
 /** Parse a task pool file's content into tasks. */
@@ -209,6 +210,13 @@ export interface AutoGoal {
 	/** Optional custom window (defaults to the plan period). */
 	start?: string;
 	end?: string;
+	/**
+	 * ADR-0005 章节型（兼容）：逐章节数（下标 0 = 第 1 章）。非空时按章节序列
+	 * 「{name}（第 X 章第 Y 节）」分解，count 恒等于 Σ chapters。
+	 */
+	chapters?: number[];
+	/** ADR-0005 v2 多级结构：篇→章→节 等任意 1~3 级单位树（优先于 chapters）。 */
+	structure?: GoalLevel[];
 }
 
 /** A quantity-type plan eligible for auto task generation. */
@@ -225,8 +233,359 @@ export interface AutoTaskPlan {
 
 export const DAY_MS = 86400000;
 
-/** Counter nouns accepted in auto task names («label（第 N 篇）»). */
-const AUTO_UNIT_RE = /（第\s*(\d+)\s*(?:篇|本|条|个|部|期|集|次|份|张|幅|门|天)）$/;
+/** 自动任务名尾部「（第<数字>…）」后缀（分解任务的通配形态，ADR-0005 v2）。 */
+const AUTO_TASK_SUFFIX_RE = /（第\s*\d+[^）]*）$/;
+
+/**
+ * 通用自动任务名识别：以「（第<数字>…）」后缀结尾即视为分解任务（ADR-0005 v2：
+ * 覆盖任意单位词与多级路径，含自定义单位；误判手动任务只会让删除多打一条墓碑，无副作用）。
+ */
+export function isAutoTask(task: PoolTask): boolean {
+	return AUTO_TASK_SUFFIX_RE.test(task.text.trim());
+}
+
+/**
+ * ADR-0008: 从任务文本提取目标（书）名——剥掉尾部「（第…）」后缀。
+ * 无后缀或前缀为空（如裸「（第 3 篇）」）返回 null，即识别不到所属目标；
+ * 识别不到的任务不进书组（今日级联里平铺在顶部）。
+ */
+export function extractGoalName(text: string): string | null {
+	const trimmed = text.trim();
+	const m = AUTO_TASK_SUFFIX_RE.exec(trimmed);
+	if (!m) return null;
+	const name = trimmed.slice(0, m.index).trim();
+	return name || null;
+}
+
+/** ADR-0008: 今日级联按书（目标）分组的一个书组。 */
+export interface BookGroup {
+	/** 目标（书）名（任务名前缀）。 */
+	name: string;
+	/** 该书全部任务（含已勾，任务池口径）。 */
+	tasks: PoolTask[];
+	/** 该做还没做的叶（未勾且 🛫 ≤ today，无 🛫 用 📅 兜底——与 pendingPoolChildren 同口径）。 */
+	pending: PoolTask[];
+	/** 今日份额中已勾的叶（阅读窗口覆盖今天且已勾）——展开已勾书行逐叶退钩用。 */
+	todayDone: PoolTask[];
+	/** 今日有安排 = 阅读窗口覆盖今天（🛫 ≤ today ≤ 📅，含预读已勾）或挂逾期欠账（pending 非空）。 */
+	scheduled: boolean;
+}
+
+/**
+ * ADR-0008: 把某计划的今日级联任务按目标（书）分组。分组键 = 任务名前缀
+ * （extractGoalName）；识别不到目标名的任务原样返回（ungrouped），由调用方平铺。
+ * 书序 = 传入顺序 = 任务池文件顺序（Map 插入序）。
+ * 分母口径：scheduled = 阅读窗口覆盖今天（🛫 ≤ today ≤ 📅，跨日窗口起读当天即计入）
+ * 或有逾期欠账；窗口未开始、已读完的书 scheduled = false，不进「今日书进度」分母。
+ */
+export function groupPoolTasksByGoal(tasks: PoolTask[], today: string): { groups: BookGroup[]; ungrouped: PoolTask[] } {
+	const byName = new Map<string, PoolTask[]>();
+	const ungrouped: PoolTask[] = [];
+	for (const t of tasks) {
+		const name = extractGoalName(t.text);
+		if (!name) {
+			ungrouped.push(t);
+			continue;
+		}
+		const bucket = byName.get(name);
+		if (bucket) bucket.push(t);
+		else byName.set(name, [t]);
+	}
+	// 「今天的叶」= 窗口 [🛫, 📅] 覆盖今天。只看 📅 = today 会漏掉跨日窗口的叶
+	// （🛫 = 今天、📅 = 明天的叶起读当天就勾了，也必须计作今日安排/今日完成）。
+	const coversToday = (t: PoolTask): boolean => {
+		const s = t.start ?? t.due;
+		const d = t.due ?? t.start;
+		return !!s && !!d && s <= today && today <= d;
+	};
+	const groups: BookGroup[] = [];
+	for (const [name, groupTasks] of byName) {
+		const pending = groupTasks.filter((t) => {
+			if (t.checked) return false;
+			const effStart = t.start ?? t.due;
+			return !!effStart && effStart <= today;
+		});
+		const todayDone = groupTasks.filter((t) => t.checked && coversToday(t));
+		const scheduled = pending.length > 0 || groupTasks.some(coversToday);
+		groups.push({ name, tasks: groupTasks, pending, todayDone, scheduled });
+	}
+	return { groups, ungrouped };
+}
+
+/**
+ * ADR-0005 v2 多级结构：部→卷→篇→章→节 之类的任意 1~8 级单位树，叶子 = 逐日可勾选任务。
+ * 编号按真书惯例：重排型单位（节/讲/课/回）每上级从 1 重新编号；其余单位（篇/卷/部/章…）
+ * 全书连续编号（第 2 篇的章是第 3、4、5 章）。
+ */
+
+/** 多级结构的一级定义：单位词 + 该级各节点数目。 */
+export interface GoalLevel {
+	/** 单位词（部/编/卷/辑/篇/单元/模块/章/回/课/讲/集/幕/场/节/小节/目/条…，可自定义任意短词）。 */
+	unit: string;
+	/**
+	 * 该级各节点数目，按全书顺序：level 0 = [总数]；level n = 每个上级节点的子数目
+	 * （长度 = 上一级节点总数）。
+	 */
+	counts: number[];
+}
+
+/** 一个分级单位的定义：词 + 默认编号方式。 */
+export interface UnitDef {
+	/** 单位词。 */
+	word: string;
+	/** true = 编号每上级从 1 重排（如：节每章重排、场每幕重排）；false = 全书连续（如：章跨篇连续）。 */
+	restart: boolean;
+}
+
+/**
+ * 分级单位词表（ADR-0005 v3，按真实书籍层级从大到小排序）：
+ * 现代/学术书 部/编→卷→篇→章→节→小节/目；古籍 篇/卷/回；教材 单元→课/讲；戏剧 幕→场；影音 集；法规 条。
+ */
+export const STRUCT_UNITS: UnitDef[] = [
+	{ word: "部", restart: false },
+	{ word: "编", restart: false },
+	{ word: "卷", restart: false },
+	{ word: "辑", restart: false },
+	{ word: "篇", restart: false },
+	{ word: "单元", restart: false },
+	{ word: "模块", restart: false },
+	{ word: "章", restart: false },
+	{ word: "回", restart: false },
+	{ word: "课", restart: false },
+	{ word: "讲", restart: false },
+	{ word: "集", restart: false },
+	{ word: "幕", restart: false },
+	{ word: "场", restart: true },
+	{ word: "节", restart: true },
+	{ word: "小节", restart: true },
+	{ word: "目", restart: true },
+	{ word: "条", restart: true },
+];
+
+/** 重排型单位集合（编号在每上级内从 1 重新开始）。 */
+const RESTART_UNITS = new Set(STRUCT_UNITS.filter((u) => u.restart).map((u) => u.word));
+
+/** 常见层级接续（用于向导里下一级单位的智能推荐，取第一项为默认建议）。 */
+const UNIT_SUCCESSORS: Record<string, string[]> = {
+	部: ["卷", "篇"],
+	编: ["章", "篇"],
+	卷: ["篇", "章"],
+	辑: ["篇", "章"],
+	篇: ["章", "单元"],
+	单元: ["课", "讲"],
+	模块: ["单元", "课"],
+	章: ["节", "讲"],
+	回: ["节"],
+	课: ["节", "讲"],
+	讲: ["节"],
+	集: ["讲", "节"],
+	幕: ["场"],
+	场: ["节"],
+	节: ["小节", "目"],
+	小节: ["目"],
+	目: ["条"],
+	条: [],
+};
+
+/** 下一级单位推荐：按真实书籍层级惯例给出接续词；未知词默认「节」。 */
+export function suggestNextUnit(prevUnit: string): string {
+	const list = UNIT_SUCCESSORS[prevUnit.trim()];
+	return list?.[0] ?? "节";
+}
+
+/** 单位默认编号方式：true = 每上级从 1 重排（节/场/目…）；false = 全书连续（部/卷/篇/章/回/课/讲…）。未知词按连续处理。 */
+export function isRestartUnit(word: string): boolean {
+	return RESTART_UNITS.has(word.trim());
+}
+
+/** 展开后的叶子（= 一个可勾选任务）。 */
+export interface GoalLeaf {
+	/** 完整任务文本「{goalName}（第 X 章第 Y 节）」等。 */
+	name: string;
+	/** 全书 1-based 顺序（均匀分日键）。 */
+	index: number;
+	/** 进度汇总组标签（倒数第二级节点显示名；单级结构为空串）。 */
+	group: string;
+}
+
+interface StructureNode {
+	label: string;
+	/** 自身单位词。 */
+	unit: string;
+	/** 自身单位是否重排型。 */
+	restart: boolean;
+	/** 上级显示名（level 0 为 null）。 */
+	parentLabel: string | null;
+	parentRestart: boolean;
+	/** 本级全局序号。 */
+	global: number;
+}
+
+interface StructureWrapper {
+	node: StructureNode;
+	children: StructureWrapper[];
+	/** 上级 wrapper（level 0 为 null）——重排叶名沿链收集用。 */
+	parent: StructureWrapper | null;
+}
+
+/**
+ * 展开多级结构为叶子序列（书序 = DFS 序）。
+ * 返回空数组表示结构非法（级数/数目不合法）。
+ * 某节点的子数目为 0（如第 5 章没有节）时，该节点本身成为叶子——任务即「第 5 章」
+ * （变深树：叶出现在不同层级，勾选粒度逐节点自适应）。
+ */
+export function expandGoalStructure(goalName: string, levels: GoalLevel[]): GoalLeaf[] {
+	const clean = (v: unknown): number => {
+		const n = typeof v === "number" ? Math.floor(v) : parseInt(String(v), 10);
+		return Number.isFinite(n) && n >= 0 ? n : 0;
+	};
+	if (!Array.isArray(levels) || levels.length === 0 || levels.length > 8) return [];
+
+	let level: StructureWrapper[] = [];
+	let roots: StructureWrapper[] = [];
+	for (let li = 0; li < levels.length; li++) {
+		const unit = String(levels[li]?.unit ?? "").trim();
+		if (!unit) return [];
+		const restart = RESTART_UNITS.has(unit);
+		const next: StructureWrapper[] = [];
+		let g = 0;
+		if (li === 0) {
+			const n = clean(levels[0].counts?.[0]);
+			if (n <= 0) return [];
+			for (let i = 1; i <= n; i++) {
+				g++;
+				next.push({
+					node: { label: `第 ${i} ${unit}`, unit, restart, parentLabel: null, parentRestart: false, global: g },
+					children: [],
+					parent: null,
+				});
+			}
+		} else {
+			const counts = levels[li].counts;
+			if (!Array.isArray(counts) || counts.length < level.length) return [];
+			for (let pi = 0; pi < level.length; pi++) {
+				const parent = level[pi].node;
+				const n = clean(counts[pi]);
+				for (let c = 1; c <= n; c++) {
+					g++;
+					const num = restart ? c : g;
+					next.push({
+						node: {
+							label: `第 ${num} ${unit}`,
+							unit,
+							restart,
+							parentLabel: parent.label,
+							parentRestart: parent.restart,
+							global: g,
+						},
+						children: [],
+						parent: level[pi],
+					});
+					level[pi].children.push(next[next.length - 1]);
+				}
+			}
+			// 某级全为 0 合法：上一级节点全部升格为叶子（DFS 收集时自然处理）
+		}
+		if (li === 0) roots = next;
+		level = next;
+	}
+
+	// 叶收集（DFS）：末级节点是叶；中间节点若无任何子节点也升格为叶（如无节的章）
+	const leaves: GoalLeaf[] = [];
+	const lastIdx = levels.length - 1;
+	const rollupIdx = levels.length - 2; // 倒数第二级 = 进度汇总组
+	/**
+	 * 路径式标签：从 w 沿上级链收集连续重排标签，锚定最近的全书连续级（或根）。
+	 * 章→节→小节：第X章第Y节第Z小节，与书内 1.2.1 式目录一致；章→节：第X章第Y节；
+	 * 全局型节点：自身全局标签（第X章/第X篇）。
+	 */
+	const pathSuffix = (w: StructureWrapper): string => {
+		if (!w.node.restart) return w.node.label;
+		const parts: string[] = [w.node.label];
+		let cur = w.parent;
+		while (cur) {
+			parts.unshift(cur.node.label);
+			if (!cur.node.restart) break;
+			cur = cur.parent;
+		}
+		return parts.join("");
+	};
+	const visit = (w: StructureWrapper, depth: number, rollup: StructureWrapper | null): void => {
+		const rollupAncestor = depth === rollupIdx ? w : rollup;
+		if (depth === lastIdx || w.children.length === 0) {
+			// 组标签用路径式：节的编号每章重排，裸标签「第 1 节」会跨章撞名
+			// 升格节点（非末级）无 rollup 祖先时以自身路径为组——进度里能看到「第 2 卷 1/1」这类行
+			leaves.push({
+				name: `${goalName}（${pathSuffix(w)}）`,
+				index: leaves.length + 1,
+				group: rollupAncestor ? pathSuffix(rollupAncestor) : depth !== lastIdx ? pathSuffix(w) : "",
+			});
+			return;
+		}
+		for (const child of w.children) visit(child, depth + 1, rollupAncestor);
+	};
+	for (const root of roots) visit(root, 0, null);
+	return leaves;
+}
+
+/** 旧 chapters: [2,3,4]（逐章节数）→ 等价两级结构（命名与旧版完全一致，兼容存量数据）。 */
+export function chaptersToStructure(chapters: number[]): GoalLevel[] {
+	return [
+		{ unit: "章", counts: [chapters.length] },
+		{ unit: "节", counts: chapters.map((c) => Math.max(0, Math.floor(c))) },
+	];
+}
+
+/** 展开目标的叶子：structure 优先，chapters 兼容转换；两者皆无返回 null（扁平目标）。 */
+export function expandGoalLeaves(goalName: string, goal: { chapters?: number[]; structure?: GoalLevel[] }): GoalLeaf[] | null {
+	if (goal.structure?.length) return expandGoalStructure(goalName, goal.structure);
+	if (goal.chapters?.length) return expandGoalStructure(goalName, chaptersToStructure(goal.chapters));
+	return null;
+}
+
+/** ADR-0005 编辑重排 context: pure inputs for `rescheduleChapterLine`. */
+export interface ChapterRescheduleContext {
+	/** Plan tag the goal belongs to. */
+	plan: string;
+	/** Goal name prefix «{name}（». */
+	prefix: string;
+	/** Valid leaf-task names; prefix-matching tasks outside this set are deleted. */
+	valid: ReadonlySet<string>;
+	/**
+	 * 叶任务名 → 序号（1-based）within the REMAINING (unchecked) sequence.
+	 * 重排 = 剩余序列从头摊：已勾的节不占新窗口位置（它们的原日期保留作记录）。
+	 */
+	leafIndexByName: ReadonlyMap<string, number>;
+	/** Remaining (unchecked) leaf count. */
+	total: number;
+	/** Reschedule window (ISO dates) — explicit goal window or the plan period. */
+	start: string;
+	end: string;
+}
+
+/**
+ * ADR-0005 编辑重排：单行纯变换（编辑目标时对任务池逐行调用）。
+ * 返回 null = 删除该行（失效叶子）；返回字符串 = 原行或重排后的行。
+ * 规则：非本计划/本目标的行不动；失效叶子删行；已勾的保留原日期（进度记录不重写，
+ * 且不占新窗口位置）；未勾的按「剩余序列 × 新窗口」均匀分布重排 🛫/📅（与分解引擎
+ * 同一公式，日期无变化则原样返回）。全未读时剩余序列 = 全序列，与初次分解一致。
+ */
+export function rescheduleChapterLine(line: string, ctx: ChapterRescheduleContext): string | null {
+	const m = TASK_LINE_RE.exec(line);
+	if (!m) return line;
+	const text = m[2].trim();
+	if (m[3] !== ctx.plan || !text.startsWith(ctx.prefix)) return line;
+	if (!ctx.valid.has(text)) return null;
+	if (m[1] === "x") return line;
+	const idx = ctx.leafIndexByName.get(text);
+	if (idx === undefined) return line;
+	const totalDays = Math.max(1, dayCount(ctx.start, ctx.end));
+	const ns = addDaysStr(ctx.start, Math.floor(((idx - 1) * totalDays) / ctx.total));
+	const nd = idx < ctx.total ? addDaysStr(ctx.start, Math.floor((idx * totalDays) / ctx.total) - 1) : ctx.end;
+	const due = nd < ns ? ns : nd;
+	if (ns === m[4] && due === m[5]) return line;
+	return `- [${m[1]}] ${text} #计划/${m[3]} 🛫 ${ns} 📅 ${due}`;
+}
 
 /** ISO-week context for auto-task quotas. */
 export interface AutoWeekContext {
@@ -245,13 +604,8 @@ export interface AutoWeekContext {
  * Used for auto task names and progress numbers (e.g. "0/144 天").
  */
 export function planCounterUnit(target: string): string {
-	const m = /(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天)/.exec(target);
+	const m = /(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天|章|节)/.exec(target);
 	return m ? m[2] : "篇";
-}
-
-/** Whether a pool task looks like an auto-generated task («（第 N 篇）」suffix). */
-export function isAutoTask(task: PoolTask): boolean {
-	return AUTO_UNIT_RE.test(task.text.trim());
 }
 
 /**
@@ -310,7 +664,7 @@ export function autoTaskNumbers(
 ): number[] {
 	let maxN = 0;
 	for (const t of existingAuto) {
-		const m = AUTO_UNIT_RE.exec(t.text.trim());
+		const m = /（第\s*(\d+)[^）]*）$/.exec(t.text.trim());
 		if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
 	}
 	const nums: number[] = [];
@@ -363,6 +717,32 @@ export async function ensureAutoTasks(
 			if (today > gEnd) continue;
 			const totalDays = Math.max(1, Math.round((parseDateString(gEnd).getTime() - parseDateString(gStart).getTime()) / DAY_MS) + 1);
 			const prefix = `${goal.name}（`;
+
+			// ADR-0005 v2: 结构型目标（structure 或兼容 chapters）——按叶子书序生成任务，
+			// 均匀分布公式与扁平分解一致（k 为全书时序下标，总叶数为分母；除不尽时前面几天多一节）
+			const leaves = expandGoalLeaves(goal.name, goal);
+			if (leaves && leaves.length > 0) {
+				const existingNames = new Set(
+					tasks
+						.filter((t) => t.plan === plan.name && t.text.trim().startsWith(prefix))
+						.map((t) => t.text.trim())
+				);
+				for (const leaf of leaves) {
+					// 幂等 + 墓碑按名跳过：用户手动删过的叶子不复活（与扁平 top-up 同语义）
+					if (existingNames.has(leaf.name) || skip.has(leaf.name)) continue;
+					const startDate = addDaysStr(gStart, Math.floor(((leaf.index - 1) * totalDays) / leaves.length));
+					let dueDate: string;
+					if (leaf.index < leaves.length) {
+						dueDate = addDaysStr(gStart, Math.floor((leaf.index * totalDays) / leaves.length) - 1);
+					} else {
+						dueDate = gEnd;
+					}
+					if (dueDate < startDate) dueDate = startDate;
+					await addTask(app, rootPath, year, { text: leaf.name, plan: plan.name, start: startDate, due: dueDate });
+				}
+				continue;
+			}
+
 			const existing = tasks.filter(
 				(t) => t.plan === plan.name && t.text.trim().startsWith(prefix) && !skip.has(t.text.trim())
 			);

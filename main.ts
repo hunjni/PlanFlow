@@ -2,6 +2,7 @@ import { ButtonComponent, Modal, Notice, Plugin, TFile, TFolder, setIcon } from 
 import { PlanBoardView, VIEW_TYPE_PLANFLOW } from "./src/PlanBoardView";
 import type { PlanFlowSettings } from "./src/settings";
 import { DEFAULT_PLAN_COLORS, DEFAULT_SETTINGS, PlanFlowSettingTab } from "./src/settings";
+import { yearDirName } from "./src/paths";
 
 /** 首次启动引导弹窗：新用户四步上手（新建计划 → 量化目标 → 每日打卡 → 追踪进度）。 */
 class WelcomeModal extends Modal {
@@ -105,18 +106,22 @@ export default class PlanFlowPlugin extends Plugin {
 				}, 1200);
 			}
 		} catch (e) {
+			const msg = (e as Error)?.message ?? String(e);
 			console.warn("PlanFlow: 计划目录初始化跳过（下次启动重试）", e);
+			// v1.0.5: 静默吞错会让用户在保存计划时撞上「未找到年度计划文件」却无从排查——弹可见提示
+			new Notice(`PlanFlow：计划目录初始化失败（${msg}）。新增/保存计划时会自动重试。`);
 		}
 	}
 
 	/**
-	 * 首次启动确保计划目录骨架存在：{rootPath}/{年}/每日|周|月 + 年度计划.md + 任务.md。
+	 * 首次启动确保计划目录骨架存在：{rootPath}/{计划{年}}/每日|周|月 + 年度计划.md + 任务.md。
 	 * 已有年度目录则只补建缺失的年度计划.md；全部已存在返回 false（不弹引导）。
+	 * v1.0.5: 改为 public——视图保存计划时若发现年度计划文件缺失，会调用此方法自愈重建。
 	 */
-	private async ensurePlanRoot(): Promise<boolean> {
+	async ensurePlanRoot(): Promise<boolean> {
 		const year = String(new Date().getFullYear());
 		const root = this.settings.rootPath.replace(/\/+$/, "");
-		const base = `${root}/${year}`;
+		const base = `${root}/${yearDirName(year)}`;
 		const yearFolder = this.app.vault.getAbstractFileByPath(base);
 		if (yearFolder instanceof TFolder) {
 			// 已有年度目录（老用户）：只补建年度计划.md
@@ -150,7 +155,13 @@ export default class PlanFlowPlugin extends Plugin {
 				new Notice(`路径冲突：${cur}`);
 				return;
 			}
-			await this.app.vault.createFolder(cur);
+			try {
+				await this.app.vault.createFolder(cur);
+			} catch (e) {
+				// v1.0.5: 大库（尤其网络盘）索引滞后时，对已存在目录 createFolder 会抛「已存在」——重查一次放行
+				if (this.app.vault.getAbstractFileByPath(cur) instanceof TFolder) continue;
+				throw e;
+			}
 		}
 	}
 

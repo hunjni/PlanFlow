@@ -326,6 +326,216 @@ export function appendCheckItem(content: string, line: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Quota plans (ADR-0001 日定额型)
+// Line format: `- [x] ✍️ 写小说 1170字（实 800字） #计划/小说 🛫 … 📅 …`
+// - 勾选 = 记满当日配额；`（实 N{unit}）` 后缀记录实际量（可选项）
+// - 惰性生成：打开今日视图时幂等补写当天缺失行，绝不改写已有行
+// ---------------------------------------------------------------------------
+
+/**
+ * 手动优先标记（ADR-0007）：用户在 UI 里手动勾/退勾或手填实际量的行会带上 `✋`，
+ * 自动逻辑（BZG 联动写实量/自动勾）遇到 `✋` 一律跳过——手动永远优先。
+ */
+export const MANUAL_MARK = "✋";
+
+/** `（实 800字）` suffix on a quota check-in line（容忍尾随 `✋` 手动标记）. */
+export const QUOTA_ACTUAL_RE = /（实\s*([\d.]+)\s*[^）]*）\s*(?:✋\s*)?$/;
+
+/** Extract the actual amount recorded on a quota line, or null. */
+export function parseQuotaActual(text: string): number | null {
+	const m = QUOTA_ACTUAL_RE.exec(text);
+	if (!m) return null;
+	const n = parseFloat(m[1]);
+	return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Extract the per-day quota amount embedded in the line text (e.g. "1170字" → 1170). */
+export function parseQuotaAmount(text: string): number | null {
+	const stripped = text.replace(QUOTA_ACTUAL_RE, "");
+	const matches = [...stripped.matchAll(/\d+(?:\.\d+)?/g)];
+	if (matches.length === 0) return null;
+	const n = parseFloat(matches[matches.length - 1][0]);
+	return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Format an amount: integers stay integers, fractions keep 1 decimal. */
+export function formatQuotaAmount(n: number): string {
+	const r = Math.round(n * 10) / 10;
+	return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
+export interface BuildQuotaLineParams {
+	/** Icon prefix, e.g. "✍️". May be empty. */
+	label: string;
+	/** Plan name (also the plan tag). */
+	plan: string;
+	/** Daily quota amount. */
+	quota: number;
+	/** Unit, e.g. "字". May be empty. */
+	unit: string;
+	date: string;
+}
+
+/** Build a quota check-in line: `- [ ] ✍️ 写小说 1170字 #计划/小说 🛫 … 📅 …`. */
+export function buildQuotaCheckLine({ label, plan, quota, unit, date }: BuildQuotaLineParams): string {
+	const name = label ? `${label} ${plan}` : plan;
+	return `- [ ] ${name} ${formatQuotaAmount(quota)}${unit} #计划/${plan} 🛫 ${date} 📅 ${date}`;
+}
+
+/**
+ * Record the actual amount on a quota line (replacing any previous `（实 …）`)
+ * and set its checkbox. `actual <= 0` clears the suffix. Other line parts
+ * (plan tag / 🛫 / 📅) are preserved from the parsed groups.
+ * `manual = true` 时追加 `✋` 手动标记（ADR-0007：标记后自动逻辑不再碰该行）。
+ */
+export function setQuotaActual(
+	content: string,
+	lineIndex: number,
+	actual: number,
+	unit: string,
+	checked: boolean,
+	expectedRaw?: string,
+	manual = false
+): string {
+	const lines = content.split("\n");
+	let idx = lineIndex;
+	if (expectedRaw && lines[idx] !== expectedRaw) {
+		idx = lines.findIndex((l) => l === expectedRaw);
+		if (idx === -1) return content;
+	}
+	const line = lines[idx];
+	if (line === undefined) return content;
+	const m = TASK_LINE_RE.exec(line.trim());
+	if (!m) return content;
+	const text = m[2].trim().replace(/（实[^）]*）\s*(?:✋\s*)?$/, "").replace(MANUAL_MARK, "").trimEnd();
+	const actualPart = actual > 0 ? `（实 ${formatQuotaAmount(actual)}${unit}）` : "";
+	let rebuilt = `- [${checked ? "x" : " "}] ${text}${actualPart}${manual ? MANUAL_MARK : ""}`;
+	if (m[3]) rebuilt += ` #计划/${m[3]}`;
+	if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
+	if (m[5]) rebuilt += ` 📅 ${m[5]}`;
+	lines[idx] = rebuilt;
+	return lines.join("\n");
+}
+
+/**
+ * 给任务行打 `✋` 手动标记（ADR-0007）。已有标记则原样返回（幂等）。
+ * 用户在 UI 里手动勾/退勾的模式行会调用——之后自动逻辑不再碰该行。
+ */
+export function markTaskLineManual(content: string, lineIndex: number, expectedRaw?: string): string {
+	const lines = content.split("\n");
+	let idx = lineIndex;
+	if (expectedRaw && lines[idx] !== expectedRaw) {
+		idx = lines.findIndex((l) => l === expectedRaw);
+		if (idx === -1) return content;
+	}
+	const line = lines[idx];
+	if (line === undefined || !/^- \[[ x]\]/.test(line)) return content;
+	if (line.includes(MANUAL_MARK)) return content;
+	const m = TASK_LINE_RE.exec(line.trim());
+	if (!m) return content;
+	let rebuilt = `- [${m[1]}] ${m[2].trimEnd()}${MANUAL_MARK}`;
+	if (m[3]) rebuilt += ` #计划/${m[3]}`;
+	if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
+	if (m[5]) rebuilt += ` 📅 ${m[5]}`;
+	lines[idx] = rebuilt;
+	return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// 模式目标每日行（ADR-0006 目标模式：复习/日记/运动）
+// 复习/运动：`- [ ] 🗣️ 文献复习 5篇（实 3篇） #计划/学习 🛫 D 📅 D`
+// 日记：    `- [ ] 📝 日记 #计划/复盘 🛫 D 📅 D`
+// 与 quota 行同构（惰性幂等补写；已存在的行一律不重建）。
+// ---------------------------------------------------------------------------
+
+/** 一条模式行生成规格（structural，避免依赖 stats）。 */
+export interface ModeLineSpec {
+	/** Plan tag name. */
+	plan: string;
+	/** Goal name（行文本的核心词，识别既有行用 includes 匹配）. */
+	name: string;
+	/** Plan icon prefix, e.g. "🗣️". May be empty. */
+	label: string;
+	/** 每日量（复习=下限；运动=可选目标量；日记恒 0）。 */
+	floor: number;
+	/** 单位（篇/分钟…），可为空。 */
+	unit: string;
+}
+
+/** 构建模式行：`- [ ] {label} {name} {floor}{unit} #计划/{plan} 🛫 D 📅 D`。 */
+export function buildModeCheckLine({ plan, name, label, floor, unit }: ModeLineSpec, date: string): string {
+	let content = label ? `${label} ${name}` : name;
+	if (floor > 0) content += ` ${formatQuotaAmount(floor)}${unit}`;
+	return `- [ ] ${content} #计划/${plan} 🛫 ${date} 📅 ${date}`;
+}
+
+/**
+ * 返回今日缺失的模式行（ADR-0006 惰性生成，幂等）。
+ * 识别既有行：同计划标签 + 行文本包含目标名（label 前缀不影响）。
+ */
+export function missingModeLines(content: string, specs: ModeLineSpec[], date: string): string[] {
+	const existing = new Set<string>();
+	const lines = content.split("\n");
+	let inCheck = false;
+	for (const line of lines) {
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (m?.[3]) existing.add(`${m[3]}|${m[2].trim()}`);
+	}
+	const out: string[] = [];
+	for (const s of specs) {
+		let found = false;
+		for (const key of existing) {
+			const [plan, text] = key.split("|");
+			if (plan === s.plan && text.includes(s.name)) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) out.push(buildModeCheckLine(s, date));
+	}
+	return out;
+}
+
+/** A quota plan flattened for line generation (structural; avoids importing stats). */
+export interface QuotaLineSpec {
+	plan: string;
+	label: string;
+	quota: number;
+	unit: string;
+}
+
+/**
+ * Return the quota check-in lines missing from the daily note's
+ * `## ✅ 今日打卡` section (ADR-0001 惰性生成，幂等：已有该计划标签的行
+ * 一律不重写——含用户手删后次日复活的取舍，见 ADR）。
+ */
+export function missingQuotaLines(content: string, quotas: QuotaLineSpec[], date: string): string[] {
+	const existing = new Set<string>();
+	const lines = content.split("\n");
+	let inCheck = false;
+	for (const line of lines) {
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (m?.[3]) existing.add(m[3]);
+	}
+	const out: string[] = [];
+	for (const q of quotas) {
+		if (existing.has(q.plan)) continue;
+		out.push(buildQuotaCheckLine({ label: q.label, plan: q.plan, quota: q.quota, unit: q.unit, date }));
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
 // Note templates
 // ---------------------------------------------------------------------------
 

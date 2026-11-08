@@ -3,7 +3,15 @@
  * Only implements what src/daily.ts, src/tasks.ts, src/stats.ts import.
  */
 export class App {}
-export class TFile {}
+export class TFile {
+	/** 复现脚本构造 TFile 时需要 path/name（真实 Obsidian 的 TFile 两者都有）。 */
+	path: string;
+	name: string;
+	constructor(path?: string) {
+		this.path = path ?? "";
+		this.name = this.path.split("/").pop() ?? "";
+	}
+}
 export class TFolder {}
 export class Notice {}
 
@@ -13,7 +21,14 @@ export function parseYaml(src: string): any {
 	let pos = 0;
 
 	const indentOf = (l: string): number => l.search(/\S/);
-	const stripComment = (s: string): string => s;
+	// 整体被引号包裹的标量去引号（js-yaml 行为；仅处理完整包裹，不动 "key: value" 内部的值）
+	const stripComment = (s: string): string => {
+		const t = s.trim();
+		if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+			return t.slice(1, -1);
+		}
+		return s;
+	};
 
 	function parseNode(indent: number): any {
 		while (pos < lines.length) {
@@ -61,8 +76,16 @@ export function parseYaml(src: string): any {
 							}
 							const nkey = nl.trim().slice(0, nidx).trim();
 							const nval = stripComment(nl.trim().slice(nidx + 1).trim());
-							obj[nkey] = nval === "" ? parseNode(indentOf(nl) + 2) : nval;
-							pos++;
+							if (nval === "") {
+								// 先 pos++ 再递归：parseNode 期望 pos 指向第一条子行
+								// （与上方 object 分支一致；此前先递归后 pos++ 导致
+								//   数组项内嵌套对象解析为 null 并把子键拍平——quota 用例复现）
+								pos++;
+								obj[nkey] = parseNode(indentOf(nl) + 2);
+							} else {
+								obj[nkey] = nval;
+								pos++;
+							}
 						}
 						arr.push(obj);
 					} else {

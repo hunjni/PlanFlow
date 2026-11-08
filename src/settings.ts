@@ -52,6 +52,15 @@ export interface PlanFlowSettings {
 	boardColumnOrder: string[];
 	/** 用户手动删除的自动分解任务名（v1.0.4）——防止 ensureAutoTasks 补额时"复活"被删任务。编辑/删除对应量化目标时清空相关条目。 */
 	deletedAutoTasks: string[];
+	/** 日记目录（ADR-0004 打卡联动）：勾选子任务时向 `{diaryDir}/{当天}.md` 的「## 代办事项」投影；空 = 禁用。 */
+	diaryDir: string;
+	/** 今日总结最近一次写入日记「## 备注」的块文本（ADR-0004 扩展五）：替换定位锚点，不在设置页展示。 */
+	summaryDiaryLast: string;
+	/**
+	 * BZG 联动（ADR-0007，默认开）：只读 BZG 的复习记录与日记日文件，驱动
+	 * 复习模式的自动实际量/自动达标与日记模式的自动勾选。BZG 缺席时静默降级为手动。
+	 */
+	bzgEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: PlanFlowSettings = {
@@ -89,6 +98,9 @@ tags: [复盘]
 	yearPlanHeights: {},
 	boardColumnOrder: [],
 	deletedAutoTasks: [],
+	diaryDir: "我的/日记",
+	summaryDiaryLast: "",
+	bzgEnabled: true,
 };
 
 /** 文件夹选择弹窗：列出库内全部文件夹，点选即回调路径（Obsidian 标准交互）。 */
@@ -157,6 +169,18 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				control: { type: "toggle", key: "reviewWorkdays" },
 			},
 			{
+				name: "BZG 联动（复习/日记自动记录）",
+				desc: "只读 BZG 插件的复习记录与日记日文件：复习模式自动写入每日实际复习篇数并自动勾选达标；日记模式检测到当天日记有亲手写下的内容即自动打钩。BZG 未安装时自动降级为手动记录",
+				aliases: ["bzg", "联动", "复习", "日记检测"],
+				control: { type: "toggle", key: "bzgEnabled" },
+			},
+			{
+				name: "日记目录（打卡联动）",
+				desc: "勾选打卡子任务时，向当天日记的「## 代办事项」写入完成记录（与待办投影同格式）；留空禁用",
+				aliases: ["diaryDir", "日记", "代办"],
+				render: (setting) => this.renderDiaryDir(setting),
+			},
+			{
 				name: "复盘笔记模板",
 				desc: "在 Obsidian 中直接编辑，{date} 会自动替换为当天日期",
 				aliases: ["reviewTemplate", "模板"],
@@ -214,6 +238,19 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				}).open();
 			})
 		);
+	}
+
+	/** 日记目录：文本框（FolderSuggest 下拉）；留空禁用打卡联动。 */
+	private renderDiaryDir(setting: Setting): void {
+		setting.addText((text) => {
+			text.setPlaceholder("我的/日记").setValue(this.plugin.settings.diaryDir);
+			const apply = (value: string): void => {
+				this.plugin.settings.diaryDir = value.trim();
+				void this.plugin.saveSettings();
+			};
+			new FolderSuggest(this.app, text.inputEl, apply);
+			text.onChange(apply);
+		});
 	}
 
 	/** 复盘模板：打开模板文件 + 恢复默认。 */
