@@ -4552,6 +4552,9 @@ class GoalEditModal extends Modal {
 	private weave: WeaveBridgeApi | null;
 	private bookList: WeaveBookSummary[] | null = null;
 	private bookLoading = false;
+	/** 选书页数据加载只自动发起一次（空/失败不再无限重试，由重试按钮驱动）。 */
+	private bookLoadAttempted = false;
+	private bookError = "";
 	private readerSid = "";
 	private readerResume = 0;
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
@@ -4865,7 +4868,7 @@ class GoalEditModal extends Modal {
 
 	/**
 	 * ADR-0009 步骤 10：从阅读器书架选书——选中即自动拉目录生成结构，直达确认页。
-	 * 书架为空 / 目录读取失败 → 引导粘贴导入；粘贴/手动结构入口保留并存（Q5=A）。
+	 * 四态明示（加载/空/失败+重试/列表），粘贴/手动结构入口保留并存（Q5=A）。
 	 */
 	private renderBookPicker(contentEl: HTMLElement): void {
 		contentEl.createDiv({
@@ -4873,23 +4876,36 @@ class GoalEditModal extends Modal {
 			text: "📖 从阅读器书架选书：选中后自动读取该书目录，生成逐节阅读结构",
 		});
 		const listEl = contentEl.createDiv({ cls: "planboard-struct-box" });
-		if (!this.bookList) {
-			if (!this.bookLoading) {
-				this.bookLoading = true;
-				void this.loadBookShelf();
+		if (this.bookList) {
+			for (const b of this.bookList) {
+				const statusMeta = { unread: "未开始", reading: "阅读中", finished: "已读完" }[b.status];
+				const row = listEl.createDiv({ cls: "planboard-book-row" });
+				const info = row.createDiv({ cls: "planboard-book-row-info" });
+				info.createSpan({ cls: "planboard-book-row-title", text: b.title || "（未命名）" });
+				info.createSpan({
+					cls: "planboard-goal-preview",
+					text: `${b.author ? ` · ${b.author}` : ""} · ${statusMeta}${b.percent > 0 ? ` ${Math.round(b.percent)}%` : ""}`,
+				});
+				row.addEventListener("click", () => void this.pickBook(b));
 			}
-			listEl.createSpan({ cls: "planboard-goal-preview", text: this.bookLoading ? "正在读取书架…" : "（书架读取失败：可用下方粘贴导入或手动定义结构）" });
-		}
-		for (const b of this.bookList ?? []) {
-			const statusMeta = { unread: "未开始", reading: "阅读中", finished: "已读完" }[b.status];
-			const row = listEl.createDiv({ cls: "planboard-book-row" });
-			const info = row.createDiv({ cls: "planboard-book-row-info" });
-			info.createSpan({ cls: "planboard-book-row-title", text: b.title || "（未命名）" });
-			info.createSpan({
-				cls: "planboard-goal-preview",
-				text: `${b.author ? ` · ${b.author}` : ""} · ${statusMeta}${b.percent > 0 ? ` ${Math.round(b.percent)}%` : ""}`,
+		} else if (this.bookLoading) {
+			listEl.createSpan({ cls: "planboard-goal-preview", text: "正在读取书架…" });
+		} else if (this.bookError) {
+			listEl.createDiv({ cls: "planboard-goal-preview", text: `书架读取失败：${this.bookError}` });
+			const retry = listEl.createEl("button", { cls: "planboard-btn", text: "重试", attr: { type: "button" } });
+			retry.addEventListener("click", () => {
+				this.bookLoadAttempted = false;
+				this.bookError = "";
+				void this.loadBookShelf();
 			});
-			row.addEventListener("click", () => void this.pickBook(b));
+		} else if (this.bookLoadAttempted) {
+			listEl.createSpan({
+				cls: "planboard-goal-preview",
+				text: "书架为空（0 本）：先在阅读器书架导入书籍，或改用下方粘贴导入",
+			});
+		}
+		if (!this.bookLoadAttempted && !this.bookLoading) {
+			void this.loadBookShelf();
 		}
 		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
 		const tocBtn = actions.createEl("button", { cls: "planboard-btn", text: "📋 粘贴目录导入", attr: { type: "button" } });
@@ -4899,17 +4915,37 @@ class GoalEditModal extends Modal {
 		this.addCancelButton(actions);
 	}
 
-	/** 拉取书架快照（选书步数据源）；完成后仍在选书页则重渲染列表。 */
+	/**
+	 * 拉取书架快照（选书步数据源）。8 秒超时兜底——桥挂起时给出可判读的失败态，
+	 * 绝不无限转圈；结果（含错误）仍在选书页时渲染。
+	 */
 	private async loadBookShelf(): Promise<void> {
 		if (this.bookLoading) return;
 		this.bookLoading = true;
+		this.bookLoadAttempted = true;
 		let list: WeaveBookSummary[] | null = null;
+		let error = "";
 		try {
-			list = this.weave ? await this.weave.getBookshelf() : null;
-		} catch {
-			list = null;
+			const task = this.weave ? this.weave.getBookshelf() : Promise.resolve(null);
+			list = await new Promise<WeaveBookSummary[] | null>((resolve, reject) => {
+				const timer = window.setTimeout(() => reject(new Error("读取超时（8 秒无响应），阅读器插件可能未就绪")), 8000);
+				task.then(
+					(v) => {
+						window.clearTimeout(timer);
+						resolve(v);
+					},
+					(e) => {
+						window.clearTimeout(timer);
+						reject(e);
+					}
+				);
+			});
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			console.warn("[PlanFlow] weave getBookshelf 失败:", e);
 		}
 		this.bookList = list && list.length > 0 ? list : null;
+		this.bookError = error;
 		this.bookLoading = false;
 		if (this.step === STEP_BOOK && this.contentEl.isConnected) this.renderWizard();
 	}
