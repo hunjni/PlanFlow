@@ -58,6 +58,7 @@ import {
 	type WeaveAdvanceDetail,
 	type WeaveBookSummary,
 	type WeaveBridgeApi,
+	type WeaveTocNode,
 } from "./weave-bridge";
 
 /** v1.7.4: 插件改名 PlanFlow——view type 同步改（workspace 布局重新打开一次即可） */
@@ -4515,10 +4516,11 @@ class ReviewModal extends Modal {
 /** Modal for creating / editing a quantified goal under a plan (v1.2, spec #4). */
 /** 结构级数上限（真实需求到不了，防御性上限）。 */
 const MAX_STRUCTURE_LEVELS = 8;
-/** 向导步骤常量：-1=模式选择；0=书名与时间；1..8=第 N 级；10=选书（ADR-0009）；70=模式表单；80=目录粘贴；90=简单数量；99=确认。 */
+/** 向导步骤常量：-1=模式选择；0=书名与时间；1..8=第 N 级；10=选书（ADR-0009）；11=结构确认（ADR-0009）；70=模式表单；80=目录粘贴；90=简单数量；99=确认。 */
 const STEP_MODE = -1;
 const STEP_INTRO = 0;
 const STEP_BOOK = 10;
+const STEP_STRUCT = 11;
 const STEP_FORM = 70;
 const STEP_TOC = 80;
 const STEP_SIMPLE = 90;
@@ -4555,6 +4557,9 @@ class GoalEditModal extends Modal {
 	/** 选书页数据加载只自动发起一次（空/失败不再无限重试，由重试按钮驱动）。 */
 	private bookLoadAttempted = false;
 	private bookError = "";
+	/** 结构确认步：选中的书 + 可编辑的提取目录树（行内调整后确认才落结构）。 */
+	private pickedBook: WeaveBookSummary | null = null;
+	private bookTree: WeaveTocNode[] | null = null;
 	private readerSid = "";
 	private readerResume = 0;
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
@@ -4688,12 +4693,13 @@ class GoalEditModal extends Modal {
 		contentEl.createEl("h2", {
 			text: this.existing ? `编辑量化目标（${this.planName}）` : `新增量化目标（${this.planName}）`,
 		});
-		// 步骤条只属于阅读/通用结构流；模式选择/模式表单/目录页/选书页是独立单屏
-		if (this.step >= STEP_INTRO && this.step !== STEP_TOC && this.step !== STEP_FORM && this.step !== STEP_BOOK) this.renderStepBar(contentEl);
+		// 步骤条只属于阅读/通用结构流；模式选择/模式表单/目录页/选书页/结构确认页是独立单屏
+		if (this.step >= STEP_INTRO && this.step !== STEP_TOC && this.step !== STEP_FORM && this.step !== STEP_BOOK && this.step !== STEP_STRUCT) this.renderStepBar(contentEl);
 		if (this.step === STEP_MODE) this.renderModeCards(contentEl);
 		else if (this.step === STEP_FORM) this.renderModeForm(contentEl);
 		else if (this.step === STEP_TOC) this.renderTocStep(contentEl);
 		else if (this.step === STEP_BOOK) this.renderBookPicker(contentEl);
+		else if (this.step === STEP_STRUCT) this.renderStructConfirm(contentEl);
 		else if (this.step === STEP_INTRO) this.renderIntro(contentEl);
 		else if (this.step === STEP_SIMPLE) this.renderSimple(contentEl);
 		else if (this.step === STEP_REVIEW) this.renderReview(contentEl);
@@ -4950,26 +4956,132 @@ class GoalEditModal extends Modal {
 		if (this.step === STEP_BOOK && this.contentEl.isConnected) this.renderWizard();
 	}
 
-	/** 选中一本书：拉目录 → 结构 + 书名 + 接续阅读预勾数，直达确认页。 */
+	/**
+	 * 选中一本书：拉目录 → 存为可编辑提取树，进结构确认步（用户核对/调整无误后
+	 * 才落结构安排阅读——按确认的结构计算量化目标与分配）。
+	 */
 	private async pickBook(b: WeaveBookSummary): Promise<void> {
 		if (!this.weave) return;
-		let tree = null;
+		let tree: WeaveTocNode[] | null = null;
 		try {
 			tree = await this.weave.getToc(b.sid);
 		} catch {
 			tree = null;
 		}
-		const conv = weaveTocToStructure(tree);
-		if (!conv) {
+		if (!tree || tree.length === 0) {
 			new Notice(`未能读取《${b.title}》的目录：可用粘贴导入或手动定义结构`);
 			return;
 		}
-		this.nameValue = b.title || this.nameValue;
-		this.levels = conv.levels.map((lv) => ({ unit: lv.unit, counts: [...lv.counts] }));
-		this.readerSid = b.sid;
-		// 接续阅读（Q11=B）：当前章序之前的叶子在保存时预勾，分配只覆盖剩余
-		this.readerResume = resumeLeafCount(conv.leafSpine, b.chapterIndex);
-		this.goto(STEP_REVIEW);
+		this.pickedBook = b;
+		// 深拷贝为可编辑树：编辑只动这份拷贝，确认时才转换落结构
+		this.bookTree = JSON.parse(JSON.stringify(tree)) as WeaveTocNode[];
+		this.goto(STEP_STRUCT);
+	}
+
+	/**
+	 * ADR-0009 结构确认步：展示提取出的目录树（真实标题 + 层级缩进），行内
+	 * 调整（↑升级 ↓降级 ✕删除 ＋子 ＋下），确认后按确认的树转换结构进确认页。
+	 * 树→结构的转换与锚点推导全部复用 weaveTocToStructure（编辑不引入第二口径）。
+	 */
+	private renderStructConfirm(contentEl: HTMLElement): void {
+		const book = this.pickedBook;
+		const tree = this.bookTree;
+		if (!book || !tree || tree.length === 0) {
+			new Notice("提取结构已失效：请重选书");
+			this.goto(STEP_BOOK);
+			return;
+		}
+		// 摘要（每次调整后重算）：层 ×单位链 + 总叶数——与确认页同一转换口径
+		const conv = weaveTocToStructure(tree);
+		const summary = conv
+			? `识别 ${conv.leafSpine.length} 节 · ${conv.levels.map((lv) => `${lv.unit} ×${lv.counts.reduce((a, c) => a + c, 0)}`).join(" → ")}`
+			: "（当前结构为空或超过 8 级）";
+		contentEl.createDiv({
+			cls: "planboard-goal-preview",
+			text: `📖《${book.title}》提取结构（共 ${tree.length} 个顶层条目） · ${summary}`,
+		});
+		contentEl.createDiv({
+			cls: "planboard-goal-preview",
+			text: "核对层级是否与书一致：鼠标移到行上调 ✕删除 / ↑升级 / ↓降级 / ＋子级 / ＋同级；确认后按此结构安排阅读",
+		});
+
+		const subtreeMaxDepth = (node: WeaveTocNode): number =>
+			node.children.length ? 1 + Math.max(...node.children.map(subtreeMaxDepth)) : 0;
+		const scroll = contentEl.createDiv({ cls: "planboard-tree-scroll" });
+		const renderRows = (
+			nodes: WeaveTocNode[],
+			depth: number,
+			parentChain: { nodes: WeaveTocNode[]; index: number }[]
+		): void => {
+			nodes.forEach((n, i) => {
+				const row = scroll.createDiv({ cls: "planboard-tree-row", attr: { style: `padding-left:${depth * 18 + 4}px` } });
+				row.createSpan({ cls: "planboard-tree-label", text: n.label || "（未命名）" });
+				const ops = row.createDiv({ cls: "planboard-tree-ops" });
+				const op = (text: string, title: string, fn: () => void, disabled = false): void => {
+					const btn = ops.createEl("button", { cls: "planboard-icon-btn", attr: { title, "aria-label": title } });
+					btn.setText(text);
+					if (disabled) {
+						btn.disabled = true;
+						return;
+					}
+					btn.addEventListener("click", (e) => {
+						e.stopPropagation();
+						fn();
+						this.renderWizard(); // 整树重渲染：调整后摘要与缩进即时更新
+					});
+				};
+				op("✕", "删除该条目（含子级）", () => nodes.splice(i, 1));
+				const grand = parentChain[parentChain.length - 1];
+				op(
+					"↑",
+					"升一级（挂到上级，排在其原上级之后）",
+					() => {
+						nodes.splice(i, 1);
+						grand.nodes.splice(grand.index + 1, 0, n);
+					},
+					depth === 0
+				);
+				op(
+					"↓",
+					"降一级（挂到上一个同级之下）",
+					() => {
+						const prev = nodes[i - 1];
+						nodes.splice(i, 1);
+						prev.children.push(n);
+					},
+					i === 0 || depth + 1 + subtreeMaxDepth(n) > 7
+				);
+				op("＋", "添加子条目", () => {
+					n.children.push({ label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
+				}, depth + 1 > 7);
+				op("⤶", "在其后添加同级条目", () => {
+					nodes.splice(i + 1, 0, { label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
+				});
+				if (n.children.length > 0) renderRows(n.children, depth + 1, [...parentChain, { nodes, index: i }]);
+			});
+		};
+		renderRows(tree, 0, []);
+
+		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
+		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 结构无误，安排阅读 →", attr: { type: "button" } });
+		ok.addEventListener("click", () => {
+			const confirmed = weaveTocToStructure(this.bookTree);
+			if (!confirmed || !this.pickedBook) {
+				new Notice("调整后的结构为空或非法：至少保留一个条目");
+				return;
+			}
+			this.nameValue = this.pickedBook.title || this.nameValue;
+			this.levels = confirmed.levels.map((lv) => ({ unit: lv.unit, counts: [...lv.counts] }));
+			this.readerSid = this.pickedBook.sid;
+			// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
+			this.readerResume = resumeLeafCount(confirmed.leafSpine, this.pickedBook.chapterIndex);
+			this.goto(STEP_REVIEW);
+		});
+		const reextract = actions.createEl("button", { cls: "planboard-btn", text: "↺ 重新提取", attr: { type: "button" } });
+		reextract.addEventListener("click", () => void this.pickBook(book));
+		const back = actions.createEl("button", { cls: "planboard-btn", text: "← 重选书", attr: { type: "button" } });
+		back.addEventListener("click", () => this.goto(STEP_BOOK));
+		this.addCancelButton(actions);
 	}
 
 	/** ADR-0006: 目录粘贴导入页（阅读书籍模式）——解析 → 预览 → 应用为多级结构。 */
