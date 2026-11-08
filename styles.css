@@ -2848,11 +2848,12 @@
 	text-overflow: ellipsis;
 }
 .planboard-tree-ops {
-	display: none;
+	display: flex;
 	gap: 2px;
 }
-.planboard-tree-row:hover .planboard-tree-ops {
-	display: flex;
+.planboard-tree-rename {
+	flex: 1;
+	font-size: 12.5px;
 }
 .planboard-tree-ops .planboard-icon-btn {
 	padding: 0 4px;

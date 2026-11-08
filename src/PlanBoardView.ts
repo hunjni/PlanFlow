@@ -4565,6 +4565,8 @@ class GoalEditModal extends Modal {
 	/** 结构确认步：选中的书 + 可编辑的提取目录树（行内调整后确认才落结构）。 */
 	private pickedBook: WeaveBookSummary | null = null;
 	private bookTree: WeaveTocNode[] | null = null;
+	/** 结构确认步文本编辑模式（整段缩进文本改层级，适合成规模的层级修正）。 */
+	private structTextMode = false;
 	private readerSid = "";
 	private readerResume = 0;
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
@@ -4985,13 +4987,15 @@ class GoalEditModal extends Modal {
 		this.pickedBook = b;
 		// 深拷贝为可编辑树：编辑只动这份拷贝，确认时才转换落结构
 		this.bookTree = JSON.parse(JSON.stringify(tree)) as WeaveTocNode[];
+		this.structTextMode = false;
 		this.goto(STEP_STRUCT);
 	}
 
 	/**
-	 * ADR-0009 结构确认步：展示提取出的目录树（真实标题 + 层级缩进），行内
-	 * 调整（↑升级 ↓降级 ✕删除 ＋子 ＋下），确认后按确认的树转换结构进确认页。
-	 * 树→结构的转换与锚点推导全部复用 weaveTocToStructure（编辑不引入第二口径）。
+	 * ADR-0009 结构确认步：展示提取出的目录树（真实标题 + 层级缩进）。两种编辑形态：
+	 * 树形（行内 ✕/✎/↑/↓/＋/⤶，适合零星调整）与文本模式（整段缩进文本，适合
+	 * 成规模的层级修正）。确认后按确认的树转换结构进确认页——树→结构的转换与
+	 * 锚点推导全部复用 weaveTocToStructure（编辑不引入第二口径）。
 	 */
 	private renderStructConfirm(contentEl: HTMLElement): void {
 		const book = this.pickedBook;
@@ -5010,71 +5014,128 @@ class GoalEditModal extends Modal {
 			cls: "planboard-goal-preview",
 			text: `📖《${book.title}》提取结构（共 ${tree.length} 个顶层条目） · ${summary}`,
 		});
-		contentEl.createDiv({
-			cls: "planboard-goal-preview",
-			text: "核对层级是否与书一致：鼠标移到行上调 ✕删除 / ↑升级 / ↓降级 / ＋子级 / ＋同级；确认后按此结构安排阅读",
+		const modeBar = contentEl.createDiv({ cls: "planboard-struct-actions" });
+		const modeBtn = modeBar.createEl("button", {
+			cls: "planboard-btn",
+			text: this.structTextMode ? "🌳 返回树形编辑" : "⌨ 文本编辑（整段改层级/删行）",
+			attr: { type: "button" },
+		});
+		modeBtn.addEventListener("click", () => {
+			this.structTextMode = !this.structTextMode;
+			this.renderWizard();
 		});
 
-		const subtreeMaxDepth = (node: WeaveTocNode): number =>
-			node.children.length ? 1 + Math.max(...node.children.map(subtreeMaxDepth)) : 0;
-		const scroll = contentEl.createDiv({ cls: "planboard-tree-scroll" });
-		const renderRows = (
-			nodes: WeaveTocNode[],
-			depth: number,
-			parentChain: { nodes: WeaveTocNode[]; index: number }[]
-		): void => {
-			nodes.forEach((n, i) => {
-				const row = scroll.createDiv({ cls: "planboard-tree-row", attr: { style: `padding-left:${depth * 18 + 4}px` } });
-				row.createSpan({ cls: "planboard-tree-label", text: n.label || "（未命名）" });
-				const ops = row.createDiv({ cls: "planboard-tree-ops" });
-				const op = (text: string, title: string, fn: () => void, disabled = false): void => {
-					const btn = ops.createEl("button", { cls: "planboard-icon-btn", attr: { title, "aria-label": title } });
-					btn.setText(text);
-					if (disabled) {
-						btn.disabled = true;
-						return;
-					}
-					btn.addEventListener("click", (e) => {
-						e.stopPropagation();
-						fn();
-						this.renderWizard(); // 整树重渲染：调整后摘要与缩进即时更新
-					});
-				};
-				op("✕", "删除该条目（含子级）", () => nodes.splice(i, 1));
-				op("✎", "重命名条目", () => {
-					const v = window.prompt("条目名称（会作为任务名的一部分）", n.label);
-					if (v !== null && v.trim()) n.label = v.trim();
-				});
-				const grand = parentChain[parentChain.length - 1];
-				op(
-					"↑",
-					"升一级（挂到上级，排在其原上级之后）",
-					() => {
-						nodes.splice(i, 1);
-						grand.nodes.splice(grand.index + 1, 0, n);
-					},
-					depth === 0
-				);
-				op(
-					"↓",
-					"降一级（挂到上一个同级之下）",
-					() => {
-						const prev = nodes[i - 1];
-						nodes.splice(i, 1);
-						prev.children.push(n);
-					},
-					i === 0 || depth + 1 + subtreeMaxDepth(n) > 7
-				);
-				op("＋", "添加子条目", () => {
-					n.children.push({ label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
-				}, depth + 1 > 7);
-				op("⤶", "在其后添加同级条目", () => {
-					nodes.splice(i + 1, 0, { label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
-				});
-				if (n.children.length > 0) renderRows(n.children, depth + 1, [...parentChain, { nodes, index: i }]);
+		if (this.structTextMode) {
+			contentEl.createDiv({
+				cls: "planboard-goal-preview",
+				text: "每行一条目录；行首每 2 个空格（或 1 个 Tab）= 下钻一级。删行 = 删条目，改缩进 = 调层级，可直接重写标题。应用后按行数对齐保留跳转锚点（增删行后锚点丢失，联动停用，可「重新提取」恢复）",
 			});
-		};
-		renderRows(tree, 0, []);
+			const taEl = contentEl.createEl("textarea", { cls: "planboard-toc-input" });
+			{
+				const lines: string[] = [];
+				const ser = (nodes: WeaveTocNode[], depth: number): void =>
+					nodes.forEach((n) => {
+						lines.push("  ".repeat(depth) + (n.label || ""));
+						ser(n.children, depth + 1);
+					});
+				ser(tree, 0);
+				taEl.value = lines.join("\n");
+			}
+			taEl.rows = 14;
+			const applyBar = contentEl.createDiv({ cls: "planboard-struct-actions" });
+			const applyBtn = applyBar.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 应用文本修改", attr: { type: "button" } });
+			applyBtn.addEventListener("click", () => this.applyStructText(taEl.value));
+		} else {
+			contentEl.createDiv({
+				cls: "planboard-goal-preview",
+				text: "核对层级是否与书一致：行尾按钮 ✕删除 / ✎改名 / ↑升级 / ↓降级 / ＋子级 / ＋同级；大规模层级问题用上方「文本编辑」",
+			});
+
+			const subtreeMaxDepth = (node: WeaveTocNode): number =>
+				node.children.length ? 1 + Math.max(...node.children.map(subtreeMaxDepth)) : 0;
+			const scroll = contentEl.createDiv({ cls: "planboard-tree-scroll" });
+			const renderRows = (
+				nodes: WeaveTocNode[],
+				depth: number,
+				parentChain: { nodes: WeaveTocNode[]; index: number }[]
+			): void => {
+				nodes.forEach((n, i) => {
+					const row = scroll.createDiv({ cls: "planboard-tree-row", attr: { style: `padding-left:${depth * 18 + 4}px` } });
+					const labelSpan = row.createSpan({ cls: "planboard-tree-label", text: n.label || "（未命名）" });
+					const ops = row.createDiv({ cls: "planboard-tree-ops" });
+					const op = (text: string, title: string, fn: () => void, disabled = false): void => {
+						const btn = ops.createEl("button", { cls: "planboard-icon-btn", attr: { title, "aria-label": title } });
+						btn.setText(text);
+						if (disabled) {
+							btn.disabled = true;
+							return;
+						}
+						btn.addEventListener("click", (e) => {
+							e.stopPropagation();
+							fn();
+							this.renderWizard(); // 整树重渲染：调整后摘要与缩进即时更新
+						});
+					};
+					op("✕", "删除该条目（含子级）", () => nodes.splice(i, 1));
+					op("✎", "重命名条目（行内输入，Enter 确认）", () => {
+						const input = createEl("input", { attr: { type: "text", value: n.label } });
+						input.addClass("planboard-tree-rename");
+						labelSpan.replaceWith(input);
+						input.focus();
+						input.select();
+						let done = false;
+						const commit = (): void => {
+							if (done) return;
+							done = true;
+							const v = input.value.trim();
+							if (v) n.label = v;
+							this.renderWizard();
+						};
+						input.addEventListener("keydown", (ev) => {
+							if (ev.key === "Enter") commit();
+							else if (ev.key === "Escape") {
+								done = true;
+								this.renderWizard();
+							}
+						});
+						input.addEventListener("blur", commit);
+					});
+					const grand = parentChain[parentChain.length - 1];
+					op(
+						"↑",
+						"升一级（挂到上级，排在其原上级之后）",
+						() => {
+							nodes.splice(i, 1);
+							grand.nodes.splice(grand.index + 1, 0, n);
+						},
+						depth === 0
+					);
+					op(
+						"↓",
+						"降一级（挂到上一个同级之下）",
+						() => {
+							const prev = nodes[i - 1];
+							nodes.splice(i, 1);
+							prev.children.push(n);
+						},
+						i === 0 || depth + 1 + subtreeMaxDepth(n) > 7
+					);
+					op(
+						"＋",
+						"添加子条目",
+						() => {
+							n.children.push({ label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
+						},
+						depth + 1 > 7
+					);
+					op("⤶", "在其后添加同级条目", () => {
+						nodes.splice(i + 1, 0, { label: "（新条目）", href: n.href || "", spineIndex: n.spineIndex ?? -1, children: [] });
+					});
+					if (n.children.length > 0) renderRows(n.children, depth + 1, [...parentChain, { nodes, index: i }]);
+				});
+			};
+			renderRows(tree, 0, []);
+		}
 
 		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
 		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 结构无误，安排阅读 →", attr: { type: "button" } });
@@ -5100,6 +5161,57 @@ class GoalEditModal extends Modal {
 		const back = actions.createEl("button", { cls: "planboard-btn", text: "← 重选书", attr: { type: "button" } });
 		back.addEventListener("click", () => this.goto(STEP_BOOK));
 		this.addCancelButton(actions);
+	}
+
+	/**
+	 * 应用文本编辑：行首缩进（2 空格 / 1 Tab = 一级）重建树。行数与原树一致时
+	 * 按 DFS 序对齐迁移跳转锚点（改字/改层级不丢联动）；增删过行则锚点置空
+	 * （联动将按 ADR-0009 停用，可重新提取恢复）。
+	 */
+	private applyStructText(text: string): void {
+		const oldTree = this.bookTree;
+		if (!oldTree) return;
+		const oldDfs: WeaveTocNode[] = [];
+		const collect = (nodes: WeaveTocNode[], out: WeaveTocNode[]): void =>
+			nodes.forEach((n) => {
+				out.push(n);
+				collect(n.children, out);
+			});
+		collect(oldTree, oldDfs);
+
+		const newTree: WeaveTocNode[] = [];
+		const stack: { depth: number; node: WeaveTocNode }[] = [];
+		for (const raw of text.split(/\r?\n/)) {
+			if (!raw.trim()) continue;
+			const indentChunk = raw.match(/^[\t ]*/)![0];
+			let depth = 0;
+			for (const ch of indentChunk) depth += ch === "\t" ? 1 : 0.5;
+			depth = Math.floor(depth);
+			if (depth > 7) {
+				new Notice("层级过深（最多 8 级）：请减少该行的行首缩进");
+				return;
+			}
+			const node: WeaveTocNode = { label: raw.trim(), href: "", spineIndex: -1, children: [] };
+			while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+			if (stack.length) stack[stack.length - 1].node.children.push(node);
+			else newTree.push(node);
+			stack.push({ depth, node });
+		}
+		if (newTree.length === 0) {
+			new Notice("文本为空：至少保留一行目录");
+			return;
+		}
+		const newDfs: WeaveTocNode[] = [];
+		collect(newTree, newDfs);
+		if (newDfs.length === oldDfs.length) {
+			newDfs.forEach((n, i) => {
+				n.href = oldDfs[i].href;
+				n.spineIndex = oldDfs[i].spineIndex;
+			});
+		}
+		this.bookTree = newTree;
+		this.structTextMode = false;
+		this.renderWizard();
 	}
 
 	/** ADR-0006: 目录粘贴导入页（阅读书籍模式）——解析 → 预览 → 应用为多级结构。 */
