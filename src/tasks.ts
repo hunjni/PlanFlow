@@ -37,6 +37,8 @@ export interface NewTaskInput {
 	plan: string | null;
 	start: string | null;
 	due: string | null;
+	/** 预勾创建（ADR-0009 接续阅读：已越过叶子以已勾态写入任务池作进度记录）。 */
+	checked?: boolean;
 }
 
 /** Path of the task pool file for a given year. */
@@ -75,8 +77,8 @@ export async function listTasks(app: App, rootPath: string, year: string): Promi
 }
 
 /** Build a Tasks-format line for the pool. */
-export function buildPoolLine({ text, plan, start, due }: NewTaskInput): string {
-	let line = `- [ ] ${text.trim()}`;
+export function buildPoolLine({ text, plan, start, due, checked }: NewTaskInput): string {
+	let line = `- [${checked ? "x" : " "}] ${text.trim()}`;
 	if (plan && plan.trim()) line += ` #计划/${plan.trim()}`;
 	if (start) line += ` 🛫 ${start}`;
 	if (due) line += ` 📅 ${due}`;

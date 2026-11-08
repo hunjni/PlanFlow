@@ -40,7 +40,7 @@ import {
 	readPlanPeriod,
 } from "./stats";
 import type { AutoTaskPlan, BookGroup, NewTaskInput, PoolTask } from "./tasks";
-import { addTask, DAY_MS, deleteTask, editTask, ensureAutoTasks, extractGoalName, groupPoolTasksByGoal, isAutoTask, isRestartUnit, listTasks, planCounterUnit, suggestNextUnit, toggleTask, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, STRUCT_UNITS, type ChapterRescheduleContext, type GoalLevel } from "./tasks";
+import { addTask, DAY_MS, deleteTask, editTask, ensureAutoTasks, extractGoalName, groupPoolTasksByGoal, isAutoTask, isRestartUnit, listTasks, planCounterUnit, suggestNextUnit, toggleTask, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, STRUCT_UNITS, type ChapterRescheduleContext, type GoalLeaf, type GoalLevel } from "./tasks";
 import { badgeCounts, computeStreak, readMonthBadges, readPeriodBadges, settleMonth, settleMonthCheckin, settleWeek, settleWeekCheckin, tierFor } from "./achievements";
 import { attachGanttDrag } from "./gantt-drag";
 import { syncPlanTrackingToDiary, syncPoolTaskToDiary, writeReviewToDiary, writeSummaryToDiary, extractReviewSection, buildReviewPrefill, type TrackingItem } from "./diary-sync";
@@ -48,6 +48,17 @@ import { DEFAULT_PLAN_COLORS, type PlanTemplate } from "./settings";
 import type { BzgSnapshot } from "./bzg";
 import { diaryDayWritten, loadBzgSnapshot, readBzgDiaryText, reviewPoolSize, reviewedOn } from "./bzg";
 import { parseToc, tocLeafRange, tocSummary } from "./toc";
+import {
+	crossedLeafIndices,
+	getWeaveBridge,
+	passedLeafIndices,
+	resumeLeafCount,
+	WEAVE_ADVANCE_EVENT,
+	weaveTocToStructure,
+	type WeaveAdvanceDetail,
+	type WeaveBookSummary,
+	type WeaveBridgeApi,
+} from "./weave-bridge";
 
 /** v1.7.4: 插件改名 PlanFlow——view type 同步改（workspace 布局重新打开一次即可） */
 export const VIEW_TYPE_PLANFLOW = "planflow";
@@ -562,6 +573,8 @@ interface GoalInput {
 	mode?: GoalMode;
 	/** ADR-0006: 每日量（review=当日下限；exercise=可选每日目标量）。 */
 	floor?: number;
+	/** ADR-0009: weave 阅读器联动——来源书 sid + 接续阅读预勾叶数（0 = 从头读）。 */
+	reader?: { sid: string; resumeLeaves: number };
 }
 
 /** 目标模式展示元数据（ADR-0006）。 */
@@ -630,6 +643,18 @@ export class PlanBoardView extends ItemView {
 	private bzgSnapshot: BzgSnapshot | null = null;
 	/** ADR-0006: 当前模式目标清单（实按钮判定/自动勾选；buildHomeData 时重建）。 */
 	private modeGoals: { plan: string; goal: PlanGoal; label: string }[] = [];
+	/** ADR-0009: weave 阅读器桥（设置开关门控；fork 缺席/形状不符为 null）。 */
+	private weaveBridge: WeaveBridgeApi | null = null;
+	/** ADR-0009: sid → 叶序锚点缓存（spine 章序 + href；结构与目录形状一致才缓存，null = 形状不符）。 */
+	private weaveAlign = new Map<string, { spine: number[]; hrefs: string[] } | null>();
+	/** ADR-0009: 进行中的锚点解析（in-flight 去重）。 */
+	private weaveAlignPending = new Map<string, Promise<{ spine: number[]; hrefs: string[] } | null>>();
+	/** ADR-0009: 对齐失败已提示过的 sid（一次性提示，避免刷屏）。 */
+	private weaveAlignWarned = new Set<string>();
+	/** ADR-0009: 上次对账时刻（节流——对账是兜底不是追问，vault 改动驱动的刷新不重跑）。 */
+	private lastWeaveReconcile = 0;
+	/** ADR-0009: 进行中的推进确认通知（同一目标不重复弹；hide 时移除）。 */
+	private weaveNotices = new Map<string, Notice>();
 
 	// DOM refs (nullable — guard before touching)
 	private panelEl: HTMLElement | null = null;
@@ -689,6 +714,12 @@ export class PlanBoardView extends ItemView {
 		this.registerEvent(this.app.vault.on("create", this.onVaultModify));
 		this.registerEvent(this.app.vault.on("delete", this.onVaultDelete));
 		this.registerEvent(this.app.vault.on("rename", this.onVaultRename));
+		// ADR-0009: weave 推进事实实时监听（fork 阅读器 dispatch；随视图生命周期注销）
+		const weaveHandler = (evt: Event): void => {
+			void this.onWeaveAdvance((evt as CustomEvent<WeaveAdvanceDetail>).detail);
+		};
+		window.addEventListener(WEAVE_ADVANCE_EVENT, weaveHandler);
+		this.register(() => window.removeEventListener(WEAVE_ADVANCE_EVENT, weaveHandler));
 		await this.refresh();
 		// v1.7.3: 打开时自动创建今日笔记（保持计划总览完整）——Obsidian 启动时 vault 索引异步，
 		// 延迟重试直到索引就绪，仍缺失则静默按模板创建。
@@ -785,8 +816,12 @@ export class PlanBoardView extends ItemView {
 	private async refresh(): Promise<void> {
 		// 计划增改后色表必须重建，否则新计划标签回退灰色（onOpen 只覆盖首次打开）
 		await this.injectPlanColorStyles();
+		// ADR-0009: weave 桥按当前设置重建（fork 缺席/关闭为 null，全链路静默降级）
+		this.weaveBridge = getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
 		if (this.tab === "today") {
 			await this.refreshToday();
+			// ADR-0009 对账兜底（Q13=B）：打开今日面板按书架位置批量确认补勾（最终一致）
+			if (this.weaveBridge) void this.reconcileWeaveReading();
 		} else if (this.tab === "board") {
 			await this.renderBoardPanel();
 		} else if (this.tab === "gantt") {
@@ -862,6 +897,181 @@ export class PlanBoardView extends ItemView {
 	private findModeGoal(plan: string | null, text: string): { plan: string; goal: PlanGoal; label: string } | null {
 		if (!plan) return null;
 		return this.modeGoals.find((mg) => mg.plan === plan && text.includes(mg.goal.name)) ?? null;
+	}
+
+	// -------------------------------------------------------------------------
+	// ADR-0009 weave 阅读器联动：推进事实（确认门）+ 对账兜底 + 跳转
+	// -------------------------------------------------------------------------
+
+	/** 按叶行文本找所属联动目标（叶行 = `{书名}（第…）` 前缀匹配）。 */
+	private findReaderGoal(plan: string | null, text: string): { plan: string; goal: PlanGoal } | null {
+		if (!plan) return null;
+		for (const p of this.planProgress) {
+			if (p.plan !== plan) continue;
+			for (const g of p.goals) {
+				if (g.readerSid && text.startsWith(`${g.name}（`)) return { plan, goal: g };
+			}
+		}
+		return null;
+	}
+
+	private findReaderGoalBySid(sid: string): { plan: string; goal: PlanGoal } | null {
+		for (const p of this.planProgress) {
+			for (const g of p.goals) {
+				if (g.readerSid === sid) return { plan: p.plan, goal: g };
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * 叶序锚点解析：桥目录树与目标结构**逐叶名字比对**一致才可用（跳转/推进映射
+	 * 的前提是结构未经手动改动——只比长度抓不住顺序错位，会静默错勾）；
+	 * 不一致 → 缓存 null，联动对该书停用（首次失效时提示一次）。
+	 * 异步（桥现解析）；带 in-flight 去重，避免并发刷新重复解析。
+	 */
+	private async resolveWeaveAlignment(sid: string, goal: PlanGoal): Promise<{ spine: number[]; hrefs: string[] } | null> {
+		if (this.weaveAlign.has(sid)) return this.weaveAlign.get(sid) ?? null;
+		const pending = this.weaveAlignPending.get(sid);
+		if (pending) return pending;
+		const task = (async (): Promise<{ spine: number[]; hrefs: string[] } | null> => {
+			let result: { spine: number[]; hrefs: string[] } | null = null;
+			try {
+				const tree = await this.weaveBridge?.getToc(sid);
+				const conv = weaveTocToStructure(tree ?? null);
+				const goalLeaves = expandGoalLeaves(goal.name, goal);
+				const convLeaves = conv ? expandGoalStructure(goal.name, conv.levels) : [];
+				if (
+					conv &&
+					goalLeaves &&
+					goalLeaves.length === convLeaves.length &&
+					goalLeaves.every((l, i) => l.name === convLeaves[i].name)
+				) {
+					result = { spine: conv.leafSpine, hrefs: conv.leafHref };
+				}
+			} catch {
+				result = null;
+			}
+			this.weaveAlign.set(sid, result);
+			this.weaveAlignPending.delete(sid);
+			return result;
+		})();
+		this.weaveAlignPending.set(sid, task);
+		return task;
+	}
+
+	/** 对齐失效的一次性提示（结构被手动改过 → 联动停用，避免静默失效让用户以为坏了）。 */
+	private warnWeaveMisaligned(sid: string, goalName: string): void {
+		if (this.weaveAlignWarned.has(sid)) return;
+		this.weaveAlignWarned.add(sid);
+		new Notice(`📖《${goalName}》：目标结构已手动调整，阅读联动（推进勾选/跳转）停用；如需恢复可删除目标后从书架重建`);
+	}
+
+	/** 推进事实落地（Q12+确认门 Q16）：越过叶子 → Notice 二选一（✓勾选 / 忽略落 ✋）。 */
+	private async onWeaveAdvance(d: WeaveAdvanceDetail): Promise<void> {
+		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.toChapter)) return;
+		if (d.toChapter <= d.fromChapter) return; // 单向只勾不退：回读不触发
+		const hit = this.findReaderGoalBySid(d.sid);
+		if (!hit) return;
+		const align = await this.resolveWeaveAlignment(d.sid, hit.goal);
+		if (!align) {
+			this.warnWeaveMisaligned(d.sid, hit.goal.name);
+			return;
+		}
+		await this.confirmWeaveLeaves(hit, crossedLeafIndices(align.spine, d.fromChapter, d.toChapter));
+	}
+
+	/** 对账兜底（Q13=B）：打开今日面板按书架当前位置批量确认（重启/跨设备最终一致）。 */
+	private async reconcileWeaveReading(): Promise<void> {
+		if (!this.weaveBridge || this.planProgress.length === 0) return;
+		const now = Date.now();
+		if (now - this.lastWeaveReconcile < 60000) return; // 1 分钟节流：兜底不是追问
+		this.lastWeaveReconcile = now;
+		let shelf: WeaveBookSummary[] | null = null;
+		try {
+			shelf = await this.weaveBridge.getBookshelf();
+		} catch {
+			return;
+		}
+		if (!shelf?.length) return;
+		for (const p of this.planProgress) {
+			for (const g of p.goals) {
+				if (!g.readerSid) continue;
+				const book = shelf.find((b) => b.sid === g.readerSid);
+				if (!book || book.chapterIndex <= 0) continue;
+				const align = await this.resolveWeaveAlignment(g.readerSid, g);
+				if (!align) {
+					this.warnWeaveMisaligned(g.readerSid, g.name);
+					continue;
+				}
+				await this.confirmWeaveLeaves({ plan: p.plan, goal: g }, passedLeafIndices(align.spine, book.chapterIndex));
+			}
+		}
+	}
+
+	/**
+	 * 确认门：候选叶（越过 ∩ 未勾 ∩ 无 ✋）为空则静默；否则弹一条非阻断 Notice，
+	 * ✓勾选 / 忽略（忽略 = 一次手动决策，落 ✋ 此后自动不问不勾，Q18=A）。
+	 */
+	private async confirmWeaveLeaves(hit: { plan: string; goal: PlanGoal }, leafIdxs: number[]): Promise<void> {
+		const sid = hit.goal.readerSid;
+		if (!sid || !this.weaveBridge || leafIdxs.length === 0) return;
+		if (this.weaveNotices.has(sid)) return; // 同一目标同一时刻只弹一条
+		const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
+		if (!leaves) return;
+		const prefix = `${hit.goal.name}（`;
+		const candidates = this.allPoolTasks.filter(
+			(t) => t.plan === hit.plan && t.text.trim().startsWith(prefix) && !t.checked && !t.raw.includes(MANUAL_MARK)
+		);
+		const todo = leaves
+			.filter((_l, i) => leafIdxs.includes(i))
+			.map((l) => candidates.find((t) => t.text.trim() === l.name))
+			.filter((t): t is PoolTask => !!t);
+		if (todo.length === 0) return;
+		const unit = hit.goal.unit || "节";
+		const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 ${todo.length} ${unit}`, 0);
+		this.weaveNotices.set(sid, notice);
+		const done = (): void => {
+			this.weaveNotices.delete(sid);
+			notice.hide();
+		};
+		const bar = notice.noticeEl.createDiv({ cls: "planboard-notice-actions" });
+		const okBtn = bar.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: `✓ 勾选 ${todo.length} ${unit}` });
+		okBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			done();
+			void this.applyWeaveCheck(hit, todo, true);
+		});
+		const skipBtn = bar.createEl("button", { cls: "planboard-btn", text: "忽略" });
+		skipBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			done();
+			void this.applyWeaveCheck(hit, todo, false);
+		});
+		// 点空白处关掉 = 本次不处理（下次推进/对账再问）
+		notice.noticeEl.addEventListener("click", (e) => {
+			if ((e.target as HTMLElement).closest("button")) return;
+			done();
+		});
+	}
+
+	/** 确认结果写回：勾选（任务池 + 日记投影）或忽略（落 ✋，自动逻辑不再碰）。 */
+	private async applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: PoolTask[], check: boolean): Promise<void> {
+		this.selfWrite = true;
+		try {
+			for (const t of tasks) {
+				if (check) {
+					await toggleTask(this.app, t, true);
+					await syncPoolTaskToDiary(this.app, this.plugin.settings.diaryDir, t.text, true);
+				} else {
+					await this.app.vault.process(t.file, (data) => markTaskLineManual(data, t.line, t.raw));
+				}
+			}
+		} finally {
+			this.selfWrite = false;
+		}
+		new Notice(check ? `已勾选 ${tasks.length} ${hit.goal.unit || "节"}` : `已忽略 ${tasks.length} ${hit.goal.unit || "节"}（此后不再自动勾选，可手动勾）`);
+		await this.refresh();
 	}
 
 	/** Read the annual plan's `plans` frontmatter (year-level, root-level fallback). */
@@ -1564,6 +1774,32 @@ export class PlanBoardView extends ItemView {
 		const scb = slabel.createEl("input", { type: "checkbox", cls: "planboard-checkbox planboard-subcheckbox" });
 		scb.addEventListener("change", () => void this.togglePoolChild(item, t, scb.checked));
 		slabel.createSpan({ cls: "planboard-check-text", text: t.text });
+		// ADR-0009: 联动叶行尾 🔗——在阅读器中打开对应章节（Q14=B：不劫持勾选语义）
+		if (item.plan && !t.checked && this.weaveBridge) {
+			const hit = this.findReaderGoal(item.plan, t.text.trim());
+			const sid = hit?.goal.readerSid;
+			if (hit && sid) {
+				const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
+				const ord = leaves ? leaves.findIndex((l) => l.name === t.text.trim()) : -1;
+				const href = ord >= 0 ? this.weaveAlign.get(sid)?.hrefs[ord] : undefined;
+				if (href) {
+					const jump = sli.createEl("button", {
+						cls: "planboard-icon-btn planboard-jump-btn",
+						attr: { "aria-label": "在阅读器中打开", title: "在阅读器中打开对应章节" },
+					});
+					jump.setText("🔗");
+					jump.addEventListener("click", (e) => {
+						e.preventDefault();
+						e.stopPropagation();
+						try {
+							this.weaveBridge?.openChapter(sid, href);
+						} catch {
+							new Notice("跳转失败：阅读器插件未响应");
+						}
+					});
+				}
+			}
+		}
 		slabel.addEventListener("click", (e) => {
 			if ((e.target as HTMLElement).tagName === "INPUT") return;
 			e.preventDefault();
@@ -1701,7 +1937,19 @@ export class PlanBoardView extends ItemView {
 	private async togglePoolChild(item: CheckItem, task: PoolTask, checked: boolean): Promise<void> {
 		this.selfWrite = true;
 		try {
-			await toggleTask(this.app, task, checked);
+			// ADR-0009: 联动叶手动退勾 → 同一笔写回内落 ✋（单向只勾不退：自动此后不再勾该叶）
+			const readerHit = !checked && item.plan ? this.findReaderGoal(item.plan, task.text.trim()) : null;
+			if (readerHit) {
+				await this.app.vault.process(task.file, (data) => {
+					const lines = data.split("\n");
+					let idx = lines.indexOf(task.raw);
+					if (idx === -1) idx = lines.findIndex((l) => l.startsWith(`- [${task.checked ? "x" : " "}] ${task.text}`));
+					if (idx === -1) return data;
+					return markTaskLineManual(toggleTaskLine(data, idx, checked), idx);
+				});
+			} else {
+				await toggleTask(this.app, task, checked);
+			}
 			await syncPoolTaskToDiary(this.app, this.plugin.settings.diaryDir, task.text, checked);
 			if (checked && item.plan && !item.checked) {
 				// 快照里剔除刚勾掉的任务后无剩余 → 全部完成
@@ -3245,7 +3493,9 @@ export class PlanBoardView extends ItemView {
 		} else {
 			bzgHint = "BZG 联动已在设置中关闭：实际复习量手动记录（每日行「实」按钮）";
 		}
-		new GoalEditModal(this.app, planName, goal, bzgHint, (input) => this.saveGoal(planName, goal, input)).open();
+		// ADR-0009: weave 桥探测（设置门控；fork 缺席 → null，向导静默走粘贴兜底流程）
+		const weave = getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
+		new GoalEditModal(this.app, planName, goal, bzgHint, weave, (input) => this.saveGoal(planName, goal, input)).open();
 	}
 
 	/** Save a new/edited plan category back to the annual frontmatter. Returns success. */
@@ -3364,6 +3614,9 @@ export class PlanBoardView extends ItemView {
 		const isModeGoal = !!input.mode && input.mode !== "reading";
 		if (input.mode) goal.mode = input.mode;
 		if (typeof input.floor === "number" && input.floor > 0) goal.floor = input.floor;
+		// ADR-0009: 阅读器联动 sid（新建来自选书；编辑走旧流程时保留既有绑定，避免联动丢失）
+		if (input.reader?.sid) goal.readerSid = input.reader.sid;
+		else if (existing?.readerSid) goal.readerSid = existing.readerSid;
 		// ADR-0005：结构型目标（多级 structure 或兼容 chapters）；count/单位由叶子推导
 		const leaves = expandGoalLeaves(input.name, input);
 		const isStructured = !isModeGoal && !!(leaves && leaves.length > 0);
@@ -3429,6 +3682,28 @@ export class PlanBoardView extends ItemView {
 				new Notice(`同计划下已存在同名目标「${input.name}」`);
 				return false;
 			}
+			// ADR-0009: 同一本书同时只允许一个未完成目标（推进事实只落单一目标，避免勾选扇出）；
+			// 跨计划查重——书架级约束而非计划级。「未完成」= 存在未勾叶（全勾完 = 已读完，
+			// 允许建重读目标，与提示语承诺一致）
+			if (input.reader?.sid) {
+				const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
+				const poolTasks = await listTasks(this.app, root, this.today.slice(0, 4));
+				const dup = defs
+					.flatMap((d) => d.goals.map((g) => ({ plan: d.name, g })))
+					.filter((x) => x.g.readerSid === input.reader?.sid)
+					.find((x) => {
+						const ls = expandGoalLeaves(x.g.name, x.g) ?? [];
+						if (ls.length === 0) return true;
+						return ls.some((l) => {
+							const t = poolTasks.find((p) => p.text.trim() === l.name);
+							return !t || !t.checked;
+						});
+					});
+				if (dup) {
+					new Notice(`《${dup.g.name}》（计划「${dup.plan}」）正在读这本书（同书同时仅一个未完成目标）；读完后再建重读目标`);
+					return false;
+				}
+			}
 			def.goals.push(goal);
 		}
 
@@ -3451,49 +3726,15 @@ export class PlanBoardView extends ItemView {
 				// ADR-0005: 结构编辑 = 按名对账 + 剩余重排——只删「新序列里已不存在」的任务，
 				// 同名叶子保留（勾选状态不丢，调节奏不丢进度）；未勾的叶子作为剩余序列从新窗口
 				// 第一天起重新摊开（重启/调速），已勾的保留原日期作进度记录、不占新窗口位置
-				const valid = new Set(leaves.map((l) => l.name));
-				// 剩余序列 = 任务池事实中未勾的有效叶子（按书序重新编号 1..m）
-				const poolTasks = pool instanceof TFile ? await listTasks(this.app, root, year) : [];
-				const remaining = new Set(
-					poolTasks.filter((t) => !t.checked && valid.has(t.text.trim())).map((t) => t.text.trim())
-				);
-				const leafIndexByName = new Map<string, number>();
-				let m = 0;
-				for (const l of leaves) {
-					if (remaining.has(l.name)) leafIndexByName.set(l.name, ++m);
-				}
-				// 重排基准窗口：显式 start/end，缺省回退年度计划周期，再缺省自然年（与分解引擎同一口径）
-				const { start: gStart, end: gEnd } = await this.resolveGoalWindow(input, root, year);
-				if (pool instanceof TFile) {
-					const prefix = `${input.name}（`;
-					const ctx: ChapterRescheduleContext = {
-						plan: planName,
-						prefix,
-						valid,
-						leafIndexByName,
-						total: m,
-						start: gStart,
-						end: gEnd,
-					};
-					this.selfWrite = true;
-					try {
-						await this.app.vault.process(pool, (data) =>
-							data
-								.split("\n")
-								.map((l) => rescheduleChapterLine(l, ctx))
-								.filter((l): l is string => l !== null)
-								.join("\n")
-						);
-					} finally {
-						this.selfWrite = false;
-					}
-				}
+				//（ADR-0009: 与接续阅读新建共用同一重排实现）
+				const { rewritten: m, end: gEnd } = await this.rescheduleRemainingReading(planName, input.name, leaves, input, root, year);
 				// 时间窗已结束 → 分解被窗口守卫跳过，显式提示避免静默 0 任务
 				if (gEnd < this.today) {
 					new Notice(`注意：目标时间窗已于 ${gEnd} 结束，未生成分解任务；重新安排请编辑时间窗`);
 				}
 				// 墓碑语义：新序列里仍存在的名字保留墓碑（用户手动删过的节编辑后不复活），
 				// 其余（含改名后的旧前缀残留、已消失的章节名）一律清除
+				const valid = new Set(leaves.map((l) => l.name));
 				this.pruneAutoTombstones([`${existing.name}（`, `${input.name}（`], valid);
 				await this.ensureAutoTasksForToday(root, year);
 				new Notice(m > 0 ? `目标已更新：已完成章节保留记录，剩余 ${m} 节按新时间窗从头重排` : "目标已更新：全部章节已完成，无待重排内容");
@@ -3530,11 +3771,85 @@ export class PlanBoardView extends ItemView {
 		} else {
 			// v1.0.4: 新建同名目标时清掉旧墓碑，避免分解被误跳过
 			this.clearAutoTombstones(`${input.name}（`);
+			// ADR-0009 接续阅读：先把已越过叶子以已勾态写入任务池（日期在窗口前一日，
+			// 作进度记录、不占每日分配）；分解引擎幂等跳过已存在任务名，剩余叶子随后重摊
+			const resumeN = isStructured && leaves ? Math.min(input.reader?.resumeLeaves ?? 0, leaves.length - 1) : 0;
+			if (resumeN > 0 && leaves) {
+				const { start: gStart } = await this.resolveGoalWindow(input, root, year);
+				const anchor = formatDate(addDays(parseDateString(gStart), -1));
+				this.selfWrite = true;
+				try {
+					for (const leaf of leaves.slice(0, resumeN)) {
+						await addTask(this.app, root, year, { text: leaf.name, plan: planName, start: anchor, due: anchor, checked: true });
+					}
+				} finally {
+					this.selfWrite = false;
+				}
+			}
 			await this.ensureAutoTasksForToday(root, year);
-			new Notice("目标已保存，分解任务已生成");
+			// ADR-0009: 剩余（未勾）叶子按剩余序列从窗口第一天重摊（与编辑路径同一公式）
+			if (resumeN > 0 && leaves) {
+				await this.rescheduleRemainingReading(planName, input.name, leaves, input, root, year);
+			}
+			new Notice(resumeN > 0 ? `目标已保存：已读 ${resumeN} 节记为完成，剩余叶子按新窗口重摊` : "目标已保存，分解任务已生成");
 		}
 		await this.refresh();
 		return true;
+	}
+
+	/**
+	 * ADR-0005/0009：剩余（未勾）叶子从窗口首日按剩余序列重摊（已勾的保留原日期作
+	 * 进度记录，不占新窗口位置）。编辑目标与接续阅读新建共用同一公式；
+	 * 返回重排叶数与窗口终点（窗口守卫提示用）。
+	 */
+	private async rescheduleRemainingReading(
+		planName: string,
+		goalName: string,
+		leaves: GoalLeaf[],
+		input: GoalInput,
+		root: string,
+		year: string
+	): Promise<{ rewritten: number; end: string }> {
+		// 重排基准窗口：显式 start/end，缺省回退年度计划周期，再缺省自然年（与分解引擎同一口径）
+		const { start: gStart, end: gEnd } = await this.resolveGoalWindow(input, root, year);
+		const pool = this.app.vault.getAbstractFileByPath(`${root}/${yearDirName(year)}/任务.md`);
+		let m = 0;
+		if (pool instanceof TFile) {
+			const valid = new Set(leaves.map((l) => l.name));
+			// 剩余序列 = 任务池事实中未勾的有效叶子（按书序重新编号 1..m）
+			const poolTasks = await listTasks(this.app, root, year);
+			const remaining = new Set(
+				poolTasks.filter((t) => !t.checked && valid.has(t.text.trim())).map((t) => t.text.trim())
+			);
+			const leafIndexByName = new Map<string, number>();
+			for (const l of leaves) {
+				if (remaining.has(l.name)) leafIndexByName.set(l.name, ++m);
+			}
+			if (m > 0) {
+				const ctx: ChapterRescheduleContext = {
+					plan: planName,
+					prefix: `${goalName}（`,
+					valid,
+					leafIndexByName,
+					total: m,
+					start: gStart,
+					end: gEnd,
+				};
+				this.selfWrite = true;
+				try {
+					await this.app.vault.process(pool, (data) =>
+						data
+							.split("\n")
+							.map((l) => rescheduleChapterLine(l, ctx))
+							.filter((l): l is string => l !== null)
+							.join("\n")
+					);
+				} finally {
+					this.selfWrite = false;
+				}
+			}
+		}
+		return { rewritten: m, end: gEnd };
 	}
 
 	/** Delete a plan category + all of its pool tasks (incl. decomposed). */
@@ -4200,9 +4515,10 @@ class ReviewModal extends Modal {
 /** Modal for creating / editing a quantified goal under a plan (v1.2, spec #4). */
 /** 结构级数上限（真实需求到不了，防御性上限）。 */
 const MAX_STRUCTURE_LEVELS = 8;
-/** 向导步骤常量：-1=模式选择；0=书名与时间；1..8=第 N 级；70=模式表单；80=目录粘贴；90=简单数量；99=确认。 */
+/** 向导步骤常量：-1=模式选择；0=书名与时间；1..8=第 N 级；10=选书（ADR-0009）；70=模式表单；80=目录粘贴；90=简单数量；99=确认。 */
 const STEP_MODE = -1;
 const STEP_INTRO = 0;
+const STEP_BOOK = 10;
 const STEP_FORM = 70;
 const STEP_TOC = 80;
 const STEP_SIMPLE = 90;
@@ -4232,6 +4548,12 @@ class GoalEditModal extends Modal {
 	private formUnitValue = "";
 	private tocValue = "";
 	private tocResult: ReturnType<typeof parseToc> = null;
+	// ADR-0009: weave 联动状态（选书步 / 接续阅读预勾）
+	private weave: WeaveBridgeApi | null;
+	private bookList: WeaveBookSummary[] | null = null;
+	private bookLoading = false;
+	private readerSid = "";
+	private readerResume = 0;
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
 	private customUnitMode = false;
 	/** BZG 联动状态提示（视图侧按当前设置生成，复习表单展示）。 */
@@ -4242,12 +4564,14 @@ class GoalEditModal extends Modal {
 		planName: string,
 		existing: PlanGoal | null,
 		bzgHint: string,
+		weave: WeaveBridgeApi | null,
 		onSubmit: (input: GoalInput) => Promise<boolean>
 	) {
 		super(app);
 		this.planName = planName;
 		this.existing = existing;
 		this.bzgHint = bzgHint;
+		this.weave = weave;
 		this.onSubmit = onSubmit;
 	}
 
@@ -4321,19 +4645,24 @@ class GoalEditModal extends Modal {
 		return `${strip(leaves[0].name)} → ${strip(leaves[leaves.length - 1].name)}`;
 	}
 
-	/** 实时预览：共 N 叶 · 顺序首→末 · 按窗口天数均分结果（ADR-0005）。 */
+	/** 实时预览：共 N 叶 · 顺序首→末 · 按窗口天数均分结果（ADR-0005；接续阅读只摊未读部分，ADR-0009）。 */
 	private buildPreview(): string {
 		const cur = this.currentLeaves();
 		if (!cur || cur.leaves.length === 0) return "";
 		const unit = this.leafUnitOf(cur.levels);
-		const parts = [`共 ${cur.leaves.length} ${unit}`];
+		const remaining = this.readerSid ? Math.max(0, cur.leaves.length - this.readerResume) : cur.leaves.length;
+		const parts = [
+			remaining < cur.leaves.length
+				? `共 ${cur.leaves.length} ${unit}（已读 ${cur.leaves.length - remaining}，分配剩余 ${remaining}）`
+				: `共 ${cur.leaves.length} ${unit}`,
+		];
 		const strip = (name: string): string => name.slice(name.indexOf("（") + 1, -1);
 		parts.push(`顺序 ${strip(cur.leaves[0].name)} → ${strip(cur.leaves[cur.leaves.length - 1].name)}`);
 		if (this.startValue && this.endValue) {
 			const days = dayCount(this.startValue, this.endValue);
-			if (days > 0) {
-				const base = Math.floor(cur.leaves.length / days);
-				const rem = cur.leaves.length % days;
+			if (days > 0 && remaining > 0) {
+				const base = Math.floor(remaining / days);
+				const rem = remaining % days;
 				parts.push(rem === 0 ? `${days} 天 · 每天 ${base} ${unit}` : `${days} 天 · 每天 ${base}~${base + 1} ${unit}`);
 			}
 		} else {
@@ -4356,11 +4685,12 @@ class GoalEditModal extends Modal {
 		contentEl.createEl("h2", {
 			text: this.existing ? `编辑量化目标（${this.planName}）` : `新增量化目标（${this.planName}）`,
 		});
-		// 步骤条只属于阅读/通用结构流；模式选择/模式表单/目录页是独立单屏
-		if (this.step >= STEP_INTRO && this.step !== STEP_TOC && this.step !== STEP_FORM) this.renderStepBar(contentEl);
+		// 步骤条只属于阅读/通用结构流；模式选择/模式表单/目录页/选书页是独立单屏
+		if (this.step >= STEP_INTRO && this.step !== STEP_TOC && this.step !== STEP_FORM && this.step !== STEP_BOOK) this.renderStepBar(contentEl);
 		if (this.step === STEP_MODE) this.renderModeCards(contentEl);
 		else if (this.step === STEP_FORM) this.renderModeForm(contentEl);
 		else if (this.step === STEP_TOC) this.renderTocStep(contentEl);
+		else if (this.step === STEP_BOOK) this.renderBookPicker(contentEl);
 		else if (this.step === STEP_INTRO) this.renderIntro(contentEl);
 		else if (this.step === STEP_SIMPLE) this.renderSimple(contentEl);
 		else if (this.step === STEP_REVIEW) this.renderReview(contentEl);
@@ -4506,6 +4836,12 @@ class GoalEditModal extends Modal {
 				if (!this.formUnitValue) this.formUnitValue = "分钟";
 				this.customUnitMode = false;
 			}
+			// ADR-0009: 阅读模式且桥可用 → 选书步（选中即自动拉目录）；桥缺席/关闭静默走原流程（粘贴兜底）
+			if (mode === "reading" && this.weave) {
+				this.goto(STEP_BOOK);
+				void this.loadBookShelf();
+				return;
+			}
 			this.goto(mode === "reading" || mode === "" ? STEP_INTRO : STEP_FORM);
 		};
 		for (const mode of ["reading", "review", "diary", "exercise"] as GoalMode[]) {
@@ -4527,8 +4863,91 @@ class GoalEditModal extends Modal {
 		this.addCancelButton(actions);
 	}
 
+	/**
+	 * ADR-0009 步骤 10：从阅读器书架选书——选中即自动拉目录生成结构，直达确认页。
+	 * 书架为空 / 目录读取失败 → 引导粘贴导入；粘贴/手动结构入口保留并存（Q5=A）。
+	 */
+	private renderBookPicker(contentEl: HTMLElement): void {
+		contentEl.createDiv({
+			cls: "planboard-goal-preview",
+			text: "📖 从阅读器书架选书：选中后自动读取该书目录，生成逐节阅读结构",
+		});
+		const listEl = contentEl.createDiv({ cls: "planboard-struct-box" });
+		if (!this.bookList) {
+			if (!this.bookLoading) {
+				this.bookLoading = true;
+				void this.loadBookShelf();
+			}
+			listEl.createSpan({ cls: "planboard-goal-preview", text: this.bookLoading ? "正在读取书架…" : "（书架读取失败：可用下方粘贴导入或手动定义结构）" });
+		}
+		for (const b of this.bookList ?? []) {
+			const statusMeta = { unread: "未开始", reading: "阅读中", finished: "已读完" }[b.status];
+			const row = listEl.createDiv({ cls: "planboard-book-row" });
+			const info = row.createDiv({ cls: "planboard-book-row-info" });
+			info.createSpan({ cls: "planboard-book-row-title", text: b.title || "（未命名）" });
+			info.createSpan({
+				cls: "planboard-goal-preview",
+				text: `${b.author ? ` · ${b.author}` : ""} · ${statusMeta}${b.percent > 0 ? ` ${Math.round(b.percent)}%` : ""}`,
+			});
+			row.addEventListener("click", () => void this.pickBook(b));
+		}
+		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
+		const tocBtn = actions.createEl("button", { cls: "planboard-btn", text: "📋 粘贴目录导入", attr: { type: "button" } });
+		tocBtn.addEventListener("click", () => this.goto(STEP_TOC));
+		const manualBtn = actions.createEl("button", { cls: "planboard-btn", text: "✍️ 手动定义结构", attr: { type: "button" } });
+		manualBtn.addEventListener("click", () => this.goto(STEP_INTRO));
+		this.addCancelButton(actions);
+	}
+
+	/** 拉取书架快照（选书步数据源）；完成后仍在选书页则重渲染列表。 */
+	private async loadBookShelf(): Promise<void> {
+		if (this.bookLoading) return;
+		this.bookLoading = true;
+		let list: WeaveBookSummary[] | null = null;
+		try {
+			list = this.weave ? await this.weave.getBookshelf() : null;
+		} catch {
+			list = null;
+		}
+		this.bookList = list && list.length > 0 ? list : null;
+		this.bookLoading = false;
+		if (this.step === STEP_BOOK && this.contentEl.isConnected) this.renderWizard();
+	}
+
+	/** 选中一本书：拉目录 → 结构 + 书名 + 接续阅读预勾数，直达确认页。 */
+	private async pickBook(b: WeaveBookSummary): Promise<void> {
+		if (!this.weave) return;
+		let tree = null;
+		try {
+			tree = await this.weave.getToc(b.sid);
+		} catch {
+			tree = null;
+		}
+		const conv = weaveTocToStructure(tree);
+		if (!conv) {
+			new Notice(`未能读取《${b.title}》的目录：可用粘贴导入或手动定义结构`);
+			return;
+		}
+		this.nameValue = b.title || this.nameValue;
+		this.levels = conv.levels.map((lv) => ({ unit: lv.unit, counts: [...lv.counts] }));
+		this.readerSid = b.sid;
+		// 接续阅读（Q11=B）：当前章序之前的叶子在保存时预勾，分配只覆盖剩余
+		this.readerResume = resumeLeafCount(conv.leafSpine, b.chapterIndex);
+		this.goto(STEP_REVIEW);
+	}
+
 	/** ADR-0006: 目录粘贴导入页（阅读书籍模式）——解析 → 预览 → 应用为多级结构。 */
 	private renderTocStep(contentEl: HTMLElement): void {
+		// ADR-0009: 从选书页直接进粘贴时书名可能为空——粘贴不经过选书，需用户补填
+		if (!this.nameValue.trim()) {
+			new Setting(contentEl).setName("书名").setDesc("书名即目标名；从书架选书会自动带出，粘贴导入请在此填写").addText((text) => {
+				text.setValue(this.nameValue);
+				text.setPlaceholder("例如：《交易心理分析》");
+				text.inputEl.addEventListener("input", () => {
+					this.nameValue = text.inputEl.value;
+				});
+			});
+		}
 		new Setting(contentEl)
 			.setName("📋 粘贴书籍目录")
 			.setDesc("每行一条；支持「第X篇/章/节」、1.2 数字编号与缩进层级，可混合")
@@ -4570,7 +4989,7 @@ class GoalEditModal extends Modal {
 			this.goto(STEP_REVIEW);
 		});
 		const back = actions.createEl("button", { cls: "planboard-btn", text: "← 上一步", attr: { type: "button" } });
-		back.addEventListener("click", () => this.goto(STEP_INTRO));
+		back.addEventListener("click", () => this.goto(this.weave && this.modeValue === "reading" ? STEP_BOOK : STEP_INTRO));
 		this.addCancelButton(actions);
 	}
 
@@ -4848,6 +5267,13 @@ class GoalEditModal extends Modal {
 			cls: "planboard-goal-preview",
 			text: `书名：${this.nameValue.trim() || "（未填）"} · 顺序 ${this.leafRangeText(cur.leaves)}`,
 		});
+		// ADR-0009 接续阅读：预勾口径明示在确认页（保存时自动记为完成，分配只覆盖剩余）
+		if (this.readerSid && this.readerResume > 0) {
+			summary.createDiv({
+				cls: "planboard-goal-preview",
+				text: `接续阅读：已读的前 ${this.readerResume} ${unit}保存时自动记为完成，每日分配覆盖剩余 ${cur.leaves.length - this.readerResume} ${unit}`,
+			});
+		}
 
 		new Setting(contentEl)
 			.setName("开始日期")
@@ -4865,7 +5291,8 @@ class GoalEditModal extends Modal {
 			text.setValue(this.daysValue);
 			text.inputEl.type = "number";
 			text.inputEl.min = "1";
-			text.setPlaceholder(`例如：${Math.max(1, Math.ceil(cur.leaves.length / 3))}（每天约 3 ${unit}）`);
+			const planN = this.readerSid ? Math.max(1, cur.leaves.length - this.readerResume) : cur.leaves.length;
+			text.setPlaceholder(`例如：${Math.max(1, Math.ceil(planN / 3))}（每天约 3 ${unit}）`);
 			text.inputEl.addEventListener("input", () => {
 				this.daysValue = text.inputEl.value;
 				this.applyDays();
@@ -4931,6 +5358,10 @@ class GoalEditModal extends Modal {
 		if (this.endValue) input.end = this.endValue;
 		// ADR-0006: 阅读书籍模式落 mode 标记（通用目标保持无模式）
 		if (this.modeValue === "reading") input.mode = "reading";
+		// ADR-0009: 阅读器联动（选书步来源）——sid + 接续阅读预勾数
+		if (this.modeValue === "reading" && this.readerSid) {
+			input.reader = { sid: this.readerSid, resumeLeaves: this.readerResume };
+		}
 		if (!simple) {
 			const levels = this.cleanLevels();
 			const leaves = expandGoalStructure(name, levels);
@@ -5109,6 +5540,8 @@ function serializePlans(plans: PlanDef[], dailyByPlan?: Record<string, boolean>)
 				if (g.floor != null) lines.push(`        floor: ${g.floor}`);
 				// ADR-0005：章节 chapters 与多级 structure 原样写回（flow 序列 / 块序列，yamlScalar 只管标量）
 				if (g.chapters && g.chapters.length > 0) lines.push(`        chapters: [${g.chapters.join(", ")}]`);
+				// ADR-0009：阅读器来源书稳定标识原样写回（联动跳转/推进事实的唯一键）
+				if (g.readerSid) lines.push(`        readerSid: ${yamlScalar(g.readerSid)}`);
 				if (g.structure && g.structure.length > 0) {
 					lines.push("        structure:");
 					for (const lv of g.structure) {
@@ -5164,7 +5597,7 @@ function toPlanDef(prog: PlanProgress): PlanDef {
 		type: prog.isQuota ? "quota" : prog.isNumeric ? "numeric" : "check",
 		target: prog.target,
 		targetCount: prog.targetCount,
-		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor })),
+		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor, readerSid: g.readerSid })),
 		quota: prog.quota ? { total: prog.quota.total, unit: prog.quota.unit, start: prog.quota.start, end: prog.quota.end } : null,
 		action: prog.action,
 		label: prog.label,

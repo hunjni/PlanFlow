@@ -7,7 +7,7 @@
 - Obsidian 插件：个人计划总览（每日打卡 + 进度统计 + 目标管理）
 - 技术栈：TypeScript + esbuild，Obsidian 官方模板结构
 - 数据全部基于 markdown 笔记（Tasks 任务格式 + frontmatter），不做私有存储
-- 不依赖任何第三方 Obsidian 插件（自包含）
+- 不依赖任何第三方 Obsidian 插件（自包含）；例外见 ADR-0009：可选的 weave 阅读器桥——运行时探测，桥缺席即静默降级，不构成硬依赖
 
 ## 构建与部署
 

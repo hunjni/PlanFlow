@@ -1,9 +1,9 @@
 // test/obsidian-mock.ts
 var TFile = class {
   constructor(path) {
-    var _a27;
+    var _a29;
     this.path = path != null ? path : "";
-    this.name = (_a27 = this.path.split("/").pop()) != null ? _a27 : "";
+    this.name = (_a29 = this.path.split("/").pop()) != null ? _a29 : "";
   }
 };
 function parseYaml(src) {
@@ -295,7 +295,7 @@ function missingQuotaLines(content, quotas, date) {
 
 // src/tasks.ts
 function parseTaskPool(file2, content) {
-  var _a27, _b11, _c7;
+  var _a29, _b12, _c8;
   const tasks2 = [];
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -304,10 +304,10 @@ function parseTaskPool(file2, content) {
       continue;
     tasks2.push({
       text: m2[2].trim(),
-      plan: (_a27 = m2[3]) != null ? _a27 : null,
+      plan: (_a29 = m2[3]) != null ? _a29 : null,
       checked: m2[1] === "x",
-      start: (_b11 = m2[4]) != null ? _b11 : null,
-      due: (_c7 = m2[5]) != null ? _c7 : null,
+      start: (_b12 = m2[4]) != null ? _b12 : null,
+      due: (_c8 = m2[5]) != null ? _c8 : null,
       line: i,
       raw: lines[i],
       file: file2
@@ -315,8 +315,8 @@ function parseTaskPool(file2, content) {
   }
   return tasks2;
 }
-function buildPoolLine({ text, plan, start, due }) {
-  let line = `- [ ] ${text.trim()}`;
+function buildPoolLine({ text, plan, start, due, checked }) {
+  let line = `- [${checked ? "x" : " "}] ${text.trim()}`;
   if (plan && plan.trim())
     line += ` #\u8BA1\u5212/${plan.trim()}`;
   if (start)
@@ -354,18 +354,18 @@ function groupPoolTasksByGoal(tasks2, today) {
       byName.set(name, [t]);
   }
   const coversToday = (t) => {
-    var _a27, _b11;
-    const s = (_a27 = t.start) != null ? _a27 : t.due;
-    const d = (_b11 = t.due) != null ? _b11 : t.start;
+    var _a29, _b12;
+    const s = (_a29 = t.start) != null ? _a29 : t.due;
+    const d = (_b12 = t.due) != null ? _b12 : t.start;
     return !!s && !!d && s <= today && today <= d;
   };
   const groups = [];
   for (const [name, groupTasks] of byName) {
     const pending = groupTasks.filter((t) => {
-      var _a27;
+      var _a29;
       if (t.checked)
         return false;
-      const effStart = (_a27 = t.start) != null ? _a27 : t.due;
+      const effStart = (_a29 = t.start) != null ? _a29 : t.due;
       return !!effStart && effStart <= today;
     });
     const todayDone = groupTasks.filter((t) => t.checked && coversToday(t));
@@ -416,15 +416,15 @@ var UNIT_SUCCESSORS = {
   \u6761: []
 };
 function suggestNextUnit(prevUnit) {
-  var _a27;
+  var _a29;
   const list = UNIT_SUCCESSORS[prevUnit.trim()];
-  return (_a27 = list == null ? void 0 : list[0]) != null ? _a27 : "\u8282";
+  return (_a29 = list == null ? void 0 : list[0]) != null ? _a29 : "\u8282";
 }
 function isRestartUnit(word) {
   return RESTART_UNITS.has(word.trim());
 }
 function expandGoalStructure(goalName, levels) {
-  var _a27, _b11, _c7;
+  var _a29, _b12, _c8;
   const clean = (v) => {
     const n = typeof v === "number" ? Math.floor(v) : parseInt(String(v), 10);
     return Number.isFinite(n) && n >= 0 ? n : 0;
@@ -434,14 +434,14 @@ function expandGoalStructure(goalName, levels) {
   let level = [];
   let roots = [];
   for (let li = 0; li < levels.length; li++) {
-    const unit = String((_b11 = (_a27 = levels[li]) == null ? void 0 : _a27.unit) != null ? _b11 : "").trim();
+    const unit = String((_b12 = (_a29 = levels[li]) == null ? void 0 : _a29.unit) != null ? _b12 : "").trim();
     if (!unit)
       return [];
     const restart = RESTART_UNITS.has(unit);
     const next = [];
     let g = 0;
     if (li === 0) {
-      const n = clean((_c7 = levels[0].counts) == null ? void 0 : _c7[0]);
+      const n = clean((_c8 = levels[0].counts) == null ? void 0 : _c8[0]);
       if (n <= 0)
         return [];
       for (let i = 1; i <= n; i++) {
@@ -522,10 +522,10 @@ function chaptersToStructure(chapters) {
   ];
 }
 function expandGoalLeaves(goalName, goal) {
-  var _a27, _b11;
-  if ((_a27 = goal.structure) == null ? void 0 : _a27.length)
+  var _a29, _b12;
+  if ((_a29 = goal.structure) == null ? void 0 : _a29.length)
     return expandGoalStructure(goalName, goal.structure);
-  if ((_b11 = goal.chapters) == null ? void 0 : _b11.length)
+  if ((_b12 = goal.chapters) == null ? void 0 : _b12.length)
     return expandGoalStructure(goalName, chaptersToStructure(goal.chapters));
   return null;
 }
@@ -670,8 +670,8 @@ function buildBzgSnapshot(items2, cfg) {
   };
 }
 function reviewedOn(snap2, localDay) {
-  var _a27, _b11;
-  return (_b11 = (_a27 = snap2.byDay.get(localDay)) == null ? void 0 : _a27.size) != null ? _b11 : 0;
+  var _a29, _b12;
+  return (_b12 = (_a29 = snap2.byDay.get(localDay)) == null ? void 0 : _a29.size) != null ? _b12 : 0;
 }
 function distinctReviewedInRange(snap2, start, end) {
   let count = 0;
@@ -721,9 +721,9 @@ function quotaExpected(dailyQuota, start, end, today) {
 }
 function filterTasksInRange(tasks2, start, end) {
   return tasks2.filter((t) => {
-    var _a27, _b11;
-    const s = (_a27 = t.start) != null ? _a27 : t.due;
-    const e = (_b11 = t.due) != null ? _b11 : t.start;
+    var _a29, _b12;
+    const s = (_a29 = t.start) != null ? _a29 : t.due;
+    const e = (_b12 = t.due) != null ? _b12 : t.start;
     if (!s || !e)
       return false;
     return s <= end && e >= start;
@@ -735,7 +735,7 @@ function summarizeTasks(tasks2) {
   return { total, done, percent: total === 0 ? 0 : Math.round(done / total * 100) };
 }
 function parsePlansFromFrontmatter(content) {
-  var _a27, _b11, _c7;
+  var _a29, _b12, _c8;
   const fmMatch = /^---\n([\s\S]*?)\n---/.exec(content);
   if (!fmMatch)
     return [];
@@ -751,7 +751,7 @@ function parsePlansFromFrontmatter(content) {
     return [];
   const defs = [];
   const push = (name, obj) => {
-    var _a28;
+    var _a30;
     const trimmed = name.trim();
     if (!trimmed)
       return;
@@ -767,7 +767,7 @@ function parsePlansFromFrontmatter(content) {
       targetCount = goals.reduce((acc, g) => acc + g.count, 0);
     } else {
       type = readPlanType(obj, target);
-      const m2 = (_a28 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a28 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
+      const m2 = (_a30 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a30 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
       targetCount = type === "numeric" && m2 ? parseInt(m2[1], 10) : 0;
     }
     defs.push({
@@ -801,7 +801,7 @@ function parsePlansFromFrontmatter(content) {
         }
       } else if (el && typeof el === "object") {
         const obj = el;
-        const name = (_c7 = (_b11 = (_a27 = obj.name) != null ? _a27 : obj.plan) != null ? _b11 : obj["\u540D\u79F0"]) != null ? _c7 : obj["\u8BA1\u5212"];
+        const name = (_c8 = (_b12 = (_a29 = obj.name) != null ? _a29 : obj.plan) != null ? _b12 : obj["\u540D\u79F0"]) != null ? _c8 : obj["\u8BA1\u5212"];
         if (typeof name === "string") {
           push(name, obj);
         } else {
@@ -848,7 +848,7 @@ function readPlanString(obj, keys) {
   return "";
 }
 function readPlanGoals(obj) {
-  var _a27, _b11, _c7, _d2;
+  var _a29, _b12, _c8, _d2;
   if (!obj || !Array.isArray(obj.goals))
     return [];
   const out = [];
@@ -856,7 +856,7 @@ function readPlanGoals(obj) {
     if (typeof g === "string") {
       const m2 = /^(.+?)\s+(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天|章|节)?(?:\s+(\d{4}-\d{2}-\d{2})~\s*(\d{4}-\d{2}-\d{2}))?$/.exec(g.trim());
       if (m2) {
-        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a27 = m2[3]) != null ? _a27 : "\u4E2A", start: m2[4], end: m2[5] });
+        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a29 = m2[3]) != null ? _a29 : "\u4E2A", start: m2[4], end: m2[5] });
       }
       continue;
     }
@@ -868,8 +868,8 @@ function readPlanGoals(obj) {
       continue;
     const mode = parseGoalMode(readPlanString(rec, ["mode", "\u6A21\u5F0F"]));
     const count = typeof rec.count === "number" ? rec.count : typeof rec["\u6570\u91CF"] === "number" ? rec["\u6570\u91CF"] : (() => {
-      var _a28;
-      const cv = (_a28 = rec.count) != null ? _a28 : rec["\u6570\u91CF"];
+      var _a30;
+      const cv = (_a30 = rec.count) != null ? _a30 : rec["\u6570\u91CF"];
       return parseInt(cv == null ? "0" : typeof cv === "string" || typeof cv === "number" ? String(cv) : "0", 10);
     })();
     if (!mode && (!count || Number.isNaN(count) || count <= 0))
@@ -889,7 +889,7 @@ function readPlanGoals(obj) {
     const goal = { name: name.trim(), count, unit, start: start || void 0, end: end || void 0 };
     if (mode) {
       goal.mode = mode;
-      const rawFloor = (_c7 = (_b11 = rec.floor) != null ? _b11 : rec["\u4E0B\u9650"]) != null ? _c7 : rec["\u6BCF\u65E5"];
+      const rawFloor = (_c8 = (_b12 = rec.floor) != null ? _b12 : rec["\u4E0B\u9650"]) != null ? _c8 : rec["\u6BCF\u65E5"];
       const floorVal = typeof rawFloor === "number" ? rawFloor : parseFloat(String(rawFloor != null ? rawFloor : ""));
       if (Number.isFinite(floorVal) && floorVal > 0)
         goal.floor = floorVal;
@@ -898,6 +898,9 @@ function readPlanGoals(obj) {
     }
     if (chapters && chapters.length > 0)
       goal.chapters = chapters;
+    const readerSid = readPlanString(rec, ["readerSid", "\u9605\u8BFB\u5668\u4E66"]);
+    if (readerSid)
+      goal.readerSid = readerSid;
     const rawStructure = rec.structure;
     if (Array.isArray(rawStructure)) {
       const levels = [];
@@ -921,10 +924,10 @@ function readPlanGoals(obj) {
   return out;
 }
 function readPlanQuota(obj) {
-  var _a27, _b11, _c7, _d2, _e;
+  var _a29, _b12, _c8, _d2, _e;
   if (!obj)
     return null;
-  const raw = (_b11 = (_a27 = obj.quota) != null ? _a27 : obj["\u5B9A\u989D"]) != null ? _b11 : obj["\u65E5\u5B9A\u989D"];
+  const raw = (_b12 = (_a29 = obj.quota) != null ? _a29 : obj["\u5B9A\u989D"]) != null ? _b12 : obj["\u65E5\u5B9A\u989D"];
   let rec = null;
   if (raw && typeof raw === "object") {
     rec = raw;
@@ -936,7 +939,7 @@ function readPlanQuota(obj) {
   }
   if (!rec)
     return null;
-  const totalRaw = (_d2 = (_c7 = rec.total) != null ? _c7 : rec["\u603B\u91CF"]) != null ? _d2 : rec["\u6570\u91CF"];
+  const totalRaw = (_d2 = (_c8 = rec.total) != null ? _c8 : rec["\u603B\u91CF"]) != null ? _d2 : rec["\u6570\u91CF"];
   const total = typeof totalRaw === "number" ? totalRaw : parseFloat(String(totalRaw != null ? totalRaw : ""));
   if (!Number.isFinite(total) || total <= 0)
     return null;
@@ -987,11 +990,15 @@ function readPlanType(obj, target) {
 var DEFAULT_UNIT_CHAIN = ["\u7AE0", "\u8282", "\u5C0F\u8282", "\u76EE", "\u6761", "\u7EC6\u76EE"];
 var UNIT_ORDER = STRUCT_UNITS.map((u) => u.word);
 var CN_UNIT_RE = /^第\s*[0-9一二三四五六七八九十百千]+\s*(部|编|卷|辑|篇|单元|模块|章|回|课|讲|集|幕|场|节|小节|目|条)/;
+function extractTocUnitWord(label) {
+  const m2 = CN_UNIT_RE.exec(label.trim());
+  return m2 ? m2[1] : "";
+}
 var CN_ORD_RE = /^[一二三四五六七八九十百]+[、.．]/;
 var MAX_TOC_LEVELS = 8;
 var MAX_TOC_LINES = 500;
 function parseTocLine(rawLine) {
-  var _a27;
+  var _a29;
   let line = rawLine.trim();
   line = line.replace(/^[-*•·]\s*(?:\[[ x]\]\s*)?/, "");
   if (!line)
@@ -1008,7 +1015,7 @@ function parseTocLine(rawLine) {
   const num = /^(\d+)(?:[.、](\d+))?(?:\.(\d+))?/.exec(line);
   if (num) {
     const depth = num[3] ? 2 : num[2] ? 1 : 0;
-    return { title: line, level: depth, family: "N", unit: (_a27 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a27 : `\u7EA7${depth + 1}` };
+    return { title: line, level: depth, family: "N", unit: (_a29 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a29 : `\u7EA7${depth + 1}` };
   }
   if (CN_ORD_RE.test(line)) {
     return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
@@ -1022,7 +1029,7 @@ function parseTocLine(rawLine) {
   return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
 }
 function parseToc(text) {
-  var _a27, _b11, _c7;
+  var _a29, _b12, _c8;
   const items2 = [];
   let skipped = 0;
   for (const l of text.split(/\r?\n/)) {
@@ -1064,7 +1071,7 @@ function parseToc(text) {
     }
     const depth = parent ? parent.depth + 1 : 0;
     if (depth >= MAX_TOC_LEVELS) {
-      const leafParent = (_b11 = (_a27 = stack[stack.length - 1]) == null ? void 0 : _a27.node) != null ? _b11 : virtualRoot;
+      const leafParent = (_b12 = (_a29 = stack[stack.length - 1]) == null ? void 0 : _a29.node) != null ? _b12 : virtualRoot;
       leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, children: [] });
       continue;
     }
@@ -1078,12 +1085,12 @@ function parseToc(text) {
   const freq = [];
   {
     const walk = (nodes) => {
-      var _a28;
+      var _a30;
       for (const n of nodes) {
         while (freq.length <= n.depth)
           freq.push(/* @__PURE__ */ new Map());
         if (n.unit)
-          freq[n.depth].set(n.unit, ((_a28 = freq[n.depth].get(n.unit)) != null ? _a28 : 0) + 1);
+          freq[n.depth].set(n.unit, ((_a30 = freq[n.depth].get(n.unit)) != null ? _a30 : 0) + 1);
         maxDepth = Math.max(maxDepth, n.depth + 1);
         walk(n.children);
       }
@@ -1094,7 +1101,7 @@ function parseToc(text) {
   for (let i = 0; i < maxDepth; i++) {
     let best = "";
     let bestN = 0;
-    for (const [w, n] of (_c7 = freq[i]) != null ? _c7 : []) {
+    for (const [w, n] of (_c8 = freq[i]) != null ? _c8 : []) {
       if (n > bestN) {
         best = w;
         bestN = n;
@@ -1119,6 +1126,86 @@ function parseToc(text) {
 function tocSummary(result) {
   const parts = result.levels.map((lv) => `${lv.unit} \xD7${lv.counts.reduce((a, b) => a + b, 0)}`);
   return `\u8BC6\u522B ${result.lineCount} \u884C${result.skipped ? `\uFF08\u8DF3\u8FC7 ${result.skipped} \u884C\uFF09` : ""} \xB7 ${parts.join(" \u2192 ")}`;
+}
+
+// src/weave-bridge.ts
+function weaveTocToStructure(tree) {
+  if (!tree || tree.length === 0)
+    return null;
+  const freq = [];
+  const walkFreq = (nodes, depth) => {
+    var _a29;
+    for (const n of nodes) {
+      while (freq.length <= depth)
+        freq.push(/* @__PURE__ */ new Map());
+      const w = extractTocUnitWord(n.label);
+      if (w)
+        freq[depth].set(w, ((_a29 = freq[depth].get(w)) != null ? _a29 : 0) + 1);
+      walkFreq(n.children, depth + 1);
+    }
+  };
+  walkFreq(tree, 0);
+  const depth0 = freq.length;
+  if (depth0 === 0 || depth0 > 8)
+    return null;
+  const units = [];
+  for (let d = 0; d < depth0; d++) {
+    let best = "";
+    let bestN = 0;
+    for (const [w, n] of freq[d]) {
+      if (n > bestN) {
+        best = w;
+        bestN = n;
+      }
+    }
+    units.push(best || DEFAULT_UNIT_CHAIN[d] || `\u7EA7${d + 1}`);
+  }
+  const levels = units.map((unit) => ({ unit, counts: [] }));
+  levels[0].counts = [tree.length];
+  const leafSpine = [];
+  const leafHref = [];
+  {
+    let current = tree;
+    for (let lv = 1; lv < levels.length; lv++) {
+      levels[lv].counts = current.map((n) => n.children.length);
+      current = current.flatMap((n) => n.children);
+    }
+    const visit = (n, depth) => {
+      if (depth === levels.length - 1 || n.children.length === 0) {
+        leafSpine.push(n.spineIndex);
+        leafHref.push(n.href);
+        return;
+      }
+      for (const c of n.children)
+        visit(c, depth + 1);
+    };
+    for (const n of tree)
+      visit(n, 0);
+  }
+  if (levels[0].counts[0] <= 0)
+    return null;
+  return { levels, leafSpine, leafHref };
+}
+function resumeLeafCount(leafSpine, chapterIndex) {
+  return passedLeafIndices(leafSpine, chapterIndex).length;
+}
+function crossedLeafIndices(leafSpine, fromChapter, toChapter) {
+  const out = [];
+  for (let i = 0; i < leafSpine.length; i++) {
+    const s = leafSpine[i];
+    if (s >= 0 && s >= fromChapter && s < toChapter)
+      out.push(i);
+  }
+  return out;
+}
+function passedLeafIndices(leafSpine, chapterIndex) {
+  const out = [];
+  for (let i = 0; i < leafSpine.length; i++) {
+    const s = leafSpine[i];
+    if (s >= 0 && s < chapterIndex)
+      out.push(i);
+  }
+  return out;
 }
 
 // test/parse-test.ts
@@ -1723,6 +1810,68 @@ var scheduled = bookView.groups.filter((g) => g.scheduled);
 var doneToday = scheduled.filter((g) => g.pending.length === 0);
 check("fraction denominator = 5", scheduled.length === 5, scheduled.length);
 check("fraction numerator = 2", doneToday.length === 2, doneToday.length);
+var bookTree = [
+  {
+    label: "\u7B2C1\u7AE0 \u521D\u89C1",
+    href: "c1.xhtml",
+    spineIndex: 1,
+    children: [
+      { label: "1.1 \u76F8\u9047", href: "c1.xhtml#s1", spineIndex: 1, children: [] },
+      { label: "1.2 \u79BB\u522B", href: "c1.xhtml#s2", spineIndex: 1, children: [] }
+    ]
+  },
+  { label: "\u7B2C2\u7AE0 \u72EC\u767D", href: "c2.xhtml", spineIndex: 2, children: [] },
+  {
+    label: "\u7B2C3\u7AE0 \u91CD\u9022",
+    href: "c3.xhtml",
+    spineIndex: 4,
+    children: [{ label: "3.1 \u91CD\u9022", href: "c3.xhtml#s1", spineIndex: 4, children: [] }]
+  }
+];
+var conv = weaveTocToStructure(bookTree);
+check("bridge: converts tree", conv !== null);
+check("bridge: 2 levels", (conv == null ? void 0 : conv.levels.length) === 2, conv == null ? void 0 : conv.levels.length);
+check("bridge: level0 \u7AE0\xD73", (conv == null ? void 0 : conv.levels[0].unit) === "\u7AE0" && conv.levels[0].counts[0] === 3);
+check("bridge: level1 \u8282 [2,0,1]", (conv == null ? void 0 : conv.levels[1].unit) === "\u8282" && JSON.stringify(conv.levels[1].counts) === "[2,0,1]", JSON.stringify(conv == null ? void 0 : conv.levels[1].counts));
+check("bridge: leaf count 4", (conv == null ? void 0 : conv.leafSpine.length) === 4, conv == null ? void 0 : conv.leafSpine.length);
+check("bridge: leafSpine DFS [1,1,2,4]", JSON.stringify(conv == null ? void 0 : conv.leafSpine) === "[1,1,2,4]", JSON.stringify(conv == null ? void 0 : conv.leafSpine));
+check("bridge: leafHref DFS", (conv == null ? void 0 : conv.leafHref.join("|")) === "c1.xhtml#s1|c1.xhtml#s2|c2.xhtml|c3.xhtml#s1");
+var bridgeLeaves = expandGoalStructure("\u6D4B\u8BD5\u4E66", conv.levels);
+check("bridge: alignment invariant (leaves match)", bridgeLeaves.length === conv.leafSpine.length, `${bridgeLeaves.length} vs ${conv.leafSpine.length}`);
+check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("\u7B2C 2 \u7AE0")));
+check("resume: chapter 2 \u2192 2 pre-read", resumeLeafCount(conv.leafSpine, 2) === 2, resumeLeafCount(conv.leafSpine, 2));
+check("resume: 0 for unread book", resumeLeafCount(conv.leafSpine, 0) === 0);
+check("resume: all for finished book", resumeLeafCount(conv.leafSpine, 5) === 4);
+check("advance: crossed [1,4) \u2192 idx 0,1,2", JSON.stringify(crossedLeafIndices(conv.leafSpine, 1, 4)) === "[0,1,2]", JSON.stringify(crossedLeafIndices(conv.leafSpine, 1, 4)));
+check("advance: backward no crossing", crossedLeafIndices(conv.leafSpine, 4, 1).length === 0);
+check("passed: chapter 4 \u2192 3 leaves (current excluded)", passedLeafIndices(conv.leafSpine, 4).length === 3);
+check("bridge: null for empty tree", weaveTocToStructure(null) === null && weaveTocToStructure([]) === null);
+var deep = { label: "\u7B2C1\u6761", href: "d9", spineIndex: 0, children: [] };
+for (let i = 0; i < 8; i++)
+  deep = { label: `\u7B2C1\u7EA7${8 - i}`, href: `d${8 - i}`, spineIndex: 0, children: [deep] };
+check("bridge: >8 levels rejected", weaveTocToStructure([deep]) === null);
+check("bridge: single level ok", weaveTocToStructure([{ label: "\u7B2C1\u7AE0", href: "c", spineIndex: 0, children: [] }]) !== null);
+var fmReader = `---
+plans:
+  \u9605\u8BFB:
+    type: \u6570\u91CF
+    target: \u8BFB\u4E66
+    goals:
+      - name: \u4EA4\u6613\u5FC3\u7406\u5206\u6790
+        count: 17
+        unit: \u8282
+        structure:
+          - unit: \u7AE0
+            counts: [17]
+        readerSid: epubsrc-d3aedbaff902c0fb5db47804
+---
+`;
+var defsReader = parsePlansFromFrontmatter(fmReader);
+var _a27;
+var readerGoal = (_a27 = defsReader[0]) == null ? void 0 : _a27.goals[0];
+check("readerSid: parsed from frontmatter", (readerGoal == null ? void 0 : readerGoal.readerSid) === "epubsrc-d3aedbaff902c0fb5db47804", readerGoal == null ? void 0 : readerGoal.readerSid);
+var _a28, _b11, _c7;
+check("readerSid: absent \u2192 undefined", ((_c7 = (_b11 = (_a28 = defs1[0]) == null ? void 0 : _a28.goals) == null ? void 0 : _b11[0]) == null ? void 0 : _c7.readerSid) === void 0);
 console.log(failed === 0 ? "\nALL PASSED" : `
 ${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

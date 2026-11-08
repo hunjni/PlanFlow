@@ -77,6 +77,11 @@ export interface PlanGoal {
 	 * exercise = 可选每日目标量；diary 不用。
 	 */
 	floor?: number;
+	/**
+	 * ADR-0009 weave 阅读器联动：目标来源书的稳定标识（epubsrc-…）。
+	 * 非空 = 启用联动（跳转/推进事实/对账）；目标只存 sid 不落锚点。
+	 */
+	readerSid?: string;
 }
 
 /** Quota definition under a quota-type plan (ADR-0001 日定额型). */
@@ -633,6 +638,9 @@ function readPlanGoals(obj?: Record<string, unknown>): PlanGoal[] {
 			else if (mode === "review") goal.floor = 1;
 		}
 		if (chapters && chapters.length > 0) goal.chapters = chapters;
+		// ADR-0009 weave 阅读器联动：来源书稳定标识（存在即启用跳转/推进事实/对账）
+		const readerSid = readPlanString(rec, ["readerSid", "阅读器书"]);
+		if (readerSid) goal.readerSid = readerSid;
 		// ADR-0005 v2 多级结构：structure: [{unit, counts}, …]（1~8 级；引擎优先于 chapters）
 		// counts 容忍 flow 序列 / 字符串 "[2, 2, 3]"（手写 frontmatter / 简版解析器）
 		const rawStructure: unknown = rec.structure;

@@ -61,6 +61,11 @@ export interface PlanFlowSettings {
 	 * 复习模式的自动实际量/自动达标与日记模式的自动勾选。BZG 缺席时静默降级为手动。
 	 */
 	bzgEnabled: boolean;
+	/**
+	 * 阅读联动（ADR-0009，默认开）：weave epub 阅读器桥——选书自动导目录、
+	 * 阅读位置推进确认勾选、任务跳转。fork 插件缺席时静默降级为粘贴导入。
+	 */
+	weaveEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: PlanFlowSettings = {
@@ -101,6 +106,7 @@ tags: [复盘]
 	diaryDir: "我的/日记",
 	summaryDiaryLast: "",
 	bzgEnabled: true,
+	weaveEnabled: true,
 };
 
 /** 文件夹选择弹窗：列出库内全部文件夹，点选即回调路径（Obsidian 标准交互）。 */
@@ -173,6 +179,12 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				desc: "只读 BZG 插件的复习记录与日记日文件：复习模式自动写入每日实际复习篇数并自动勾选达标；日记模式检测到当天日记有亲手写下的内容即自动打钩。BZG 未安装时自动降级为手动记录",
 				aliases: ["bzg", "联动", "复习", "日记检测"],
 				control: { type: "toggle", key: "bzgEnabled" },
+			},
+			{
+				name: "阅读联动（选书导目录/进度勾选/跳转）",
+				desc: "weave epub 阅读器桥（ADR-0009）：阅读书籍模式从书架选书自动读取目录建目标；阅读位置推进时弹确认勾选对应任务；任务行尾 🔗 跳转到阅读器对应章节。阅读器未安装时自动降级为粘贴目录导入",
+				aliases: ["weave", "阅读器", "epub", "联动", "跳转"],
+				control: { type: "toggle", key: "weaveEnabled" },
 			},
 			{
 				name: "日记目录（打卡联动）",

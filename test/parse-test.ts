@@ -696,5 +696,71 @@ const doneToday = scheduled.filter((g) => g.pending.length === 0);
 check("fraction denominator = 5", scheduled.length === 5, scheduled.length);
 check("fraction numerator = 2", doneToday.length === 2, doneToday.length);
 
+// --- N. weave 阅读器桥（ADR-0009）：目录树转换 / 推进事实 / 接续阅读 --------
+import { weaveTocToStructure, resumeLeafCount, crossedLeafIndices, passedLeafIndices, type WeaveTocNode } from "../src/weave-bridge";
+
+const bookTree: WeaveTocNode[] = [
+	{
+		label: "第1章 初见", href: "c1.xhtml", spineIndex: 1,
+		children: [
+			{ label: "1.1 相遇", href: "c1.xhtml#s1", spineIndex: 1, children: [] },
+			{ label: "1.2 离别", href: "c1.xhtml#s2", spineIndex: 1, children: [] },
+		],
+	},
+	{ label: "第2章 独白", href: "c2.xhtml", spineIndex: 2, children: [] },
+	{
+		label: "第3章 重逢", href: "c3.xhtml", spineIndex: 4,
+		children: [{ label: "3.1 重逢", href: "c3.xhtml#s1", spineIndex: 4, children: [] }],
+	},
+];
+const conv = weaveTocToStructure(bookTree);
+check("bridge: converts tree", conv !== null);
+check("bridge: 2 levels", conv?.levels.length === 2, conv?.levels.length);
+check("bridge: level0 章×3", conv?.levels[0].unit === "章" && conv.levels[0].counts[0] === 3);
+check("bridge: level1 节 [2,0,1]", conv?.levels[1].unit === "节" && JSON.stringify(conv.levels[1].counts) === "[2,0,1]", JSON.stringify(conv?.levels[1].counts));
+// 升格叶（无子的章）参与 DFS 叶序：第1节,第2节,第2章,第3节
+check("bridge: leaf count 4", conv?.leafSpine.length === 4, conv?.leafSpine.length);
+check("bridge: leafSpine DFS [1,1,2,4]", JSON.stringify(conv?.leafSpine) === "[1,1,2,4]", JSON.stringify(conv?.leafSpine));
+check("bridge: leafHref DFS", conv?.leafHref.join("|") === "c1.xhtml#s1|c1.xhtml#s2|c2.xhtml|c3.xhtml#s1");
+// 对齐不变式：结构展开叶数 = 桥叶序数（推进/跳转映射前提）
+const bridgeLeaves = expandGoalStructure("测试书", conv!.levels);
+check("bridge: alignment invariant (leaves match)", bridgeLeaves.length === conv!.leafSpine.length, `${bridgeLeaves.length} vs ${conv!.leafSpine.length}`);
+check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("第 2 章")));
+// 接续阅读：读到第 2 章（index 2）→ spine<2 的叶 = 第1节+第2节 = 2
+check("resume: chapter 2 → 2 pre-read", resumeLeafCount(conv!.leafSpine, 2) === 2, resumeLeafCount(conv!.leafSpine, 2));
+check("resume: 0 for unread book", resumeLeafCount(conv!.leafSpine, 0) === 0);
+check("resume: all for finished book", resumeLeafCount(conv!.leafSpine, 5) === 4);
+// 推进事实：从第 1 章进第 3 章 → 越过 [1,4) 的叶下标 {0,1,2}
+check("advance: crossed [1,4) → idx 0,1,2", JSON.stringify(crossedLeafIndices(conv!.leafSpine, 1, 4)) === "[0,1,2]", JSON.stringify(crossedLeafIndices(conv!.leafSpine, 1, 4)));
+check("advance: backward no crossing", crossedLeafIndices(conv!.leafSpine, 4, 1).length === 0);
+check("passed: chapter 4 → 3 leaves (current excluded)", passedLeafIndices(conv!.leafSpine, 4).length === 3);
+check("bridge: null for empty tree", weaveTocToStructure(null) === null && weaveTocToStructure([]) === null);
+// 超深（>8 级）拒绝：9 层嵌套链
+let deep: WeaveTocNode = { label: "第1条", href: "d9", spineIndex: 0, children: [] };
+for (let i = 0; i < 8; i++) deep = { label: `第1级${8 - i}`, href: `d${8 - i}`, spineIndex: 0, children: [deep] };
+check("bridge: >8 levels rejected", weaveTocToStructure([deep]) === null);
+check("bridge: single level ok", weaveTocToStructure([{ label: "第1章", href: "c", spineIndex: 0, children: [] }]) !== null);
+
+// readerSid frontmatter round-trip（ADR-0009）
+const fmReader = `---
+plans:
+  阅读:
+    type: 数量
+    target: 读书
+    goals:
+      - name: 交易心理分析
+        count: 17
+        unit: 节
+        structure:
+          - unit: 章
+            counts: [17]
+        readerSid: epubsrc-d3aedbaff902c0fb5db47804
+---
+`;
+const defsReader = parsePlansFromFrontmatter(fmReader);
+const readerGoal = defsReader[0]?.goals[0];
+check("readerSid: parsed from frontmatter", readerGoal?.readerSid === "epubsrc-d3aedbaff902c0fb5db47804", readerGoal?.readerSid);
+check("readerSid: absent → undefined", defs1[0]?.goals?.[0]?.readerSid === undefined);
+
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

@@ -19,12 +19,21 @@ import { STRUCT_UNITS, expandGoalStructure } from "./tasks";
  */
 
 /** 无单位词时的默认单位链（数字编号 1 / 1.2 / 1.2.3 逐级取用）。 */
-const DEFAULT_UNIT_CHAIN = ["章", "节", "小节", "目", "条", "细目"];
+export const DEFAULT_UNIT_CHAIN = ["章", "节", "小节", "目", "条", "细目"];
 
 /** 单位词层级序（由大到小，与 STRUCT_UNITS 词表一致）。 */
 const UNIT_ORDER: string[] = STRUCT_UNITS.map((u) => u.word);
 
 const CN_UNIT_RE = /^第\s*[0-9一二三四五六七八九十百千]+\s*(部|编|卷|辑|篇|单元|模块|章|回|课|讲|集|幕|场|节|小节|目|条)/;
+
+/**
+ * 从单条目录标签提取单位词（ADR-0009 桥导入用）：「第3章」→「章」，
+ * 无命中返回空串（调用方落默认链）。与 parseTocLine 共用词表与正则。
+ */
+export function extractTocUnitWord(label: string): string {
+	const m = CN_UNIT_RE.exec(label.trim());
+	return m ? m[1] : "";
+}
 const CN_ORD_RE = /^[一二三四五六七八九十百]+[、.．]/;
 
 /** 结构级数上限（与向导 MAX_STRUCTURE_LEVELS 对齐）。 */

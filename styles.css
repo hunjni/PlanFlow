@@ -2781,3 +2781,42 @@
 	word-break: break-all;
 }
 
+/* ─── ADR-0009 weave 阅读器联动 ─────────────────────────────── */
+
+/* 选书步：书架行（可点击，hover 高亮同模式卡） */
+.planboard-book-row {
+	padding: 8px 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	margin-bottom: 6px;
+	cursor: pointer;
+	transition: border-color 120ms ease, background-color 120ms ease;
+}
+.planboard-book-row:hover {
+	border-color: var(--interactive-accent);
+	background: var(--background-secondary-alt);
+}
+.planboard-book-row-info {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.planboard-book-row-title {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+/* 叶行尾跳转按钮（复用 icon-btn 基座；强调可点） */
+.planboard-jump-btn {
+	color: var(--interactive-accent);
+}
+
+/* 推进确认 Notice 内按钮行 */
+.planboard-notice-actions {
+	display: flex;
+	gap: 8px;
+	margin-top: 8px;
+}
+.planboard-notice-actions .planboard-btn {
+	margin: 0;
+}
