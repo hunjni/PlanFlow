@@ -1681,7 +1681,11 @@ export class PlanBoardView extends ItemView {
 	 */
 	private computeBookView(plan: string): { scheduled: BookGroup[]; ungroupedPending: PoolTask[] } {
 		const planTasks = this.allPoolTasks.filter((t) => t.plan === plan);
-		const { groups, ungrouped } = groupPoolTasksByGoal(planTasks, this.today);
+		// ADR-0009: 已知书名前缀优先（真实标题无编号后缀的叶也能归组）
+		const known = this.planProgress
+			.filter((p) => p.plan === plan)
+			.flatMap((p) => p.goals.map((g) => g.name));
+		const { groups, ungrouped } = groupPoolTasksByGoal(planTasks, this.today, known);
 		return {
 			scheduled: groups.filter((g) => g.scheduled),
 			ungroupedPending: ungrouped.filter((t) => this.isPendingPoolChild(t)),
@@ -1752,8 +1756,9 @@ export class PlanBoardView extends ItemView {
 
 		// ADR-0003: 下一级子任务 = 任务池中该计划「该做还没做」的任务；全勾完自动勾父行
 		// ADR-0008: 今日有安排的书 ≥ 2 时按书分组（书行 + 叶），否则维持扁平列表
+		// ADR-0009: 单书同样折叠书行（阈值 ≥1；书行勾=清当日份额，多书规则不变）
 		if (item.plan && bookView) {
-			if (bookView.scheduled.length >= 2) {
+			if (bookView.scheduled.length >= 1) {
 				this.renderGroupedChildren(li, item, bookView);
 			} else {
 				const children = this.pendingPoolChildren(item.plan);

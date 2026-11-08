@@ -284,11 +284,16 @@ export interface BookGroup {
  * 分母口径：scheduled = 阅读窗口覆盖今天（🛫 ≤ today ≤ 📅，跨日窗口起读当天即计入）
  * 或有逾期欠账；窗口未开始、已读完的书 scheduled = false，不进「今日书进度」分母。
  */
-export function groupPoolTasksByGoal(tasks: PoolTask[], today: string): { groups: BookGroup[]; ungrouped: PoolTask[] } {
+export function groupPoolTasksByGoal(tasks: PoolTask[], today: string, knownNames?: string[]): { groups: BookGroup[]; ungrouped: PoolTask[] } {
 	const byName = new Map<string, PoolTask[]>();
 	const ungrouped: PoolTask[] = [];
+	// ADR-0009: 已知目标（书）名前缀匹配优先——真实标题后缀可能无编号（如「（序）」），
+	// 剥后缀正则识别不到时会游离书组外；计划里登记的目标名是更可靠的归属依据
+	const known = (knownNames ?? []).filter(Boolean);
 	for (const t of tasks) {
-		const name = extractGoalName(t.text);
+		const text = t.text.trim();
+		const knownHit = known.find((n) => text.startsWith(`${n}（`));
+		const name = knownHit ?? extractGoalName(text);
 		if (!name) {
 			ungrouped.push(t);
 			continue;

@@ -696,6 +696,20 @@ const doneToday = scheduled.filter((g) => g.pending.length === 0);
 check("fraction denominator = 5", scheduled.length === 5, scheduled.length);
 check("fraction numerator = 2", doneToday.length === 2, doneToday.length);
 
+// ADR-0009: knownNames 前缀归属——无编号真实标题后缀（序）不游离书组外
+const knownPool = parseTaskPool(
+	file,
+	[
+		"- [ ] 先秦穿越生存手册（序） #计划/阅读 🛫 2026-11-08 📅 2026-11-08",
+		"- [ ] 先秦穿越生存手册（第一章　英雄难过语言关·欲闯天下|上古汉语） #计划/阅读 🛫 2026-11-08 📅 2026-11-08",
+		"- [ ] 别的书（第 1 节） #计划/阅读 🛫 2026-11-08 📅 2026-11-08",
+	].join("\n")
+);
+const knownView = groupPoolTasksByGoal(knownPool, "2026-11-08", ["先秦穿越生存手册"]);
+check("knownNames: 无编号后缀叶归入书组", knownView.groups.map((g) => g.name).join(",") === "先秦穿越生存手册,别的书", JSON.stringify(knownView.groups.map((g) => g.name)));
+check("knownNames: 书组含两叶且 scheduled", knownView.groups[0]?.pending.length === 2 && knownView.groups[0]?.scheduled === true);
+check("knownNames: 缺省维持原口径", groupPoolTasksByGoal(knownPool, "2026-11-08").ungrouped.length === 1);
+
 // --- N. weave 阅读器桥（ADR-0009）：目录树转换 / 推进事实 / 接续阅读 --------
 import { weaveTocToStructure, resumeLeafCount, crossedLeafIndices, passedLeafIndices, type WeaveTocNode } from "../src/weave-bridge";
 
