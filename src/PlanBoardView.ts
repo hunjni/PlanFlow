@@ -654,6 +654,8 @@ export class PlanBoardView extends ItemView {
 	private weaveAlignWarned = new Set<string>();
 	/** ADR-0009: 上次对账时刻（节流——对账是兜底不是追问，vault 改动驱动的刷新不重跑）。 */
 	private lastWeaveReconcile = 0;
+	/** ADR-0009: 锚点补齐后的重渲染去重（同一时刻只刷一次打卡列表）。 */
+	private weaveAlignRenderQueued = false;
 	/** ADR-0009: 进行中的推进确认通知（同一目标不重复弹；hide 时移除）。 */
 	private weaveNotices = new Map<string, Notice>();
 
@@ -1788,6 +1790,17 @@ export class PlanBoardView extends ItemView {
 				const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
 				const ord = leaves ? leaves.findIndex((l) => l.name === t.text.trim()) : -1;
 				const href = ord >= 0 ? this.weaveAlign.get(sid)?.hrefs[ord] : undefined;
+				if (!href && !this.weaveAlign.has(sid)) {
+					// 锚点解析是异步的，首帧缓存常为空——补齐后刷一次列表（缓存后零开销）
+					void this.resolveWeaveAlignment(sid, hit.goal).then((a) => {
+						if (!a || this.weaveAlignRenderQueued) return;
+						this.weaveAlignRenderQueued = true;
+						window.setTimeout(() => {
+							this.weaveAlignRenderQueued = false;
+							if (this.contentEl?.isConnected) this.updateChecklist();
+						}, 50);
+					});
+				}
 				if (href) {
 					const jump = sli.createEl("button", {
 						cls: "planboard-icon-btn planboard-jump-btn",
@@ -1840,6 +1853,27 @@ export class PlanBoardView extends ItemView {
 		cb.checked = done;
 		cb.addEventListener("change", () => void this.toggleBookGroup(item, g, cb.checked));
 		label.createSpan({ cls: "planboard-check-text planboard-bookname", text: g.name });
+		// ADR-0009: 书行 🔗——在阅读器中打开这本书（恢复上次阅读位置）；旧版 fork 无 openBook 时不显示
+		if (this.weaveBridge?.openBook) {
+			const goal = this.planProgress.find((p) => p.plan === item.plan)?.goals.find((x) => x.name === g.name);
+			const sid = goal?.readerSid;
+			if (sid) {
+				const jump = label.createEl("button", {
+					cls: "planboard-icon-btn planboard-jump-btn",
+					attr: { "aria-label": "在阅读器中打开这本书", title: "在阅读器中打开（恢复上次阅读位置）" },
+				});
+				jump.setText("🔗");
+				jump.addEventListener("click", (e) => {
+					e.preventDefault();
+					e.stopPropagation();
+					try {
+						this.weaveBridge?.openBook?.(sid);
+					} catch {
+						new Notice("跳转失败：阅读器插件未响应");
+					}
+				});
+			}
+		}
 
 		if (!done) {
 			const sub = liB.createEl("ul", { cls: "planboard-sublist planboard-leaflist" });

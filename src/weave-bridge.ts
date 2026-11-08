@@ -60,6 +60,8 @@ export interface WeaveBridgeApi {
 	getBookshelf(): Promise<WeaveBookSummary[]>;
 	getToc(sid: string): Promise<WeaveTocNode[] | null>;
 	openChapter(sid: string, href: string): void;
+	/** 打开整本书（恢复上次阅读位置）；可选——旧版 fork 未提供时不显示书行跳转。 */
+	openBook?(sid: string): void;
 }
 
 /** 位置推进事件 detail（桥契约）：阅读位置从 fromChapter 推进到 toChapter（spine 序号，向前推进）。 */
