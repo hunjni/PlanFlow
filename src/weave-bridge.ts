@@ -66,6 +66,8 @@ export interface WeaveBridgeApi {
 	openBook?(sid: string): void;
 	/** 当前阅读位置（含章节文件内进度）；可选——旧版 fork 未提供时对账按章粒度兜底。 */
 	getPosition?(sid: string): Promise<{ chapterIndex: number; sectionProgress: number } | null>;
+	/** 批量解析 href 文件内进度（锚点自愈迁移用）；可选——旧版 fork 未提供时迁移跳过。 */
+	getProgressByHref?(sid: string, hrefs: string[]): Promise<(number | null)[]>;
 }
 
 /** 位置推进事件 detail（桥契约）：阅读位置推进（跨章或章内越过目录条目）后派发。 */

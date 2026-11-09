@@ -1,5 +1,6 @@
 import { ButtonComponent, Modal, Notice, Plugin, TFile, TFolder, setIcon } from "obsidian";
-import { PlanBoardView, VIEW_TYPE_PLANFLOW } from "./src/PlanBoardView";
+import { PlanBoardView, VIEW_TYPE_PLANFLOW, writePlansToFile } from "./src/PlanBoardView";
+import { startWeaveRuntime, stopWeaveRuntime } from "./src/weave-runtime";
 import type { PlanFlowSettings } from "./src/settings";
 import { DEFAULT_PLAN_COLORS, DEFAULT_SETTINGS, PlanFlowSettingTab } from "./src/settings";
 import { yearDirName } from "./src/paths";
@@ -83,6 +84,9 @@ export default class PlanFlowPlugin extends Plugin {
 		this.moveRibbonIconFirst();
 
 		this.addSettingTab(new PlanFlowSettingTab(this.app, this));
+
+		// ADR-0009: weave 阅读联动运行时——插件级生命周期（推进事件/对账/自愈不依赖视图打开）
+		startWeaveRuntime(this, { app: this.app, plugin: this, writePlanFile: writePlansToFile });
 
 		if (this.settings.openOnStartup) {
 			// 借鉴 Homepage 插件方案：监听 layout-change，等 Obsidian 启动恢复流程
@@ -214,6 +218,7 @@ plans:
 	};
 
 	onunload(): void {
+		stopWeaveRuntime();
 		// 保留用户拖放位置：不在 onunload 中 detach leaves
 	}
 

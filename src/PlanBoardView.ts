@@ -51,21 +51,25 @@ import { diaryDayWritten, loadBzgSnapshot, readBzgDiaryText, reviewPoolSize, rev
 import { parseToc, tocLeafRange, tocSummary } from "./toc";
 import {
 	getWeaveBridge,
-	passedLeafIndices,
-	passedLeafIndicesFine,
 	resumeLeafCount,
-	WEAVE_ADVANCE_EVENT,
 	weaveTocToStructure,
 	inferNeighborSpines,
 	resolveMissingAnchors,
-	type WeaveAdvanceDetail,
 	type WeaveBookSummary,
 	type WeaveBridgeApi,
 	type WeaveTocNode,
 } from "./weave-bridge";
+import {
+	ensureWeaveAlignment,
+	getWeaveAlignment,
+	isAlignCached,
+	reconcileIfOpen,
+} from "./weave-runtime";
 
 /** v1.7.4: 插件改名 PlanFlow——view type 同步改（workspace 布局重新打开一次即可） */
 export const VIEW_TYPE_PLANFLOW = "planflow";
+let renderQueued = false;
+
 
 type TabKey = PeriodType | "today" | "board" | "gantt";
 
@@ -650,17 +654,11 @@ export class PlanBoardView extends ItemView {
 	/** ADR-0009: weave 阅读器桥（设置开关门控；fork 缺席/形状不符为 null）。 */
 	private weaveBridge: WeaveBridgeApi | null = null;
 	/** ADR-0009: sid → 叶序锚点缓存（spine 章序 + href；结构与目录形状一致才缓存，null = 形状不符）。 */
-	private weaveAlign = new Map<string, { spine: number[]; progress: number[]; hrefs: string[] } | null>();
 	/** ADR-0009: 进行中的锚点解析（in-flight 去重）。 */
-	private weaveAlignPending = new Map<string, Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null>>();
 	/** ADR-0009: 对齐失败已提示过的 sid（一次性提示，避免刷屏）。 */
-	private weaveAlignWarned = new Set<string>();
 	/** ADR-0009: 上次对账时刻（节流——对账是兜底不是追问，vault 改动驱动的刷新不重跑）。 */
-	private lastWeaveReconcile = 0;
 	/** ADR-0009: 锚点补齐后的重渲染去重（同一时刻只刷一次打卡列表）。 */
-	private weaveAlignRenderQueued = false;
 	/** ADR-0009: 进行中的推进确认通知（同一目标不重复弹；hide 时移除）。 */
-	private weaveNotices = new Map<string, { hide: () => void }>();
 
 	// DOM refs (nullable — guard before touching)
 	private panelEl: HTMLElement | null = null;
@@ -720,12 +718,6 @@ export class PlanBoardView extends ItemView {
 		this.registerEvent(this.app.vault.on("create", this.onVaultModify));
 		this.registerEvent(this.app.vault.on("delete", this.onVaultDelete));
 		this.registerEvent(this.app.vault.on("rename", this.onVaultRename));
-		// ADR-0009: weave 推进事实实时监听（fork 阅读器 dispatch；随视图生命周期注销）
-		const weaveHandler = (evt: Event): void => {
-			void this.onWeaveAdvance((evt as CustomEvent<WeaveAdvanceDetail>).detail);
-		};
-		window.addEventListener(WEAVE_ADVANCE_EVENT, weaveHandler);
-		this.register(() => window.removeEventListener(WEAVE_ADVANCE_EVENT, weaveHandler));
 		await this.refresh();
 		// v1.7.3: 打开时自动创建今日笔记（保持计划总览完整）——Obsidian 启动时 vault 索引异步，
 		// 延迟重试直到索引就绪，仍缺失则静默按模板创建。
@@ -827,7 +819,7 @@ export class PlanBoardView extends ItemView {
 		if (this.tab === "today") {
 			await this.refreshToday();
 			// ADR-0009 对账兜底（Q13=B）：打开今日面板按书架位置批量确认补勾（最终一致）
-			if (this.weaveBridge) void this.reconcileWeaveReading();
+			reconcileIfOpen(this.plugin);
 		} else if (this.tab === "board") {
 			await this.renderBoardPanel();
 		} else if (this.tab === "gantt") {
@@ -944,291 +936,9 @@ export class PlanBoardView extends ItemView {
 		return null;
 	}
 
-	private findReaderGoalBySid(sid: string): { plan: string; goal: PlanGoal } | null {
-		for (const p of this.planProgress) {
-			for (const g of p.goals) {
-				if (g.readerSid === sid) return { plan: p.plan, goal: g };
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * ADR-0009 每叶锚点：优先目标落盘的锚点快照（确认结构时推导，改名/微调不失效）；
-	 * 无快照的旧目标回退实时对齐（缓存）。两路皆不可用返回 null（联动停用）。
-	 */
+	/** ADR-0009: 叶锚点委托运行时（落盘快照优先，旧目标实时对齐）。 */
 	private leafAnchorsFor(goal: PlanGoal): { spine: number[]; progress: number[]; hrefs: string[] } | null {
-		if (goal.readerAnchors?.length) {
-			return {
-				spine: goal.readerAnchors.map((a) => a.spine),
-				progress: goal.readerAnchors.map((a) => (typeof a.progress === "number" ? a.progress : -1)),
-				hrefs: goal.readerAnchors.map((a) => a.href),
-			};
-		}
-		return goal.readerSid ? (this.weaveAlign.get(goal.readerSid) ?? null) : null;
-	}
-
-	/**
-	 * 叶序锚点解析：桥目录树与目标结构**逐叶名字比对**一致才可用（跳转/推进映射
-	 * 的前提是结构未经手动改动——只比长度抓不住顺序错位，会静默错勾）；
-	 * 不一致 → 缓存 null，联动对该书停用（首次失效时提示一次）。
-	 * 异步（桥现解析）；带 in-flight 去重，避免并发刷新重复解析。
-	 */
-	private async resolveWeaveAlignment(sid: string, goal: PlanGoal): Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null> {
-		if (this.weaveAlign.has(sid)) return this.weaveAlign.get(sid) ?? null;
-		const pending = this.weaveAlignPending.get(sid);
-		if (pending) return pending;
-		const task = (async (): Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null> => {
-			let result: { spine: number[]; progress: number[]; hrefs: string[] } | null = null;
-			try {
-				const tree = await this.weaveBridge?.getToc(sid);
-				const conv = weaveTocToStructure(tree ?? null);
-				const goalLeaves = expandGoalLeaves(goal.name, goal);
-				const convLeaves = conv ? expandGoalStructure(goal.name, conv.levels) : [];
-				if (
-					conv &&
-					goalLeaves &&
-					goalLeaves.length === convLeaves.length &&
-					goalLeaves.every((l, i) => l.name === convLeaves[i].name)
-				) {
-					result = { spine: conv.leafSpine, progress: conv.leafProgress, hrefs: conv.leafHref };
-				}
-			} catch {
-				result = null;
-			}
-			console.debug(
-				`[PlanFlow] 实时对齐《${goal.name}》(${sid}): ${result ? `成功 ${result.spine.length} 叶` : "失败（叶名/数量不一致或目录读取失败）"}`
-			);
-			this.weaveAlign.set(sid, result);
-			this.weaveAlignPending.delete(sid);
-			return result;
-		})();
-		this.weaveAlignPending.set(sid, task);
-		return task;
-	}
-
-	/**
-	 * ADR-0009 自愈迁移：进度字段（progress）上线前建的锚点快照是两段式（无文件内
-	 * 进度）——同章内的小节推进判定不出来。这里按叶名比对从桥实时目录补齐 progress
-	 * 并写回年度计划 frontmatter（每 sid 一次；成功后该书即享逐节触发，无需重建）。
-	 */
-	private weaveMigrated = new Set<string>();
-	private async migrateWeaveAnchorProgress(goal: PlanGoal): Promise<void> {
-		const sid = goal.readerSid;
-		if (!sid || this.weaveMigrated.has(sid)) return;
-		const anchors = goal.readerAnchors;
-		if (!anchors?.length || anchors.every((a) => typeof a.progress === "number")) {
-			this.weaveMigrated.add(sid);
-			return;
-		}
-		this.weaveMigrated.add(sid);
-		if (!this.weaveBridge) return;
-		try {
-			const tree = await this.weaveBridge.getToc(sid);
-			const conv = weaveTocToStructure(tree ?? null);
-			const goalLeaves = expandGoalLeaves(goal.name, goal);
-			const convLeaves = conv ? expandGoalStructure(goal.name, conv.levels) : [];
-			if (
-				!conv ||
-				!goalLeaves ||
-				goalLeaves.length !== convLeaves.length ||
-				goalLeaves.length !== conv.leafProgress.length ||
-				!goalLeaves.every((l, i) => l.name === convLeaves[i].name)
-			) {
-				console.info(`[PlanFlow] 《${goal.name}》锚点进度自愈跳过：实时目录与目标结构不一致`);
-				return;
-			}
-			goal.readerAnchors = anchors.map((a, i) => ({ ...a, progress: conv.leafProgress[i] }));
-			this.weaveAlign.set(sid, { spine: conv.leafSpine, progress: conv.leafProgress, hrefs: conv.leafHref });
-			const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
-			const year = this.today.slice(0, 4);
-			const file = await this.findAnnualPlanFile(true);
-			if (!file) return;
-			const content = await this.app.vault.cachedRead(file);
-			const defs = parsePlansFromFrontmatter(content);
-			let changed = false;
-			for (const d of defs) {
-				for (const g of d.goals) {
-					if (g.readerSid === sid && g.name === goal.name) {
-						g.readerAnchors = goal.readerAnchors.map((a) => ({ ...a }));
-						changed = true;
-					}
-				}
-			}
-			if (!changed) return;
-			this.selfWrite = true;
-			try {
-				await writePlansToFile(this.app, file, defs, this.readRawDailyMap(content));
-			} finally {
-				this.selfWrite = false;
-			}
-			console.info(`[PlanFlow] 《${goal.name}》锚点已补齐文件内进度（自愈迁移落盘完成）`);
-		} catch (e) {
-			console.warn("[PlanFlow] 锚点进度自愈失败:", e);
-		}
-	}
-
-	/** 对齐失效的一次性提示（无落盘锚点的旧目标实时对齐失败 → 联动停用）。 */
-	private warnWeaveMisaligned(sid: string, goalName: string): void {
-		if (this.weaveAlignWarned.has(sid)) return;
-		this.weaveAlignWarned.add(sid);
-		// 常见于锚点特性上线前建的目标：结构改过或目录解析差异都会对齐失败；
-		// 快照目标（确认结构时落盘锚点）改名/微调也不失效，不走这条提示
-		new Notice(`📖《${goalName}》：无法与阅读器目录对齐，叶跳转/推进勾选停用；删除该目标后从书架重建一次即可（重建会落盘每叶锚点，此后改结构也不失效）`);
-	}
-
-	/** 推进事实落地（Q12+确认门 Q16）：越过叶子 → Notice 二选一（✓勾选 / 忽略落 ✋）。 */
-	private async onWeaveAdvance(d: WeaveAdvanceDetail): Promise<void> {
-		// 桥懒重试：启动时序可能让首次探测落在 fork 加载完成之前（weaveBridge=null），
-		// 真实事件到达时重新探测一次——此后为正常引用
-		this.weaveBridge ??= getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
-		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.chapterIndex)) return;
-		console.info("[PlanFlow] 收到阅读推进事件:", d);
-		const hit = this.findReaderGoalBySid(d.sid);
-		if (!hit) {
-			console.info("[PlanFlow] 推进事件无对应联动目标（sid 未绑定）:", d.sid);
-			return;
-		}
-		// 旧两段锚点在此补齐 progress（迁移随事件走，不依赖面板刷新）
-		if (!hit.goal.readerAnchors?.every((a) => typeof a.progress === "number")) {
-			await this.migrateWeaveAnchorProgress(hit.goal);
-		}
-		const align = this.leafAnchorsFor(hit.goal) ?? (await this.resolveWeaveAlignment(d.sid, hit.goal));
-		if (!align) {
-			this.warnWeaveMisaligned(d.sid, hit.goal.name);
-			return;
-		}
-		const sectionProgress = Number.isFinite(d.sectionProgress) ? d.sectionProgress : -1;
-		await this.confirmWeaveLeaves(
-			hit,
-			passedLeafIndicesFine(align.spine, align.progress, d.chapterIndex, sectionProgress)
-		);
-	}
-
-	/** 对账兜底（Q13=B）：打开今日面板按书架当前位置批量确认（重启/跨设备最终一致）。 */
-	private async reconcileWeaveReading(): Promise<void> {
-		this.weaveBridge ??= getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
-		if (!this.weaveBridge || this.planProgress.length === 0) return;
-		const now = Date.now();
-		if (now - this.lastWeaveReconcile < 60000) return; // 1 分钟节流：兜底不是追问
-		this.lastWeaveReconcile = now;
-		let shelf: WeaveBookSummary[] | null = null;
-		try {
-			shelf = await this.weaveBridge.getBookshelf();
-		} catch (e) {
-			console.warn("[PlanFlow] 对账取书架失败:", e);
-			return;
-		}
-		if (!shelf?.length) return;
-		for (const p of this.planProgress) {
-			for (const g of p.goals) {
-				if (!g.readerSid) continue;
-				await this.migrateWeaveAnchorProgress(g);
-				const book = shelf.find((b) => b.sid === g.readerSid);
-				if (!book || book.chapterIndex <= 0) continue;
-				const align = this.leafAnchorsFor(g) ?? (await this.resolveWeaveAlignment(g.readerSid, g));
-				if (!align) {
-					this.warnWeaveMisaligned(g.readerSid, g.name);
-					continue;
-				}
-				let crossed: number[];
-				if (this.weaveBridge.getPosition) {
-					const pos = await this.weaveBridge.getPosition(g.readerSid);
-					crossed = passedLeafIndicesFine(
-						align.spine,
-						align.progress,
-						pos?.chapterIndex ?? book.chapterIndex,
-						pos?.sectionProgress ?? -1
-					);
-				} else {
-					crossed = passedLeafIndices(align.spine, book.chapterIndex);
-				}
-				console.debug(
-					`[PlanFlow] 对账《${g.name}》: 章序 ${book.chapterIndex} · 锚点来源 ${g.readerAnchors?.length ? "落盘快照" : "实时对齐"} · 已越过 ${crossed.length} 叶`
-				);
-				await this.confirmWeaveLeaves({ plan: p.plan, goal: g }, crossed);
-			}
-		}
-	}
-
-	/**
-	 * 确认门：候选叶（越过 ∩ 未勾 ∩ 无 ✋）为空则静默；否则弹一条非阻断 Notice，
-	 * ✓勾选 / 忽略（忽略 = 一次手动决策，落 ✋ 此后自动不问不勾，Q18=A）。
-	 */
-	private async confirmWeaveLeaves(hit: { plan: string; goal: PlanGoal }, leafIdxs: number[]): Promise<void> {
-		const sid = hit.goal.readerSid;
-		if (!sid || !this.weaveBridge || leafIdxs.length === 0) return;
-		if (this.weaveNotices.has(sid)) return; // 同一目标同一时刻只弹一条
-		const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
-		if (!leaves) return;
-		const prefix = `${hit.goal.name}（`;
-		const candidates = this.allPoolTasks.filter(
-			(t) => t.plan === hit.plan && t.text.trim().startsWith(prefix) && !t.checked && !t.raw.includes(MANUAL_MARK)
-		);
-		const todo = leaves
-			.filter((_l, i) => leafIdxs.includes(i))
-			.map((l) => candidates.find((t) => t.text.trim() === l.name))
-			.filter((t): t is PoolTask => !!t);
-		if (todo.length === 0) return;
-		const unit = hit.goal.unit || "节";
-		if (todo.length === 1) {
-			// 单叶：非阻断 Notice 快速二选一
-			const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 1 ${unit}`, 0);
-			this.weaveNotices.set(sid, notice);
-			const done = (): void => {
-				this.weaveNotices.delete(sid);
-				notice.hide();
-			};
-			const bar = notice.noticeEl.createDiv({ cls: "planboard-notice-actions" });
-			const okBtn = bar.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 勾选" });
-			okBtn.addEventListener("click", (e) => {
-				e.stopPropagation();
-				done();
-				void this.applyWeaveCheck(hit, todo, true);
-			});
-			const skipBtn = bar.createEl("button", { cls: "planboard-btn", text: "忽略" });
-			skipBtn.addEventListener("click", (e) => {
-				e.stopPropagation();
-				done();
-				void this.applyWeaveCheck(hit, todo, false);
-			});
-			// 点空白处关掉 = 本次不处理（下次推进/对账再问）
-			notice.noticeEl.addEventListener("click", (e) => {
-				if ((e.target as HTMLElement).closest("button")) return;
-				done();
-			});
-			return;
-		}
-		// 多叶（大文件书跨章一次越过一批）：逐叶勾选弹窗——勾所选的，未勾的下次再问
-		const modal = new WeaveConfirmModal(
-			this.app,
-			hit.goal.name,
-			unit,
-			todo,
-			(picked) => this.applyWeaveCheck(hit, picked, true),
-			() => this.applyWeaveCheck(hit, todo, false)
-		);
-		this.weaveNotices.set(sid, { hide: () => modal.close() });
-		modal.open();
-	}
-
-	/** 确认结果写回：勾选（任务池 + 日记投影）或忽略（落 ✋，自动逻辑不再碰）。 */
-	private async applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: PoolTask[], check: boolean): Promise<void> {
-		this.selfWrite = true;
-		try {
-			for (const t of tasks) {
-				if (check) {
-					await toggleTask(this.app, t, true);
-					await syncPoolTaskToDiary(this.app, this.plugin.settings.diaryDir, t.text, true);
-				} else {
-					await this.app.vault.process(t.file, (data) => markTaskLineManual(data, t.line, t.raw));
-				}
-			}
-		} finally {
-			this.selfWrite = false;
-		}
-		new Notice(check ? `已勾选 ${tasks.length} ${hit.goal.unit || "节"}` : `已忽略 ${tasks.length} ${hit.goal.unit || "节"}（此后不再自动勾选，可手动勾）`);
-		await this.refresh();
+		return getWeaveAlignment(goal);
 	}
 
 	/** Read the annual plan's `plans` frontmatter (year-level, root-level fallback). */
@@ -2036,17 +1746,17 @@ export class PlanBoardView extends ItemView {
 				// 锚点优先取目标落盘快照（同步、随结构确认落盘、改名不失效）；旧目标回退实时对齐缓存
 				const align = this.leafAnchorsFor(hit.goal);
 				const href = ord >= 0 ? align?.hrefs[ord] : undefined;
-				if (!href && !hit.goal.readerAnchors?.length && !this.weaveAlign.has(sid)) {
-					// 旧目标无快照：锚点解析是异步的，首帧缓存常为空——补齐后刷一次列表
-					void this.resolveWeaveAlignment(sid, hit.goal).then((a) => {
-						if (!a || this.weaveAlignRenderQueued) return;
-						this.weaveAlignRenderQueued = true;
-						window.setTimeout(() => {
-							this.weaveAlignRenderQueued = false;
-							if (this.contentEl?.isConnected) this.updateChecklist();
-						}, 50);
-					});
-				}
+					if (!href && !hit.goal.readerAnchors?.length && !isAlignCached(sid)) {
+						// 旧目标无快照：锚点解析是异步的，首帧缓存常为空——补齐后刷一次列表
+						void ensureWeaveAlignment(sid, hit.goal).then((a) => {
+							if (!a || renderQueued) return;
+							renderQueued = true;
+							window.setTimeout(() => {
+								renderQueued = false;
+								if (this.contentEl?.isConnected) this.updateChecklist();
+							}, 50);
+						});
+					}
 				if (href) {
 					const jump = sli.createEl("button", {
 						cls: "planboard-icon-btn planboard-jump-btn",
@@ -4701,62 +4411,6 @@ class PlanEditModal extends Modal {
 }
 
 /** ADR-0001: quota 行「实际量」录入弹窗——留空保存 = 清除实际量、仅勾选记满当日配额。 */
-/**
- * ADR-0009 推进确认（多叶形态）：大文件书一次跨章越过一批叶时，逐叶勾选
- * 「哪些真的看完了」——勾所选中的；未选中的不落 ✋，下次推进/对账再问；
- * 「全部忽略」才对整批落 ✋（此后自动不问不勾）。
- */
-class WeaveConfirmModal extends Modal {
-	private readonly items: { task: PoolTask; picked: boolean }[];
-	constructor(
-		app: App,
-		private readonly goalName: string,
-		private readonly unit: string,
-		tasks: PoolTask[],
-		private readonly onCheck: (picked: PoolTask[]) => Promise<void>,
-		private readonly onIgnoreAll: () => Promise<void>
-	) {
-		super(app);
-		this.items = tasks.map((task) => ({ task, picked: true }));
-	}
-
-	onOpen(): void {
-		const { contentEl } = this;
-		contentEl.addClass("planboard-modal");
-		contentEl.createEl("h3", { text: `📖《${this.goalName}》阅读位置已越过 ${this.items.length} ${this.unit}` });
-		contentEl.createDiv({
-			cls: "planboard-goal-preview",
-			text: "勾选真正看完的（这本书的章节文件较大，一次越过的部分可自行甄别）；未勾的下次再问",
-		});
-		const list = contentEl.createDiv({ cls: "planboard-struct-box" });
-		for (const it of this.items) {
-			const row = list.createDiv({ cls: "planboard-tree-row" });
-			const cb = row.createEl("input", { type: "checkbox", cls: "planboard-checkbox" });
-			cb.checked = true;
-			cb.addEventListener("change", () => {
-				it.picked = cb.checked;
-			});
-			row.createSpan({ cls: "planboard-tree-label", text: it.task.text });
-		}
-		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
-		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 勾选所选", attr: { type: "button" } });
-		ok.addEventListener("click", () => {
-			this.close();
-			void this.onCheck(this.items.filter((i) => i.picked).map((i) => i.task));
-		});
-		const ignoreAll = actions.createEl("button", { cls: "planboard-btn", text: "全部忽略 ✋", attr: { type: "button" } });
-		ignoreAll.addEventListener("click", () => {
-			this.close();
-			void this.onIgnoreAll();
-		});
-		const cancel = actions.createEl("button", { cls: "planboard-btn", text: "取消", attr: { type: "button" } });
-		cancel.addEventListener("click", () => this.close());
-	}
-
-	onClose(): void {
-		this.contentEl.empty();
-	}
-}
 
 class QuotaActualModal extends Modal {
 	private item: CheckItem;
@@ -6142,7 +5796,7 @@ function readRawPlans(content: string): Map<string, Record<string, unknown>> {
  * The plans block is re-serialized manually (no js-yaml); every other frontmatter
  * field and the note body are preserved. Callers manage `selfWrite`.
  */
-async function writePlansToFile(
+export async function writePlansToFile(
 	app: App,
 	file: TFile,
 	plans: PlanDef[],
