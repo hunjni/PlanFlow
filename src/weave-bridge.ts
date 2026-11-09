@@ -219,7 +219,8 @@ export function passedLeafIndicesFine(
 		const s = leafSpine[i];
 		const p = leafProgress[i];
 		if (s < 0) continue;
-		if (s < chapterIndex || (s === chapterIndex && p >= 0 && p <= sectionProgress + 1e-9)) out.push(i);
+		// 严格 < ：刚翻进某节（位置恰在其起点）不算越过——读到它结尾进入下一节时才会被计入
+		if (s < chapterIndex || (s === chapterIndex && p >= 0 && p < sectionProgress - 1e-9)) out.push(i);
 	}
 	return out;
 }
