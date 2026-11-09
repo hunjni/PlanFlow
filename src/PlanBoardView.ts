@@ -16,6 +16,7 @@ import {
 	missingModeLines,
 	missingQuotaLines,
 	markTaskLineManual,
+	matchesModeLine,
 	moveTaskLine,
 	parseDailyContent,
 	parseDateString,
@@ -574,8 +575,8 @@ interface GoalInput {
 	mode?: GoalMode;
 	/** ADR-0006: 每日量（review=当日下限；exercise=可选每日目标量）。 */
 	floor?: number;
-	/** ADR-0009: weave 阅读器联动——来源书 sid + 接续阅读预勾叶数（0 = 从头读）。 */
-	reader?: { sid: string; resumeLeaves: number };
+	/** ADR-0009: weave 阅读器联动——来源书 sid + 接续阅读预勾叶数 + 每叶锚点快照。 */
+	reader?: { sid: string; resumeLeaves: number; anchors?: { spine: number; href: string }[] };
 }
 
 /** 目标模式展示元数据（ADR-0006）。 */
@@ -896,10 +897,33 @@ export class PlanBoardView extends ItemView {
 		);
 	}
 
-	/** ADR-0006: 按计划标签 + 行文本识别行所属的模式目标。 */
-	private findModeGoal(plan: string | null, text: string): { plan: string; goal: PlanGoal; label: string } | null {
-		if (!plan) return null;
-		return this.modeGoals.find((mg) => mg.plan === plan && text.includes(mg.goal.name)) ?? null;
+	/**
+	 * ADR-0006: 识别一行是否为模式目标行（紧凑匹配：剥 emoji 后以目标名开头 +
+	 * 有量须含「N单位」/ 无量须整行恰为名）。松散 includes 会把计划默认打卡行
+	 * （如目标也叫「运动」时的「运动 每天半小时」）误判成模式行。
+	 */
+	private modeLineMatch(item: CheckItem): { plan: string; goal: PlanGoal; label: string } | null {
+		if (!item.plan) return null;
+		for (const mg of this.modeGoals) {
+			if (mg.plan !== item.plan) continue;
+			if (matchesModeLine(item.text, mg.goal.name, mg.goal.floor ?? 0, mg.goal.unit || "")) return mg;
+		}
+		return null;
+	}
+
+	/** ADR-0006: 某计划在今日打卡区的父行 = 同计划第一个非模式行（无则 null，模式行保持顶层）。 */
+	private modeParentOf(item: CheckItem): CheckItem | null {
+		if (!this.dailyData || !item.plan) return null;
+		for (const it of this.dailyData.checkItems) {
+			if (it.plan === item.plan && !this.modeLineMatch(it)) return it;
+		}
+		return null;
+	}
+
+	/** ADR-0006: 父行下的全部模式子行（今日打卡区、保持文件顺序）。 */
+	private modeChildrenOf(parent: CheckItem): CheckItem[] {
+		if (!this.dailyData || !parent.plan) return [];
+		return this.dailyData.checkItems.filter((it) => it.plan === parent.plan && this.modeLineMatch(it));
 	}
 
 	// -------------------------------------------------------------------------
@@ -925,6 +949,17 @@ export class PlanBoardView extends ItemView {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * ADR-0009 每叶锚点：优先目标落盘的锚点快照（确认结构时推导，改名/微调不失效）；
+	 * 无快照的旧目标回退实时对齐（缓存）。两路皆不可用返回 null（联动停用）。
+	 */
+	private leafAnchorsFor(goal: PlanGoal): { spine: number[]; hrefs: string[] } | null {
+		if (goal.readerAnchors?.length) {
+			return { spine: goal.readerAnchors.map((a) => a.spine), hrefs: goal.readerAnchors.map((a) => a.href) };
+		}
+		return goal.readerSid ? (this.weaveAlign.get(goal.readerSid) ?? null) : null;
 	}
 
 	/**
@@ -974,9 +1009,13 @@ export class PlanBoardView extends ItemView {
 	private async onWeaveAdvance(d: WeaveAdvanceDetail): Promise<void> {
 		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.toChapter)) return;
 		if (d.toChapter <= d.fromChapter) return; // 单向只勾不退：回读不触发
+		console.info("[PlanFlow] 收到阅读推进事件:", d);
 		const hit = this.findReaderGoalBySid(d.sid);
-		if (!hit) return;
-		const align = await this.resolveWeaveAlignment(d.sid, hit.goal);
+		if (!hit) {
+			console.info("[PlanFlow] 推进事件无对应联动目标（sid 未绑定）:", d.sid);
+			return;
+		}
+		const align = this.leafAnchorsFor(hit.goal) ?? (await this.resolveWeaveAlignment(d.sid, hit.goal));
 		if (!align) {
 			this.warnWeaveMisaligned(d.sid, hit.goal.name);
 			return;
@@ -993,7 +1032,8 @@ export class PlanBoardView extends ItemView {
 		let shelf: WeaveBookSummary[] | null = null;
 		try {
 			shelf = await this.weaveBridge.getBookshelf();
-		} catch {
+		} catch (e) {
+			console.warn("[PlanFlow] 对账取书架失败:", e);
 			return;
 		}
 		if (!shelf?.length) return;
@@ -1002,12 +1042,16 @@ export class PlanBoardView extends ItemView {
 				if (!g.readerSid) continue;
 				const book = shelf.find((b) => b.sid === g.readerSid);
 				if (!book || book.chapterIndex <= 0) continue;
-				const align = await this.resolveWeaveAlignment(g.readerSid, g);
+				const align = this.leafAnchorsFor(g) ?? (await this.resolveWeaveAlignment(g.readerSid, g));
 				if (!align) {
 					this.warnWeaveMisaligned(g.readerSid, g.name);
 					continue;
 				}
-				await this.confirmWeaveLeaves({ plan: p.plan, goal: g }, passedLeafIndices(align.spine, book.chapterIndex));
+				const crossed = passedLeafIndices(align.spine, book.chapterIndex);
+				console.debug(
+					`[PlanFlow] 对账《${g.name}》: 章序 ${book.chapterIndex} · 锚点来源 ${g.readerAnchors?.length ? "落盘快照" : "实时对齐"} · 已越过 ${crossed.length} 叶`
+				);
+				await this.confirmWeaveLeaves({ plan: p.plan, goal: g }, crossed);
 			}
 		}
 	}
@@ -1250,7 +1294,7 @@ export class PlanBoardView extends ItemView {
 					const m = TASK_LINE_RE.exec(line);
 					if (!m || !m[3]) continue;
 					const text = m[2].trim();
-					const op = autos.find((a) => m[3] === a.spec.plan && text.includes(a.spec.name));
+					const op = autos.find((a) => m[3] === a.spec.plan && matchesModeLine(text, a.spec.name, a.spec.floor, a.spec.unit));
 					if (!op) continue;
 					if (line.includes(MANUAL_MARK)) continue; // 手动优先：✋ 行自动逻辑绝不碰
 					const checkedNow = m[1] === "x";
@@ -1654,8 +1698,25 @@ export class PlanBoardView extends ItemView {
 	private updateChecklist(): void {
 		if (!this.dailyData || !this.checklistEl) return;
 		this.checklistEl.empty();
+		// ADR-0006: 模式行嵌套——同计划有父打卡项（非模式行）时，模式行渲染为其子项；
+		// 无父行（计划 daily=false / 默认行被删）时保持顶层原样。
+		const modeChildren = new Set<CheckItem>();
+		const childrenOf = new Map<CheckItem, CheckItem[]>();
 		for (const item of this.dailyData.checkItems) {
-			this.checklistEl.appendChild(this.renderCheckItem(item));
+			if (!this.modeLineMatch(item)) continue;
+			const parent = this.modeParentOf(item);
+			if (!parent || parent === item) continue;
+			modeChildren.add(item);
+			let arr = childrenOf.get(parent);
+			if (!arr) {
+				arr = [];
+				childrenOf.set(parent, arr);
+			}
+			arr.push(item);
+		}
+		for (const item of this.dailyData.checkItems) {
+			if (modeChildren.has(item)) continue;
+			this.checklistEl.appendChild(this.renderCheckItem(item, childrenOf.get(item) ?? []));
 		}
 	}
 
@@ -1694,7 +1755,7 @@ export class PlanBoardView extends ItemView {
 		};
 	}
 
-	private renderCheckItem(item: CheckItem): HTMLElement {
+	private renderCheckItem(item: CheckItem, modeChildren: CheckItem[] = []): HTMLElement {
 		const li = createEl("li", { cls: "planboard-check-item" + (item.checked ? " is-checked" : "") });
 		li.setAttribute("data-line", String(item.line));
 
@@ -1721,7 +1782,7 @@ export class PlanBoardView extends ItemView {
 		const actions = li.createDiv({ cls: "planboard-item-actions" });
 		// ADR-0001: quota 行追加「实际量」录入按钮（勾选 = 记满配额；填数 = 按实际累计）
 		// ADR-0006: 复习/运动模式行同样提供「实」按钮（复习下限/运动每日量语境）
-		const modeHit = this.findModeGoal(item.plan, item.text);
+		const modeHit = this.modeLineMatch(item);
 		if (item.plan && (this.quotaPlanSet.has(item.plan) || (modeHit && modeHit.goal.mode !== "diary"))) {
 			const actBtn = actions.createEl("button", {
 				cls: "planboard-icon-btn planboard-quota-actual-btn",
@@ -1772,6 +1833,40 @@ export class PlanBoardView extends ItemView {
 			}
 		}
 
+		// ADR-0006: 模式目标行 = 计划父打卡项的子项（拉升/八段锦挂在「运动」下）；
+		// 勾父 → 级联勾全部子（ADR-0003 同款），勾满子 → 父自动勾。
+		if (modeChildren.length > 0) {
+			li.addClass("has-sublist");
+			const sub = li.createEl("ul", { cls: "planboard-sublist planboard-mode-sublist" });
+			for (const c of modeChildren) sub.appendChild(this.renderModeChild(c));
+		}
+
+		return li;
+	}
+
+	/** ADR-0006: 模式子行（父打卡项下嵌套渲染）：勾选写回自身行；复习/运动子行带「实」按钮。 */
+	private renderModeChild(item: CheckItem): HTMLElement {
+		const mg = this.modeLineMatch(item);
+		const li = createEl("li", { cls: "planboard-subitem planboard-mode-child" + (item.checked ? " is-checked" : "") });
+		li.setAttribute("data-line", String(item.line));
+		const label = li.createEl("label", { cls: "planboard-check-label" });
+		const cb = label.createEl("input", { type: "checkbox", cls: "planboard-checkbox planboard-subcheckbox" });
+		cb.checked = item.checked;
+		cb.addEventListener("change", () => void this.toggleCheckItem(item, cb.checked));
+		label.createSpan({ cls: "planboard-check-text", text: item.text });
+		if (mg && mg.goal.mode !== "diary") {
+			const actions = li.createDiv({ cls: "planboard-item-actions" });
+			const actBtn = actions.createEl("button", {
+				cls: "planboard-icon-btn planboard-quota-actual-btn",
+				attr: { "aria-label": "记录实际量", title: "记录实际量" },
+			});
+			actBtn.setText("实");
+			actBtn.addEventListener("click", (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				void this.openQuotaActualModal(item);
+			});
+		}
 		return li;
 	}
 
@@ -1789,9 +1884,11 @@ export class PlanBoardView extends ItemView {
 			if (hit && sid) {
 				const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
 				const ord = leaves ? leaves.findIndex((l) => l.name === t.text.trim()) : -1;
-				const href = ord >= 0 ? this.weaveAlign.get(sid)?.hrefs[ord] : undefined;
-				if (!href && !this.weaveAlign.has(sid)) {
-					// 锚点解析是异步的，首帧缓存常为空——补齐后刷一次列表（缓存后零开销）
+				// 锚点优先取目标落盘快照（同步、随结构确认落盘、改名不失效）；旧目标回退实时对齐缓存
+				const align = this.leafAnchorsFor(hit.goal);
+				const href = ord >= 0 ? align?.hrefs[ord] : undefined;
+				if (!href && !hit.goal.readerAnchors?.length && !this.weaveAlign.has(sid)) {
+					// 旧目标无快照：锚点解析是异步的，首帧缓存常为空——补齐后刷一次列表
 					void this.resolveWeaveAlignment(sid, hit.goal).then((a) => {
 						if (!a || this.weaveAlignRenderQueued) return;
 						this.weaveAlignRenderQueued = true;
@@ -1940,7 +2037,8 @@ export class PlanBoardView extends ItemView {
 	private async toggleCheckItem(item: CheckItem, checked: boolean): Promise<void> {
 		if (!this.dailyData) return;
 		// ADR-0006/0007: 模式行手动勾/退勾 → 打 `✋` 标记（此后自动逻辑不再覆盖）
-		const modeHit = this.findModeGoal(item.plan, item.text);
+		const modeHit = this.modeLineMatch(item);
+		const modeParent = modeHit ? this.modeParentOf(item) : null;
 		this.selfWrite = true;
 		try {
 			if (modeHit) {
@@ -1949,13 +2047,32 @@ export class PlanBoardView extends ItemView {
 			} else {
 				await this.app.vault.process(item.file, (data) => toggleTaskLine(data, item.line, checked, item.raw));
 			}
+			// ADR-0006: 勾计划父行 → 级联勾掉该计划全部模式子行（不打 ✋——复习行的 BZG
+			// 自动实量随后照常写入）；取消父行不回退子行（与任务池子任务同语义）。
+			if (checked && !modeHit && item.plan) {
+				for (const child of this.modeChildrenOf(item)) {
+					if (child.checked || child === item) continue;
+					await this.app.vault.process(child.file, (data) => toggleTaskLine(data, child.line, true, child.raw));
+					child.checked = true;
+				}
+			}
 			// ADR-0003: 勾父行 → 连带勾掉该计划全部待办子任务（Q3a）；
 			// 取消父行不回退子任务——防误触清掉任务池里的进度记录。
-			if (checked && item.plan) {
+			if (checked && item.plan && !modeHit) {
 				for (const t of this.pendingPoolChildren(item.plan)) {
 					await toggleTask(this.app, t, true);
 					// ADR-0004: 级联勾掉的子任务同步投影到当天日记「## 代办事项」
 					await syncPoolTaskToDiary(this.app, this.plugin.settings.diaryDir, t.text, true);
+				}
+			}
+			// ADR-0006: 勾满某计划的全部模式子行 → 父打卡行自动勾（ADR-0003「全子完成勾父」同款）
+			if (modeHit && checked && modeParent && !modeParent.checked) {
+				const siblings = this.modeChildrenOf(modeParent);
+				const allDone = siblings.every((c) => c.checked || c === item);
+				if (siblings.length > 0 && allDone) {
+					await this.app.vault.process(modeParent.file, (data) =>
+						toggleTaskLine(data, modeParent.line, true, modeParent.raw));
+					modeParent.checked = true;
 				}
 			}
 		} finally {
@@ -2008,7 +2125,7 @@ export class PlanBoardView extends ItemView {
 	/** ADR-0001: 打开「实际量」录入弹窗（quota 行专用）。 */
 	private async openQuotaActualModal(item: CheckItem): Promise<void> {
 		// ADR-0006: 复习/运动模式行 → 下限语境的录入（留空 = 记满下限）
-		const modeHit = this.findModeGoal(item.plan, item.text);
+		const modeHit = this.modeLineMatch(item);
 		if (modeHit) {
 			const unit = modeHit.goal.unit || (modeHit.goal.mode === "review" ? "篇" : "");
 			const floor = modeHit.goal.floor ?? 0;
@@ -3657,6 +3774,9 @@ export class PlanBoardView extends ItemView {
 		// ADR-0009: 阅读器联动 sid（新建来自选书；编辑走旧流程时保留既有绑定，避免联动丢失）
 		if (input.reader?.sid) goal.readerSid = input.reader.sid;
 		else if (existing?.readerSid) goal.readerSid = existing.readerSid;
+		// ADR-0009: 每叶锚点快照随目标落盘（确认步提取树推导；编辑走旧流程保留既有锚点）
+		if (input.reader?.anchors?.length) goal.readerAnchors = input.reader.anchors.map((a) => ({ ...a }));
+		else if (existing?.readerAnchors) goal.readerAnchors = existing.readerAnchors;
 		// ADR-0005：结构型目标（多级 structure 或兼容 chapters）；count/单位由叶子推导
 		const leaves = expandGoalLeaves(input.name, input);
 		const isStructured = !isModeGoal && !!(leaves && leaves.length > 0);
@@ -4603,6 +4723,8 @@ class GoalEditModal extends Modal {
 	private structTextMode = false;
 	private readerSid = "";
 	private readerResume = 0;
+	/** 结构确认步推导的每叶锚点快照（确认后随目标落盘，跳转/推进只认它）。 */
+	private readerAnchorList: { spine: number; href: string }[] = [];
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
 	private customUnitMode = false;
 	/** BZG 联动状态提示（视图侧按当前设置生成，复习表单展示）。 */
@@ -5186,6 +5308,8 @@ class GoalEditModal extends Modal {
 				...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
 			}));
 			this.readerSid = this.pickedBook.sid;
+			// ADR-0009: 每叶锚点快照（确认树推导，随目标落盘——跳转/推进只认它）
+			this.readerAnchorList = confirmed.leafSpine.map((spine, i) => ({ spine, href: confirmed.leafHref[i] }));
 			// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
 			this.readerResume = resumeLeafCount(confirmed.leafSpine, this.pickedBook.chapterIndex);
 			this.goto(STEP_REVIEW);
@@ -5670,9 +5794,9 @@ class GoalEditModal extends Modal {
 		if (this.endValue) input.end = this.endValue;
 		// ADR-0006: 阅读书籍模式落 mode 标记（通用目标保持无模式）
 		if (this.modeValue === "reading") input.mode = "reading";
-		// ADR-0009: 阅读器联动（选书步来源）——sid + 接续阅读预勾数
+		// ADR-0009: 阅读器联动（选书步来源）——sid + 接续阅读预勾数 + 每叶锚点快照
 		if (this.modeValue === "reading" && this.readerSid) {
-			input.reader = { sid: this.readerSid, resumeLeaves: this.readerResume };
+			input.reader = { sid: this.readerSid, resumeLeaves: this.readerResume, anchors: this.readerAnchorList };
 		}
 		if (!simple) {
 			const levels = this.cleanLevels();
@@ -5852,8 +5976,11 @@ function serializePlans(plans: PlanDef[], dailyByPlan?: Record<string, boolean>)
 				if (g.floor != null) lines.push(`        floor: ${g.floor}`);
 				// ADR-0005：章节 chapters 与多级 structure 原样写回（flow 序列 / 块序列，yamlScalar 只管标量）
 				if (g.chapters && g.chapters.length > 0) lines.push(`        chapters: [${g.chapters.join(", ")}]`);
-				// ADR-0009：阅读器来源书稳定标识原样写回（联动跳转/推进事实的唯一键）
+				// ADR-0009：阅读器来源书稳定标识 + 每叶锚点快照（"spine|href" 紧凑序列）原样写回
 				if (g.readerSid) lines.push(`        readerSid: ${yamlScalar(g.readerSid)}`);
+				if (g.readerAnchors?.length) {
+					lines.push(`        readerAnchors: [${g.readerAnchors.map((a) => yamlScalar(`${a.spine}|${a.href}`)).join(", ")}]`);
+				}
 				if (g.structure && g.structure.length > 0) {
 					lines.push("        structure:");
 					for (const lv of g.structure) {
@@ -5914,7 +6041,7 @@ function toPlanDef(prog: PlanProgress): PlanDef {
 		type: prog.isQuota ? "quota" : prog.isNumeric ? "numeric" : "check",
 		target: prog.target,
 		targetCount: prog.targetCount,
-		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor, readerSid: g.readerSid })),
+		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor, readerSid: g.readerSid, readerAnchors: g.readerAnchors })),
 		quota: prog.quota ? { total: prog.quota.total, unit: prog.quota.unit, start: prog.quota.start, end: prog.quota.end } : null,
 		action: prog.action,
 		label: prog.label,

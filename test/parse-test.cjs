@@ -1,9 +1,9 @@
 // test/obsidian-mock.ts
 var TFile = class {
   constructor(path) {
-    var _a29;
+    var _a41;
     this.path = path != null ? path : "";
-    this.name = (_a29 = this.path.split("/").pop()) != null ? _a29 : "";
+    this.name = (_a41 = this.path.split("/").pop()) != null ? _a41 : "";
   }
 };
 function parseYaml(src) {
@@ -239,6 +239,13 @@ function buildModeCheckLine({ plan, name, label, floor, unit }, date) {
     content += ` ${formatQuotaAmount(floor)}${unit}`;
   return `- [ ] ${content} #\u8BA1\u5212/${plan} \u{1F6EB} ${date} \u{1F4C5} ${date}`;
 }
+function matchesModeLine(text, name, floor, unit) {
+  const stripped = text.trim().replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+  if (floor > 0) {
+    return stripped.startsWith(name) && stripped.includes(`${formatQuotaAmount(floor)}${unit || ""}`);
+  }
+  return stripped === name;
+}
 function missingModeLines(content, specs, date) {
   const existing = /* @__PURE__ */ new Set();
   const lines = content.split("\n");
@@ -295,7 +302,7 @@ function missingQuotaLines(content, quotas, date) {
 
 // src/tasks.ts
 function parseTaskPool(file2, content) {
-  var _a29, _b12, _c8;
+  var _a41, _b22, _c10;
   const tasks2 = [];
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -304,10 +311,10 @@ function parseTaskPool(file2, content) {
       continue;
     tasks2.push({
       text: m2[2].trim(),
-      plan: (_a29 = m2[3]) != null ? _a29 : null,
+      plan: (_a41 = m2[3]) != null ? _a41 : null,
       checked: m2[1] === "x",
-      start: (_b12 = m2[4]) != null ? _b12 : null,
-      due: (_c8 = m2[5]) != null ? _c8 : null,
+      start: (_b22 = m2[4]) != null ? _b22 : null,
+      due: (_c10 = m2[5]) != null ? _c10 : null,
       line: i,
       raw: lines[i],
       file: file2
@@ -326,7 +333,7 @@ function buildPoolLine({ text, plan, start, due, checked }) {
   return line;
 }
 var DAY_MS = 864e5;
-var AUTO_TASK_SUFFIX_RE = /（第\s*\d+[^）]*）$/;
+var AUTO_TASK_SUFFIX_RE = /（(?:第\s*)?[0-9一二三四五六七八九十百千][^）]*）$/;
 function isAutoTask(task) {
   return AUTO_TASK_SUFFIX_RE.test(task.text.trim());
 }
@@ -338,11 +345,14 @@ function extractGoalName(text) {
   const name = trimmed.slice(0, m2.index).trim();
   return name || null;
 }
-function groupPoolTasksByGoal(tasks2, today) {
+function groupPoolTasksByGoal(tasks2, today, knownNames) {
   const byName = /* @__PURE__ */ new Map();
   const ungrouped = [];
+  const known = (knownNames != null ? knownNames : []).filter(Boolean);
   for (const t of tasks2) {
-    const name = extractGoalName(t.text);
+    const text = t.text.trim();
+    const knownHit = known.find((n) => text.startsWith(`${n}\uFF08`));
+    const name = knownHit != null ? knownHit : extractGoalName(text);
     if (!name) {
       ungrouped.push(t);
       continue;
@@ -354,18 +364,18 @@ function groupPoolTasksByGoal(tasks2, today) {
       byName.set(name, [t]);
   }
   const coversToday = (t) => {
-    var _a29, _b12;
-    const s = (_a29 = t.start) != null ? _a29 : t.due;
-    const d = (_b12 = t.due) != null ? _b12 : t.start;
+    var _a41, _b22;
+    const s = (_a41 = t.start) != null ? _a41 : t.due;
+    const d = (_b22 = t.due) != null ? _b22 : t.start;
     return !!s && !!d && s <= today && today <= d;
   };
   const groups = [];
   for (const [name, groupTasks] of byName) {
     const pending = groupTasks.filter((t) => {
-      var _a29;
+      var _a41;
       if (t.checked)
         return false;
-      const effStart = (_a29 = t.start) != null ? _a29 : t.due;
+      const effStart = (_a41 = t.start) != null ? _a41 : t.due;
       return !!effStart && effStart <= today;
     });
     const todayDone = groupTasks.filter((t) => t.checked && coversToday(t));
@@ -416,38 +426,42 @@ var UNIT_SUCCESSORS = {
   \u6761: []
 };
 function suggestNextUnit(prevUnit) {
-  var _a29;
+  var _a41;
   const list = UNIT_SUCCESSORS[prevUnit.trim()];
-  return (_a29 = list == null ? void 0 : list[0]) != null ? _a29 : "\u8282";
+  return (_a41 = list == null ? void 0 : list[0]) != null ? _a41 : "\u8282";
 }
 function isRestartUnit(word) {
   return RESTART_UNITS.has(word.trim());
 }
 function expandGoalStructure(goalName, levels) {
-  var _a29, _b12, _c8;
+  var _a41, _b22, _c10;
   const clean = (v) => {
     const n = typeof v === "number" ? Math.floor(v) : parseInt(String(v), 10);
     return Number.isFinite(n) && n >= 0 ? n : 0;
   };
   if (!Array.isArray(levels) || levels.length === 0 || levels.length > 8)
     return [];
+  const labelAt = (li, g) => {
+    var _a42, _b23, _c11;
+    return String((_c11 = (_b23 = (_a42 = levels[li]) == null ? void 0 : _a42.labels) == null ? void 0 : _b23[g - 1]) != null ? _c11 : "").trim();
+  };
   let level = [];
   let roots = [];
   for (let li = 0; li < levels.length; li++) {
-    const unit = String((_b12 = (_a29 = levels[li]) == null ? void 0 : _a29.unit) != null ? _b12 : "").trim();
+    const unit = String((_b22 = (_a41 = levels[li]) == null ? void 0 : _a41.unit) != null ? _b22 : "").trim();
     if (!unit)
       return [];
     const restart = RESTART_UNITS.has(unit);
     const next = [];
     let g = 0;
     if (li === 0) {
-      const n = clean((_c8 = levels[0].counts) == null ? void 0 : _c8[0]);
+      const n = clean((_c10 = levels[0].counts) == null ? void 0 : _c10[0]);
       if (n <= 0)
         return [];
       for (let i = 1; i <= n; i++) {
         g++;
         next.push({
-          node: { label: `\u7B2C ${i} ${unit}`, unit, restart, parentLabel: null, parentRestart: false, global: g },
+          node: { label: labelAt(0, g) || `\u7B2C ${i} ${unit}`, unit, restart, parentLabel: null, parentRestart: false, global: g },
           children: [],
           parent: null
         });
@@ -464,7 +478,7 @@ function expandGoalStructure(goalName, levels) {
           const num = restart ? c : g;
           next.push({
             node: {
-              label: `\u7B2C ${num} ${unit}`,
+              label: labelAt(li, g) || `\u7B2C ${num} ${unit}`,
               unit,
               restart,
               parentLabel: parent.label,
@@ -501,8 +515,20 @@ function expandGoalStructure(goalName, levels) {
   const visit = (w, depth, rollup) => {
     const rollupAncestor = depth === rollupIdx ? w : rollup;
     if (depth === lastIdx || w.children.length === 0) {
+      const realLabel = labelAt(depth, w.node.global);
+      let suffix;
+      if (realLabel) {
+        if (!w.node.restart) {
+          suffix = realLabel;
+        } else {
+          const roll = rollupAncestor && rollupAncestor !== w ? pathSuffix(rollupAncestor) : "";
+          suffix = roll ? `${roll}\xB7${realLabel}` : realLabel;
+        }
+      } else {
+        suffix = pathSuffix(w);
+      }
       leaves.push({
-        name: `${goalName}\uFF08${pathSuffix(w)}\uFF09`,
+        name: `${goalName}\uFF08${suffix}\uFF09`,
         index: leaves.length + 1,
         group: rollupAncestor ? pathSuffix(rollupAncestor) : depth !== lastIdx ? pathSuffix(w) : ""
       });
@@ -522,10 +548,10 @@ function chaptersToStructure(chapters) {
   ];
 }
 function expandGoalLeaves(goalName, goal) {
-  var _a29, _b12;
-  if ((_a29 = goal.structure) == null ? void 0 : _a29.length)
+  var _a41, _b22;
+  if ((_a41 = goal.structure) == null ? void 0 : _a41.length)
     return expandGoalStructure(goalName, goal.structure);
-  if ((_b12 = goal.chapters) == null ? void 0 : _b12.length)
+  if ((_b22 = goal.chapters) == null ? void 0 : _b22.length)
     return expandGoalStructure(goalName, chaptersToStructure(goal.chapters));
   return null;
 }
@@ -670,8 +696,8 @@ function buildBzgSnapshot(items2, cfg) {
   };
 }
 function reviewedOn(snap2, localDay) {
-  var _a29, _b12;
-  return (_b12 = (_a29 = snap2.byDay.get(localDay)) == null ? void 0 : _a29.size) != null ? _b12 : 0;
+  var _a41, _b22;
+  return (_b22 = (_a41 = snap2.byDay.get(localDay)) == null ? void 0 : _a41.size) != null ? _b22 : 0;
 }
 function distinctReviewedInRange(snap2, start, end) {
   let count = 0;
@@ -721,9 +747,9 @@ function quotaExpected(dailyQuota, start, end, today) {
 }
 function filterTasksInRange(tasks2, start, end) {
   return tasks2.filter((t) => {
-    var _a29, _b12;
-    const s = (_a29 = t.start) != null ? _a29 : t.due;
-    const e = (_b12 = t.due) != null ? _b12 : t.start;
+    var _a41, _b22;
+    const s = (_a41 = t.start) != null ? _a41 : t.due;
+    const e = (_b22 = t.due) != null ? _b22 : t.start;
     if (!s || !e)
       return false;
     return s <= end && e >= start;
@@ -735,7 +761,7 @@ function summarizeTasks(tasks2) {
   return { total, done, percent: total === 0 ? 0 : Math.round(done / total * 100) };
 }
 function parsePlansFromFrontmatter(content) {
-  var _a29, _b12, _c8;
+  var _a41, _b22, _c10;
   const fmMatch = /^---\n([\s\S]*?)\n---/.exec(content);
   if (!fmMatch)
     return [];
@@ -751,7 +777,7 @@ function parsePlansFromFrontmatter(content) {
     return [];
   const defs = [];
   const push = (name, obj) => {
-    var _a30;
+    var _a42;
     const trimmed = name.trim();
     if (!trimmed)
       return;
@@ -767,7 +793,7 @@ function parsePlansFromFrontmatter(content) {
       targetCount = goals.reduce((acc, g) => acc + g.count, 0);
     } else {
       type = readPlanType(obj, target);
-      const m2 = (_a30 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a30 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
+      const m2 = (_a42 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a42 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
       targetCount = type === "numeric" && m2 ? parseInt(m2[1], 10) : 0;
     }
     defs.push({
@@ -801,7 +827,7 @@ function parsePlansFromFrontmatter(content) {
         }
       } else if (el && typeof el === "object") {
         const obj = el;
-        const name = (_c8 = (_b12 = (_a29 = obj.name) != null ? _a29 : obj.plan) != null ? _b12 : obj["\u540D\u79F0"]) != null ? _c8 : obj["\u8BA1\u5212"];
+        const name = (_c10 = (_b22 = (_a41 = obj.name) != null ? _a41 : obj.plan) != null ? _b22 : obj["\u540D\u79F0"]) != null ? _c10 : obj["\u8BA1\u5212"];
         if (typeof name === "string") {
           push(name, obj);
         } else {
@@ -848,7 +874,7 @@ function readPlanString(obj, keys) {
   return "";
 }
 function readPlanGoals(obj) {
-  var _a29, _b12, _c8, _d2;
+  var _a41, _b22, _c10, _d4;
   if (!obj || !Array.isArray(obj.goals))
     return [];
   const out = [];
@@ -856,7 +882,7 @@ function readPlanGoals(obj) {
     if (typeof g === "string") {
       const m2 = /^(.+?)\s+(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天|章|节)?(?:\s+(\d{4}-\d{2}-\d{2})~\s*(\d{4}-\d{2}-\d{2}))?$/.exec(g.trim());
       if (m2) {
-        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a29 = m2[3]) != null ? _a29 : "\u4E2A", start: m2[4], end: m2[5] });
+        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a41 = m2[3]) != null ? _a41 : "\u4E2A", start: m2[4], end: m2[5] });
       }
       continue;
     }
@@ -868,8 +894,8 @@ function readPlanGoals(obj) {
       continue;
     const mode = parseGoalMode(readPlanString(rec, ["mode", "\u6A21\u5F0F"]));
     const count = typeof rec.count === "number" ? rec.count : typeof rec["\u6570\u91CF"] === "number" ? rec["\u6570\u91CF"] : (() => {
-      var _a30;
-      const cv = (_a30 = rec.count) != null ? _a30 : rec["\u6570\u91CF"];
+      var _a42;
+      const cv = (_a42 = rec.count) != null ? _a42 : rec["\u6570\u91CF"];
       return parseInt(cv == null ? "0" : typeof cv === "string" || typeof cv === "number" ? String(cv) : "0", 10);
     })();
     if (!mode && (!count || Number.isNaN(count) || count <= 0))
@@ -889,7 +915,7 @@ function readPlanGoals(obj) {
     const goal = { name: name.trim(), count, unit, start: start || void 0, end: end || void 0 };
     if (mode) {
       goal.mode = mode;
-      const rawFloor = (_c8 = (_b12 = rec.floor) != null ? _b12 : rec["\u4E0B\u9650"]) != null ? _c8 : rec["\u6BCF\u65E5"];
+      const rawFloor = (_c10 = (_b22 = rec.floor) != null ? _b22 : rec["\u4E0B\u9650"]) != null ? _c10 : rec["\u6BCF\u65E5"];
       const floorVal = typeof rawFloor === "number" ? rawFloor : parseFloat(String(rawFloor != null ? rawFloor : ""));
       if (Number.isFinite(floorVal) && floorVal > 0)
         goal.floor = floorVal;
@@ -901,6 +927,21 @@ function readPlanGoals(obj) {
     const readerSid = readPlanString(rec, ["readerSid", "\u9605\u8BFB\u5668\u4E66"]);
     if (readerSid)
       goal.readerSid = readerSid;
+    const rawAnchors = rec.readerAnchors;
+    if (Array.isArray(rawAnchors)) {
+      const anchors = rawAnchors.map((a) => {
+        const s = typeof a === "string" ? a : String(a != null ? a : "");
+        const sep = s.indexOf("|");
+        if (sep === -1)
+          return null;
+        const spine = parseInt(s.slice(0, sep), 10);
+        if (!Number.isFinite(spine) || spine < 0)
+          return null;
+        return { spine, href: s.slice(sep + 1) };
+      }).filter((a) => !!a);
+      if (anchors.length > 0)
+        goal.readerAnchors = anchors;
+    }
     const rawStructure = rec.structure;
     if (Array.isArray(rawStructure)) {
       const levels = [];
@@ -909,12 +950,18 @@ function readPlanGoals(obj) {
           continue;
         const obj2 = lv;
         const unit2 = readPlanString(obj2, ["unit", "\u5355\u4F4D"]);
-        const rawCounts = (_d2 = obj2.counts) != null ? _d2 : obj2["\u6570\u76EE"];
+        const rawCounts = (_d4 = obj2.counts) != null ? _d4 : obj2["\u6570\u76EE"];
         if (!unit2 || (rawCounts === void 0 || rawCounts === null))
           continue;
-        const list = (Array.isArray(rawCounts) ? rawCounts : String(rawCounts).replace(/[[\]]/g, "").split(/[,，\s]+/)).filter((c) => String(c).trim() !== "").map(toInt).filter((c) => Number.isFinite(c) && c > 0);
-        if (list.length > 0)
-          levels.push({ unit: unit2, counts: list });
+        const list = (Array.isArray(rawCounts) ? rawCounts : String(rawCounts).replace(/[[\]]/g, "").split(/[,，\s]+/)).map(toInt).filter((c) => Number.isFinite(c) && c >= 0);
+        if (list.length > 0) {
+          const level = { unit: unit2, counts: list };
+          const rawLabels = obj2.labels;
+          if (Array.isArray(rawLabels) && rawLabels.length > 0) {
+            level.labels = rawLabels.map((s) => typeof s === "string" ? s : String(s != null ? s : ""));
+          }
+          levels.push(level);
+        }
       }
       if (levels.length > 0)
         goal.structure = levels;
@@ -924,10 +971,10 @@ function readPlanGoals(obj) {
   return out;
 }
 function readPlanQuota(obj) {
-  var _a29, _b12, _c8, _d2, _e;
+  var _a41, _b22, _c10, _d4, _e3;
   if (!obj)
     return null;
-  const raw = (_b12 = (_a29 = obj.quota) != null ? _a29 : obj["\u5B9A\u989D"]) != null ? _b12 : obj["\u65E5\u5B9A\u989D"];
+  const raw = (_b22 = (_a41 = obj.quota) != null ? _a41 : obj["\u5B9A\u989D"]) != null ? _b22 : obj["\u65E5\u5B9A\u989D"];
   let rec = null;
   if (raw && typeof raw === "object") {
     rec = raw;
@@ -939,11 +986,11 @@ function readPlanQuota(obj) {
   }
   if (!rec)
     return null;
-  const totalRaw = (_d2 = (_c8 = rec.total) != null ? _c8 : rec["\u603B\u91CF"]) != null ? _d2 : rec["\u6570\u91CF"];
+  const totalRaw = (_d4 = (_c10 = rec.total) != null ? _c10 : rec["\u603B\u91CF"]) != null ? _d4 : rec["\u6570\u91CF"];
   const total = typeof totalRaw === "number" ? totalRaw : parseFloat(String(totalRaw != null ? totalRaw : ""));
   if (!Number.isFinite(total) || total <= 0)
     return null;
-  const unitRaw = (_e = rec.unit) != null ? _e : rec["\u5355\u4F4D"];
+  const unitRaw = (_e3 = rec.unit) != null ? _e3 : rec["\u5355\u4F4D"];
   const unit = typeof unitRaw === "string" ? unitRaw.trim() : "";
   const start = [rec.start, rec["\u5F00\u59CB"], rec["\u8D77"]].find((v) => typeof v === "string" && !!v.trim());
   const end = [rec.end, rec["\u7ED3\u675F"], rec["\u6B62"], rec["\u622A\u6B62"]].find((v) => typeof v === "string" && !!v.trim());
@@ -998,7 +1045,7 @@ var CN_ORD_RE = /^[一二三四五六七八九十百]+[、.．]/;
 var MAX_TOC_LEVELS = 8;
 var MAX_TOC_LINES = 500;
 function parseTocLine(rawLine) {
-  var _a29;
+  var _a41;
   let line = rawLine.trim();
   line = line.replace(/^[-*•·]\s*(?:\[[ x]\]\s*)?/, "");
   if (!line)
@@ -1015,7 +1062,7 @@ function parseTocLine(rawLine) {
   const num = /^(\d+)(?:[.、](\d+))?(?:\.(\d+))?/.exec(line);
   if (num) {
     const depth = num[3] ? 2 : num[2] ? 1 : 0;
-    return { title: line, level: depth, family: "N", unit: (_a29 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a29 : `\u7EA7${depth + 1}` };
+    return { title: line, level: depth, family: "N", unit: (_a41 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a41 : `\u7EA7${depth + 1}` };
   }
   if (CN_ORD_RE.test(line)) {
     return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
@@ -1029,7 +1076,7 @@ function parseTocLine(rawLine) {
   return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
 }
 function parseToc(text) {
-  var _a29, _b12, _c8;
+  var _a41, _b22, _c10;
   const items2 = [];
   let skipped = 0;
   for (const l of text.split(/\r?\n/)) {
@@ -1071,7 +1118,7 @@ function parseToc(text) {
     }
     const depth = parent ? parent.depth + 1 : 0;
     if (depth >= MAX_TOC_LEVELS) {
-      const leafParent = (_b12 = (_a29 = stack[stack.length - 1]) == null ? void 0 : _a29.node) != null ? _b12 : virtualRoot;
+      const leafParent = (_b22 = (_a41 = stack[stack.length - 1]) == null ? void 0 : _a41.node) != null ? _b22 : virtualRoot;
       leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, children: [] });
       continue;
     }
@@ -1085,12 +1132,12 @@ function parseToc(text) {
   const freq = [];
   {
     const walk = (nodes) => {
-      var _a30;
+      var _a42;
       for (const n of nodes) {
         while (freq.length <= n.depth)
           freq.push(/* @__PURE__ */ new Map());
         if (n.unit)
-          freq[n.depth].set(n.unit, ((_a30 = freq[n.depth].get(n.unit)) != null ? _a30 : 0) + 1);
+          freq[n.depth].set(n.unit, ((_a42 = freq[n.depth].get(n.unit)) != null ? _a42 : 0) + 1);
         maxDepth = Math.max(maxDepth, n.depth + 1);
         walk(n.children);
       }
@@ -1101,7 +1148,7 @@ function parseToc(text) {
   for (let i = 0; i < maxDepth; i++) {
     let best = "";
     let bestN = 0;
-    for (const [w, n] of (_c8 = freq[i]) != null ? _c8 : []) {
+    for (const [w, n] of (_c10 = freq[i]) != null ? _c10 : []) {
       if (n > bestN) {
         best = w;
         bestN = n;
@@ -1130,21 +1177,32 @@ function tocSummary(result) {
 
 // src/weave-bridge.ts
 function weaveTocToStructure(tree) {
+  var _a41;
   if (!tree || tree.length === 0)
     return null;
   const freq = [];
   const walkFreq = (nodes, depth) => {
-    var _a29;
+    var _a42;
     for (const n of nodes) {
       while (freq.length <= depth)
         freq.push(/* @__PURE__ */ new Map());
       const w = extractTocUnitWord(n.label);
       if (w)
-        freq[depth].set(w, ((_a29 = freq[depth].get(w)) != null ? _a29 : 0) + 1);
+        freq[depth].set(w, ((_a42 = freq[depth].get(w)) != null ? _a42 : 0) + 1);
       walkFreq(n.children, depth + 1);
     }
   };
   walkFreq(tree, 0);
+  const labelRows = [];
+  const walkLabels = (nodes, depth) => {
+    for (const n of nodes) {
+      while (labelRows.length <= depth)
+        labelRows.push([]);
+      labelRows[depth].push(n.label || "");
+      walkLabels(n.children, depth + 1);
+    }
+  };
+  walkLabels(tree, 0);
   const depth0 = freq.length;
   if (depth0 === 0 || depth0 > 8)
     return null;
@@ -1181,6 +1239,10 @@ function weaveTocToStructure(tree) {
     };
     for (const n of tree)
       visit(n, 0);
+  }
+  for (let lv = 0; lv < levels.length; lv++) {
+    if ((_a41 = labelRows[lv]) == null ? void 0 : _a41.some((l) => l.trim() !== ""))
+      levels[lv].labels = labelRows[lv];
   }
   if (levels[0].counts[0] <= 0)
     return null;
@@ -1810,6 +1872,19 @@ var scheduled = bookView.groups.filter((g) => g.scheduled);
 var doneToday = scheduled.filter((g) => g.pending.length === 0);
 check("fraction denominator = 5", scheduled.length === 5, scheduled.length);
 check("fraction numerator = 2", doneToday.length === 2, doneToday.length);
+var knownPool = parseTaskPool(
+  file,
+  [
+    "- [ ] \u5148\u79E6\u7A7F\u8D8A\u751F\u5B58\u624B\u518C\uFF08\u5E8F\uFF09 #\u8BA1\u5212/\u9605\u8BFB \u{1F6EB} 2026-11-08 \u{1F4C5} 2026-11-08",
+    "- [ ] \u5148\u79E6\u7A7F\u8D8A\u751F\u5B58\u624B\u518C\uFF08\u7B2C\u4E00\u7AE0\u3000\u82F1\u96C4\u96BE\u8FC7\u8BED\u8A00\u5173\xB7\u6B32\u95EF\u5929\u4E0B|\u4E0A\u53E4\u6C49\u8BED\uFF09 #\u8BA1\u5212/\u9605\u8BFB \u{1F6EB} 2026-11-08 \u{1F4C5} 2026-11-08",
+    "- [ ] \u522B\u7684\u4E66\uFF08\u7B2C 1 \u8282\uFF09 #\u8BA1\u5212/\u9605\u8BFB \u{1F6EB} 2026-11-08 \u{1F4C5} 2026-11-08"
+  ].join("\n")
+);
+var knownView = groupPoolTasksByGoal(knownPool, "2026-11-08", ["\u5148\u79E6\u7A7F\u8D8A\u751F\u5B58\u624B\u518C"]);
+check("knownNames: \u65E0\u7F16\u53F7\u540E\u7F00\u53F6\u5F52\u5165\u4E66\u7EC4", knownView.groups.map((g) => g.name).join(",") === "\u5148\u79E6\u7A7F\u8D8A\u751F\u5B58\u624B\u518C,\u522B\u7684\u4E66", JSON.stringify(knownView.groups.map((g) => g.name)));
+var _a27, _b11;
+check("knownNames: \u4E66\u7EC4\u542B\u4E24\u53F6\u4E14 scheduled", ((_a27 = knownView.groups[0]) == null ? void 0 : _a27.pending.length) === 2 && ((_b11 = knownView.groups[0]) == null ? void 0 : _b11.scheduled) === true);
+check("knownNames: \u7F3A\u7701\u7EF4\u6301\u539F\u53E3\u5F84", groupPoolTasksByGoal(knownPool, "2026-11-08").ungrouped.length === 1);
 var bookTree = [
   {
     label: "\u7B2C1\u7AE0 \u521D\u89C1",
@@ -1838,7 +1913,7 @@ check("bridge: leafSpine DFS [1,1,2,4]", JSON.stringify(conv == null ? void 0 : 
 check("bridge: leafHref DFS", (conv == null ? void 0 : conv.leafHref.join("|")) === "c1.xhtml#s1|c1.xhtml#s2|c2.xhtml|c3.xhtml#s1");
 var bridgeLeaves = expandGoalStructure("\u6D4B\u8BD5\u4E66", conv.levels);
 check("bridge: alignment invariant (leaves match)", bridgeLeaves.length === conv.leafSpine.length, `${bridgeLeaves.length} vs ${conv.leafSpine.length}`);
-check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("\u7B2C 2 \u7AE0")));
+check("bridge: upgrade leaf named as chapter", bridgeLeaves.some((l) => l.name.includes("\u7B2C2\u7AE0 \u72EC\u767D")));
 check("resume: chapter 2 \u2192 2 pre-read", resumeLeafCount(conv.leafSpine, 2) === 2, resumeLeafCount(conv.leafSpine, 2));
 check("resume: 0 for unread book", resumeLeafCount(conv.leafSpine, 0) === 0);
 check("resume: all for finished book", resumeLeafCount(conv.leafSpine, 5) === 4);
@@ -1867,11 +1942,72 @@ plans:
 ---
 `;
 var defsReader = parsePlansFromFrontmatter(fmReader);
-var _a27;
-var readerGoal = (_a27 = defsReader[0]) == null ? void 0 : _a27.goals[0];
+var _a28;
+var readerGoal = (_a28 = defsReader[0]) == null ? void 0 : _a28.goals[0];
 check("readerSid: parsed from frontmatter", (readerGoal == null ? void 0 : readerGoal.readerSid) === "epubsrc-d3aedbaff902c0fb5db47804", readerGoal == null ? void 0 : readerGoal.readerSid);
-var _a28, _b11, _c7;
-check("readerSid: absent \u2192 undefined", ((_c7 = (_b11 = (_a28 = defs1[0]) == null ? void 0 : _a28.goals) == null ? void 0 : _b11[0]) == null ? void 0 : _c7.readerSid) === void 0);
+var _a29, _b12, _c7;
+check("readerSid: absent \u2192 undefined", ((_c7 = (_b12 = (_a29 = defs1[0]) == null ? void 0 : _a29.goals) == null ? void 0 : _b12[0]) == null ? void 0 : _c7.readerSid) === void 0);
+var autoOf = (text) => isAutoTask({ text, plan: null, checked: false, start: null, due: null, line: 0, raw: "", file: null });
+var labeled = expandGoalStructure("\u6D4B\u8BD5\u4E66", [
+  { unit: "\u7AE0", counts: [2], labels: ["\u7B2C1\u7AE0 \u521D\u89C1", "\u7B2C2\u7AE0 \u72EC\u767D"] },
+  { unit: "\u8282", counts: [2, 0], labels: ["1.1 \u76F8\u9047", "1.2 \u79BB\u522B"] }
+]);
+var _a30, _b13;
+check("labels: \u91CD\u6392\u53F6\u5E26\u7AE0\u8DEF\u5F84\u524D\u7F00", ((_a30 = labeled[0]) == null ? void 0 : _a30.name) === "\u6D4B\u8BD5\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.1 \u76F8\u9047\uFF09", (_b13 = labeled[0]) == null ? void 0 : _b13.name);
+var _a31, _b14;
+check("labels: \u91CD\u6392\u53F62", ((_a31 = labeled[1]) == null ? void 0 : _a31.name) === "\u6D4B\u8BD5\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.2 \u79BB\u522B\uFF09", (_b14 = labeled[1]) == null ? void 0 : _b14.name);
+var _a32, _b15;
+check("labels: \u65E0\u8282\u7AE0\u5347\u683C\u7528\u771F\u5B9E\u6807\u9898", ((_a32 = labeled[2]) == null ? void 0 : _a32.name) === "\u6D4B\u8BD5\u4E66\uFF08\u7B2C2\u7AE0 \u72EC\u767D\uFF09", (_b15 = labeled[2]) == null ? void 0 : _b15.name);
+var _a33, _b16;
+check("labels: \u7EC4\u6807\u7B7E\u7528\u771F\u5B9E\u6807\u9898", ((_a33 = labeled[0]) == null ? void 0 : _a33.group) === "\u7B2C1\u7AE0 \u521D\u89C1", (_b16 = labeled[0]) == null ? void 0 : _b16.group);
+var _a34;
+check("labels: \u975E\u91CD\u6392\u53F6\u76F4\u63A5\u7528\u771F\u5B9E\u6807\u9898", ((_a34 = expandGoalStructure("\u4E66", [{ unit: "\u7AE0", counts: [1], labels: ["\u7B2C\u4E00\u56DE \u77F3\u5F52"] }])[0]) == null ? void 0 : _a34.name) === "\u4E66\uFF08\u7B2C\u4E00\u56DE \u77F3\u5F52\uFF09");
+check("labels: \u4E2D\u6587\u6570\u5B57\u540E\u7F00\u8BC6\u522B\u4E3A\u81EA\u52A8\u4EFB\u52A1", autoOf("\u4E66\uFF08\u7B2C\u4E00\u56DE \u77F3\u5F52\uFF09") === true);
+check("labels: \u6570\u5B57\u540E\u7F00\u8BC6\u522B", autoOf("\u4E66\uFF081.1 \u76F8\u9047\uFF09") === true);
+var _a35, _b17;
+check("labels: \u5E26\u8DEF\u5F84\u540E\u7F00\u8BC6\u522B", autoOf((_b17 = (_a35 = labeled[0]) == null ? void 0 : _a35.name) != null ? _b17 : "") === true);
+check("labels: \u624B\u52A8\u4EFB\u52A1\u4E0D\u8BEF\u5224", autoOf("\u5199\u6587\u7AE0\uFF08\u8349\u7A3F\uFF09") === false);
+check("labels: extractGoalName \u5265\u771F\u5B9E\u6807\u9898\u540E\u7F00", extractGoalName("\u4E66\uFF081.1 \u76F8\u9047\uFF09") === "\u4E66");
+var _a36;
+check("labels: \u7F3A labels \u843D\u751F\u6210\u540D", ((_a36 = expandGoalStructure("\u4E66", [{ unit: "\u7AE0", counts: [2] }])[1]) == null ? void 0 : _a36.name) === "\u4E66\uFF08\u7B2C 2 \u7AE0\uFF09");
+var convL = weaveTocToStructure(bookTree);
+var _a37, _b18;
+check("bridge: labels attached per level", ((_a37 = convL == null ? void 0 : convL.levels[0].labels) == null ? void 0 : _a37[0]) === "\u7B2C1\u7AE0 \u521D\u89C1" && ((_b18 = convL.levels[1].labels) == null ? void 0 : _b18.length) === 3, JSON.stringify(convL == null ? void 0 : convL.levels[1].labels));
+var fmLabels = `---
+plans:
+  \u9605\u8BFB:
+    type: \u6570\u91CF
+    goals:
+      - name: \u6D4B\u8BD5\u4E66
+        count: 3
+        unit: \u8282
+        structure:
+          - unit: \u7AE0
+            counts: [2]
+            labels:
+              - \u7B2C1\u7AE0 \u521D\u89C1
+              - \u7B2C2\u7AE0 \u72EC\u767D
+          - unit: \u8282
+            counts: [2, 0]
+            labels:
+              - 1.1 \u76F8\u9047
+              - 1.2 \u79BB\u522B
+---
+`;
+var defsLabels = parsePlansFromFrontmatter(fmLabels);
+var _a38, _b19, _c8, _d2, _e, _f, _g, _h, _i;
+check("labels: YAML round-trip level0", ((_e = (_d2 = (_c8 = (_b19 = (_a38 = defsLabels[0]) == null ? void 0 : _a38.goals[0]) == null ? void 0 : _b19.structure) == null ? void 0 : _c8[0]) == null ? void 0 : _d2.labels) == null ? void 0 : _e[0]) === "\u7B2C1\u7AE0 \u521D\u89C1", JSON.stringify((_i = (_h = (_g = (_f = defsLabels[0]) == null ? void 0 : _f.goals[0]) == null ? void 0 : _g.structure) == null ? void 0 : _h[0]) == null ? void 0 : _i.labels));
+var _a39, _b20, _c9, _d3, _e2;
+check("labels: YAML round-trip level1 len 2", ((_e2 = (_d3 = (_c9 = (_b20 = (_a39 = defsLabels[0]) == null ? void 0 : _a39.goals[0]) == null ? void 0 : _b20.structure) == null ? void 0 : _c9[1]) == null ? void 0 : _d3.labels) == null ? void 0 : _e2.length) === 2);
+var rl = expandGoalStructure("\u6D4B\u8BD5\u4E66", defsLabels[0].goals[0].structure);
+var _a40, _b21;
+check("labels: round-trip \u547D\u540D\u7A33\u5B9A", ((_a40 = rl[0]) == null ? void 0 : _a40.name) === "\u6D4B\u8BD5\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.1 \u76F8\u9047\uFF09", (_b21 = rl[0]) == null ? void 0 : _b21.name);
+check("modeLine: review line matches", matchesModeLine("\u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 7\u7BC7\uFF09", "\u6587\u732E\u590D\u4E60", 5, "\u7BC7"), void 0);
+check("modeLine: exercise line matches", matchesModeLine("\u{1F3C3} \u62C9\u5347 1\u6B21", "\u62C9\u5347", 1, "\u6B21"), void 0);
+check("modeLine: diary exact matches", matchesModeLine("\u{1F4DD} \u65E5\u8BB0", "\u65E5\u8BB0", 0, ""), void 0);
+check("modeLine: parent default line NOT matched (floor>0)", !matchesModeLine("\u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6", "\u8FD0\u52A8", 30, "\u5206\u949F"), void 0);
+check("modeLine: parent default line NOT matched (floor=0)", !matchesModeLine("\u{1F4C8} \u65E5\u8BB0 \u590D\u76D8+\u6B21\u65E5\u8BA1\u5212", "\u65E5\u8BB0", 0, ""), void 0);
+check("modeLine: wrong floor amount not matched", !matchesModeLine("\u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7", "\u6587\u732E\u590D\u4E60", 10, "\u7BC7"), void 0);
 console.log(failed === 0 ? "\nALL PASSED" : `
 ${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

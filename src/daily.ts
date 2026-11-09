@@ -470,6 +470,24 @@ export function buildModeCheckLine({ plan, name, label, floor, unit }: ModeLineS
 }
 
 /**
+ * 判断打卡行文本是否为某模式目标的行（ADR-0006 行识别，防止把计划默认打卡行误判）：
+ * - 剥离行首 emoji/符号前缀后，须以目标名开头；
+ * - 有每日量（floor>0）时，行内须含「N{unit}」记号（如「5篇」「30分钟」）；
+ * - 无量（floor=0，日记/纯打卡运动）时，整行剥离前缀后必须恰为目标名
+ *   ——计划默认行（如「运动 每天半小时」）永远多出动作文本，不会被误判。
+ */
+export function matchesModeLine(text: string, name: string, floor: number, unit: string): boolean {
+	const stripped = text
+		.trim()
+		.replace(/^[^\w\u4e00-\u9fff]+/, "")
+		.trim();
+	if (floor > 0) {
+		return stripped.startsWith(name) && stripped.includes(`${formatQuotaAmount(floor)}${unit || ""}`);
+	}
+	return stripped === name;
+}
+
+/**
  * 返回今日缺失的模式行（ADR-0006 惰性生成，幂等）。
  * 识别既有行：同计划标签 + 行文本包含目标名（label 前缀不影响）。
  */

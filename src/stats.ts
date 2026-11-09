@@ -6,6 +6,7 @@ import {
 	dayCount,
 	daysInMonth,
 	getISOWeek,
+	matchesModeLine,
 	parseDailyContent,
 	parseQuotaActual,
 	parseQuotaAmount,
@@ -79,9 +80,15 @@ export interface PlanGoal {
 	floor?: number;
 	/**
 	 * ADR-0009 weave 阅读器联动：目标来源书的稳定标识（epubsrc-…）。
-	 * 非空 = 启用联动（跳转/推进事实/对账）；目标只存 sid 不落锚点。
+	 * 非空 = 启用联动（跳转/推进事实/对账）。
 	 */
 	readerSid?: string;
+	/**
+	 * ADR-0009: 每叶跳转/推进锚点快照（DFS 叶序对齐：spine = 所在章序，href = 章内锚点）。
+	 * 结构确认时落盘——此后跳转与推进映射只认这份快照，不依赖阅读器实时目录
+	 * （结构改名/微调不失效）；无此字段的旧目标回退实时对齐。
+	 */
+	readerAnchors?: { spine: number; href: string }[];
 }
 
 /** Quota definition under a quota-type plan (ADR-0001 日定额型). */
@@ -638,9 +645,23 @@ function readPlanGoals(obj?: Record<string, unknown>): PlanGoal[] {
 			else if (mode === "review") goal.floor = 1;
 		}
 		if (chapters && chapters.length > 0) goal.chapters = chapters;
-		// ADR-0009 weave 阅读器联动：来源书稳定标识（存在即启用跳转/推进事实/对账）
+		// ADR-0009 weave 阅读器联动：来源书稳定标识 + 每叶锚点快照（"spine|href" 紧凑流式序列）
 		const readerSid = readPlanString(rec, ["readerSid", "阅读器书"]);
 		if (readerSid) goal.readerSid = readerSid;
+		const rawAnchors: unknown = rec.readerAnchors;
+		if (Array.isArray(rawAnchors)) {
+			const anchors = rawAnchors
+				.map((a) => {
+					const s = typeof a === "string" ? a : String(a ?? "");
+					const sep = s.indexOf("|");
+					if (sep === -1) return null;
+					const spine = parseInt(s.slice(0, sep), 10);
+					if (!Number.isFinite(spine) || spine < 0) return null;
+					return { spine, href: s.slice(sep + 1) };
+				})
+				.filter((a): a is { spine: number; href: string } => !!a);
+			if (anchors.length > 0) goal.readerAnchors = anchors;
+		}
 		// ADR-0005 v2 多级结构：structure: [{unit, counts}, …]（1~8 级；引擎优先于 chapters）
 		// counts 容忍 flow 序列 / 字符串 "[2, 2, 3]"（手写 frontmatter / 简版解析器）
 		const rawStructure: unknown = rec.structure;
@@ -760,7 +781,7 @@ export async function computeModeGoalStats(
 			const m = TASK_LINE_RE.exec(line);
 			if (!m || m[3] !== planName) continue;
 			const text = m[2].trim();
-			if (!text.includes(goal.name)) continue;
+			if (!matchesModeLine(text, goal.name, goal.floor ?? 0, goal.unit || "")) continue;
 			found = {
 				checked: m[1] === "x",
 				actual: parseQuotaActual(text),

@@ -6,7 +6,7 @@
  */
 import { parsePlansFromFrontmatter, filterTasksInRange, summarizeTasks, computeQuotaDaily, quotaExpected } from "../src/stats";
 import { parseTaskPool, buildPoolLine, autoWeekContext, autoQuota, autoTaskNumbers, planCounterUnit, isAutoTask, extractGoalName, groupPoolTasksByGoal, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, suggestNextUnit, isRestartUnit, type GoalLevel } from "../src/tasks";
-import { parseQuotaActual, parseQuotaAmount, buildQuotaCheckLine, missingQuotaLines, setQuotaActual, formatQuotaAmount, buildModeCheckLine, missingModeLines, markTaskLineManual, MANUAL_MARK, toggleTaskLine } from "../src/daily";
+import { parseQuotaActual, parseQuotaAmount, buildQuotaCheckLine, missingQuotaLines, setQuotaActual, formatQuotaAmount, buildModeCheckLine, missingModeLines, markTaskLineManual, matchesModeLine, MANUAL_MARK, toggleTaskLine } from "../src/daily";
 import { parseToc, parseTocLine, tocSummary } from "../src/toc";
 import { parseReviewItems, buildBzgSnapshot, reviewedOn, distinctReviewedInRange, diaryDayWritten, utcToLocalDay } from "../src/bzg";
 import { TFile } from "obsidian";
@@ -823,6 +823,15 @@ check("labels: YAML round-trip level0", defsLabels[0]?.goals[0]?.structure?.[0]?
 check("labels: YAML round-trip level1 len 2", defsLabels[0]?.goals[0]?.structure?.[1]?.labels?.length === 2);
 const rl = expandGoalStructure("测试书", defsLabels[0]!.goals[0]!.structure!);
 check("labels: round-trip 命名稳定", rl[0]?.name === "测试书（第1章 初见·1.1 相遇）", rl[0]?.name);
+
+
+// --- 模式行识别（matchesModeLine：父行不误判 / 无量行须全等） -----------------
+check("modeLine: review line matches", matchesModeLine("🗣️ 文献复习 5篇（实 7篇）", "文献复习", 5, "篇"), undefined);
+check("modeLine: exercise line matches", matchesModeLine("🏃 拉升 1次", "拉升", 1, "次"), undefined);
+check("modeLine: diary exact matches", matchesModeLine("📝 日记", "日记", 0, ""), undefined);
+check("modeLine: parent default line NOT matched (floor>0)", !matchesModeLine("🏃 运动 每天半小时", "运动", 30, "分钟"), undefined);
+check("modeLine: parent default line NOT matched (floor=0)", !matchesModeLine("📈 日记 复盘+次日计划", "日记", 0, ""), undefined);
+check("modeLine: wrong floor amount not matched", !matchesModeLine("🗣️ 文献复习 5篇", "文献复习", 10, "篇"), undefined);
 
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
