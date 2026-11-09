@@ -1007,6 +1007,67 @@ export class PlanBoardView extends ItemView {
 		return task;
 	}
 
+	/**
+	 * ADR-0009 自愈迁移：进度字段（progress）上线前建的锚点快照是两段式（无文件内
+	 * 进度）——同章内的小节推进判定不出来。这里按叶名比对从桥实时目录补齐 progress
+	 * 并写回年度计划 frontmatter（每 sid 一次；成功后该书即享逐节触发，无需重建）。
+	 */
+	private weaveMigrated = new Set<string>();
+	private async migrateWeaveAnchorProgress(goal: PlanGoal): Promise<void> {
+		const sid = goal.readerSid;
+		if (!sid || this.weaveMigrated.has(sid)) return;
+		const anchors = goal.readerAnchors;
+		if (!anchors?.length || anchors.every((a) => typeof a.progress === "number")) {
+			this.weaveMigrated.add(sid);
+			return;
+		}
+		this.weaveMigrated.add(sid);
+		if (!this.weaveBridge) return;
+		try {
+			const tree = await this.weaveBridge.getToc(sid);
+			const conv = weaveTocToStructure(tree ?? null);
+			const goalLeaves = expandGoalLeaves(goal.name, goal);
+			const convLeaves = conv ? expandGoalStructure(goal.name, conv.levels) : [];
+			if (
+				!conv ||
+				!goalLeaves ||
+				goalLeaves.length !== convLeaves.length ||
+				goalLeaves.length !== conv.leafProgress.length ||
+				!goalLeaves.every((l, i) => l.name === convLeaves[i].name)
+			) {
+				console.info(`[PlanFlow] 《${goal.name}》锚点进度自愈跳过：实时目录与目标结构不一致`);
+				return;
+			}
+			goal.readerAnchors = anchors.map((a, i) => ({ ...a, progress: conv.leafProgress[i] }));
+			this.weaveAlign.set(sid, { spine: conv.leafSpine, progress: conv.leafProgress, hrefs: conv.leafHref });
+			const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
+			const year = this.today.slice(0, 4);
+			const file = await this.findAnnualPlanFile(true);
+			if (!file) return;
+			const content = await this.app.vault.cachedRead(file);
+			const defs = parsePlansFromFrontmatter(content);
+			let changed = false;
+			for (const d of defs) {
+				for (const g of d.goals) {
+					if (g.readerSid === sid && g.name === goal.name) {
+						g.readerAnchors = goal.readerAnchors.map((a) => ({ ...a }));
+						changed = true;
+					}
+				}
+			}
+			if (!changed) return;
+			this.selfWrite = true;
+			try {
+				await writePlansToFile(this.app, file, defs, this.readRawDailyMap(content));
+			} finally {
+				this.selfWrite = false;
+			}
+			console.info(`[PlanFlow] 《${goal.name}》锚点已补齐文件内进度（自愈迁移落盘完成）`);
+		} catch (e) {
+			console.warn("[PlanFlow] 锚点进度自愈失败:", e);
+		}
+	}
+
 	/** 对齐失效的一次性提示（无落盘锚点的旧目标实时对齐失败 → 联动停用）。 */
 	private warnWeaveMisaligned(sid: string, goalName: string): void {
 		if (this.weaveAlignWarned.has(sid)) return;
@@ -1054,6 +1115,7 @@ export class PlanBoardView extends ItemView {
 		for (const p of this.planProgress) {
 			for (const g of p.goals) {
 				if (!g.readerSid) continue;
+				await this.migrateWeaveAnchorProgress(g);
 				const book = shelf.find((b) => b.sid === g.readerSid);
 				if (!book || book.chapterIndex <= 0) continue;
 				const align = this.leafAnchorsFor(g) ?? (await this.resolveWeaveAlignment(g.readerSid, g));
