@@ -347,7 +347,10 @@ async function confirmLeaves(
 ): Promise<void> {
 	const sid = hit.goal.readerSid;
 	if (!sid || !deps || leafIdxs.length === 0) return;
-	if (weaveNotices.has(sid)) return;
+	if (weaveNotices.has(sid)) {
+		logDebug(deps.app, `confirm skip(${hit.goal.name}): 确认窗已打开`);
+		return;
+	}
 	const { app, plugin } = deps;
 	const leaves = expandGoalLeaves(hit.goal.name, hit.goal);
 	if (!leaves) return;
@@ -359,7 +362,10 @@ async function confirmLeaves(
 		.filter((_l, i) => leafIdxs.includes(i))
 		.map((l) => candidates.find((t) => t.text.trim() === l.name))
 		.filter((t): t is PoolTask => !!t);
-	if (todo.length === 0) return;
+	if (todo.length === 0) {
+		logDebug(deps.app, `confirm silent(${hit.goal.name}): crossed=${leafIdxs.length} 但可勾候选=0（已勾/已✋）`);
+		return;
+	}
 	const unit = hit.goal.unit || "节";
 	if (todo.length === 1) {
 		const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 1 ${unit}`, 0);
