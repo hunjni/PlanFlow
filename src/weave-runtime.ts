@@ -43,6 +43,7 @@ export interface WeaveRuntimeDeps {
 let deps: WeaveRuntimeDeps | null = null;
 let listening = false;
 let lastReconcile = 0;
+let reconcileRunning = false;
 let renderQueued = false;
 const weaveAlign = new Map<string, { spine: number[]; progress: number[]; hrefs: string[] } | null>();
 const weaveAlignPending = new Map<string, Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null>>();
@@ -96,10 +97,11 @@ export function startWeaveRuntime(plugin: PlanFlowPlugin, runtimeDeps?: WeaveRun
 			listening = false;
 		});
 	}
-	// 延迟首跑：等 fork 插件与 PlanBoard 自动打开完成（启动时序在探测处已懒重试兜底）
+	// 延迟首跑：首轮含每本书的一次性全量解析（数十秒 CPU），放到启动 30 秒后执行，
+	// 避开打开软件/恢复工作区的高峰（启动时序在探测处已懒重试兜底）
 	window.setTimeout(() => {
 		void reconcileNow(plugin, true);
-	}, 10000);
+	}, 30000);
 }
 
 export function stopWeaveRuntime(): void {
@@ -214,7 +216,22 @@ export async function reconcileNow(plugin: PlanFlowPlugin, initial: boolean): Pr
 	if (!bridge) return;
 	const now = Date.now();
 	if (!initial && now - lastReconcile < 60000) return; // 1 分钟节流：兜底不是追问
-	lastReconcile = now;
+	if (reconcileRunning) return; // 并发互斥：上一轮没跑完不叠加（getPosition 解析较重）
+	reconcileRunning = true;
+	const startedAt = Date.now();
+	try {
+		await reconcilePass(plugin, bridge, initial);
+	} finally {
+		reconcileRunning = false;
+		logDebug(plugin.app, `reconcile done in ${Date.now() - startedAt}ms`);
+	}
+}
+
+async function reconcilePass(plugin: PlanFlowPlugin, bridge: WeaveBridgeApi, initial: boolean): Promise<void> {
+	const rtDeps = deps;
+	if (!rtDeps) return;
+	const { app } = rtDeps;
+	lastReconcile = Date.now();
 	let shelf: WeaveBookSummary[] | null = null;
 	try {
 		shelf = await bridge.getBookshelf();
@@ -241,7 +258,7 @@ export async function reconcileNow(plugin: PlanFlowPlugin, initial: boolean): Pr
 			const book = shelf.find((b) => b.sid === sid);
 			crossed = passedLeafIndices(align.spine, book?.chapterIndex ?? -1);
 		}
-		logDebug(deps.app, `reconcile: ${hit.goal.name} crossed=${crossed.length}`);
+		logDebug(app, `reconcile: ${hit.goal.name} crossed=${crossed.length}`);
 		await confirmLeaves(hit, crossed, pool);
 	}
 }
