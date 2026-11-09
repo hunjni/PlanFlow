@@ -51,6 +51,8 @@ export interface WeaveTocNode {
 	href: string;
 	/** 本条目所在 spine 章序；解析不出为 -1（联动按「永不越过」处理，绝不误判已读）。 */
 	spineIndex: number;
+	/** 本条目在章节文件内的进度（0~1；null = 解析不出，按章粒度兜底）。 */
+	progress?: number | null;
 	/** 子条目（层级天然对应多级结构）。 */
 	children: WeaveTocNode[];
 }
@@ -62,15 +64,17 @@ export interface WeaveBridgeApi {
 	openChapter(sid: string, href: string): void;
 	/** 打开整本书（恢复上次阅读位置）；可选——旧版 fork 未提供时不显示书行跳转。 */
 	openBook?(sid: string): void;
+	/** 当前阅读位置（含章节文件内进度）；可选——旧版 fork 未提供时对账按章粒度兜底。 */
+	getPosition?(sid: string): Promise<{ chapterIndex: number; sectionProgress: number } | null>;
 }
 
-/** 位置推进事件 detail（桥契约）：阅读位置从 fromChapter 推进到 toChapter（spine 序号，向前推进）。 */
+/** 位置推进事件 detail（桥契约）：阅读位置推进（跨章或章内越过目录条目）后派发。 */
 export interface WeaveAdvanceDetail {
 	sid: string;
-	/** 推进前章序（越过的开区间起点）。 */
-	fromChapter: number;
-	/** 推进后章序（当前正在读的章）。 */
-	toChapter: number;
+	/** 当前所在 spine 章节文件序号。 */
+	chapterIndex: number;
+	/** 当前位置在章节文件内的进度（0~1；与目录锚点的 progress 同口径可比）。 */
+	sectionProgress: number;
 }
 
 /** 探测桥：设置关闭 / fork 缺席 / api 形状不符 → null（调用方静默降级）。 */
@@ -94,8 +98,9 @@ export function getWeaveBridge(app: App, enabled: boolean): WeaveBridgeApi | nul
 /** 目录树转换结果：结构（含真实标题 labels）+ 与展开叶子序对齐的锚点（同下标即同一叶）。 */
 export interface WeaveTocStructure {
 	levels: GoalLevel[];
-	/** DFS 叶序锚点：leafSpine 章序（推进判定）+ leafHref 章内锚点（跳转）。 */
+	/** DFS 叶序锚点：leafSpine 章序 + leafProgress 文件内进度（推进判定）+ leafHref（跳转）。 */
 	leafSpine: number[];
+	leafProgress: number[];
 	leafHref: string[];
 }
 
@@ -152,6 +157,7 @@ export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStruct
 	const levels: GoalLevel[] = units.map((unit) => ({ unit, counts: [] }));
 	levels[0].counts = [tree.length];
 	const leafSpine: number[] = [];
+	const leafProgress: number[] = [];
 	const leafHref: string[] = [];
 	{
 		let current = tree;
@@ -164,6 +170,7 @@ export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStruct
 		const visit = (n: WeaveTocNode, depth: number): void => {
 			if (depth === levels.length - 1 || n.children.length === 0) {
 				leafSpine.push(n.spineIndex);
+				leafProgress.push(typeof n.progress === "number" ? n.progress : -1);
 				leafHref.push(n.href);
 				return;
 			}
@@ -177,7 +184,7 @@ export function weaveTocToStructure(tree: WeaveTocNode[] | null): WeaveTocStruct
 	}
 
 	if (levels[0].counts[0] <= 0) return null;
-	return { levels, leafSpine, leafHref };
+	return { levels, leafSpine, leafProgress, leafHref };
 }
 
 /** 接续阅读（Q11=B）：当前章序之前（spine ∈ [0, chapterIndex)）的叶子数 = 建目标时预勾数。 */
@@ -192,6 +199,27 @@ export function crossedLeafIndices(leafSpine: number[], fromChapter: number, toC
 		const s = leafSpine[i];
 		// spine=-1（锚点解析不出）按「永不越过」处理——宁可漏勾（可手动）不可误勾
 		if (s >= 0 && s >= fromChapter && s < toChapter) out.push(i);
+	}
+	return out;
+}
+
+/**
+ * 位置事实（细粒度）：当前 (章序, 文件内进度) 之前仍未勾的叶下标。
+ * 叶位置 = (spine, progress)；progress < 0（解析不出）按「同章内永远未越过」处理
+ * ——宁可漏勾（可手动/确认窗甄别）不误勾。
+ */
+export function passedLeafIndicesFine(
+	leafSpine: number[],
+	leafProgress: number[],
+	chapterIndex: number,
+	sectionProgress: number
+): number[] {
+	const out: number[] = [];
+	for (let i = 0; i < leafSpine.length; i++) {
+		const s = leafSpine[i];
+		const p = leafProgress[i];
+		if (s < 0) continue;
+		if (s < chapterIndex || (s === chapterIndex && p >= 0 && p <= sectionProgress + 1e-9)) out.push(i);
 	}
 	return out;
 }

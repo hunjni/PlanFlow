@@ -88,7 +88,7 @@ export interface PlanGoal {
 	 * 结构确认时落盘——此后跳转与推进映射只认这份快照，不依赖阅读器实时目录
 	 * （结构改名/微调不失效）；无此字段的旧目标回退实时对齐。
 	 */
-	readerAnchors?: { spine: number; href: string }[];
+	readerAnchors?: { spine: number; href: string; progress?: number }[];
 }
 
 /** Quota definition under a quota-type plan (ADR-0001 日定额型). */
@@ -652,14 +652,23 @@ function readPlanGoals(obj?: Record<string, unknown>): PlanGoal[] {
 		if (Array.isArray(rawAnchors)) {
 			const anchors = rawAnchors
 				.map((a) => {
-					const s = typeof a === "string" ? a : String(a ?? "");
-					const sep = s.indexOf("|");
+					const str = typeof a === "string" ? a : String(a ?? "");
+					const sep = str.indexOf("|");
 					if (sep === -1) return null;
-					const spine = parseInt(s.slice(0, sep), 10);
+					const spine = parseInt(str.slice(0, sep), 10);
 					if (!Number.isFinite(spine) || spine < 0) return null;
-					return { spine, href: s.slice(sep + 1) };
+					// 第三段 = 文件内进度（可选；旧格式两段 = 无进度，按章粒度兜底）
+					const rest = str.slice(sep + 1);
+					const sep2 = rest.indexOf("|");
+					const href = sep2 === -1 ? rest : rest.slice(0, sep2);
+					const progress = sep2 === -1 ? undefined : parseFloat(rest.slice(sep2 + 1));
+					return {
+						spine,
+						href,
+						...(progress !== undefined && Number.isFinite(progress) && progress >= 0 ? { progress } : {}),
+					};
 				})
-				.filter((a): a is { spine: number; href: string } => !!a);
+				.filter((a): a is { spine: number; href: string; progress?: number } => !!a);
 			if (anchors.length > 0) goal.readerAnchors = anchors;
 		}
 		// ADR-0005 v2 多级结构：structure: [{unit, counts}, …]（1~8 级；引擎优先于 chapters）

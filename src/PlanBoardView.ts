@@ -50,9 +50,9 @@ import type { BzgSnapshot } from "./bzg";
 import { diaryDayWritten, loadBzgSnapshot, readBzgDiaryText, reviewPoolSize, reviewedOn } from "./bzg";
 import { parseToc, tocLeafRange, tocSummary } from "./toc";
 import {
-	crossedLeafIndices,
 	getWeaveBridge,
 	passedLeafIndices,
+	passedLeafIndicesFine,
 	resumeLeafCount,
 	WEAVE_ADVANCE_EVENT,
 	weaveTocToStructure,
@@ -578,7 +578,7 @@ interface GoalInput {
 	/** ADR-0006: 每日量（review=当日下限；exercise=可选每日目标量）。 */
 	floor?: number;
 	/** ADR-0009: weave 阅读器联动——来源书 sid + 接续阅读预勾叶数 + 每叶锚点快照。 */
-	reader?: { sid: string; resumeLeaves: number; anchors?: { spine: number; href: string }[] };
+	reader?: { sid: string; resumeLeaves: number; anchors?: { spine: number; href: string; progress?: number }[] };
 }
 
 /** 目标模式展示元数据（ADR-0006）。 */
@@ -650,9 +650,9 @@ export class PlanBoardView extends ItemView {
 	/** ADR-0009: weave 阅读器桥（设置开关门控；fork 缺席/形状不符为 null）。 */
 	private weaveBridge: WeaveBridgeApi | null = null;
 	/** ADR-0009: sid → 叶序锚点缓存（spine 章序 + href；结构与目录形状一致才缓存，null = 形状不符）。 */
-	private weaveAlign = new Map<string, { spine: number[]; hrefs: string[] } | null>();
+	private weaveAlign = new Map<string, { spine: number[]; progress: number[]; hrefs: string[] } | null>();
 	/** ADR-0009: 进行中的锚点解析（in-flight 去重）。 */
-	private weaveAlignPending = new Map<string, Promise<{ spine: number[]; hrefs: string[] } | null>>();
+	private weaveAlignPending = new Map<string, Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null>>();
 	/** ADR-0009: 对齐失败已提示过的 sid（一次性提示，避免刷屏）。 */
 	private weaveAlignWarned = new Set<string>();
 	/** ADR-0009: 上次对账时刻（节流——对账是兜底不是追问，vault 改动驱动的刷新不重跑）。 */
@@ -957,9 +957,13 @@ export class PlanBoardView extends ItemView {
 	 * ADR-0009 每叶锚点：优先目标落盘的锚点快照（确认结构时推导，改名/微调不失效）；
 	 * 无快照的旧目标回退实时对齐（缓存）。两路皆不可用返回 null（联动停用）。
 	 */
-	private leafAnchorsFor(goal: PlanGoal): { spine: number[]; hrefs: string[] } | null {
+	private leafAnchorsFor(goal: PlanGoal): { spine: number[]; progress: number[]; hrefs: string[] } | null {
 		if (goal.readerAnchors?.length) {
-			return { spine: goal.readerAnchors.map((a) => a.spine), hrefs: goal.readerAnchors.map((a) => a.href) };
+			return {
+				spine: goal.readerAnchors.map((a) => a.spine),
+				progress: goal.readerAnchors.map((a) => (typeof a.progress === "number" ? a.progress : -1)),
+				hrefs: goal.readerAnchors.map((a) => a.href),
+			};
 		}
 		return goal.readerSid ? (this.weaveAlign.get(goal.readerSid) ?? null) : null;
 	}
@@ -970,12 +974,12 @@ export class PlanBoardView extends ItemView {
 	 * 不一致 → 缓存 null，联动对该书停用（首次失效时提示一次）。
 	 * 异步（桥现解析）；带 in-flight 去重，避免并发刷新重复解析。
 	 */
-	private async resolveWeaveAlignment(sid: string, goal: PlanGoal): Promise<{ spine: number[]; hrefs: string[] } | null> {
+	private async resolveWeaveAlignment(sid: string, goal: PlanGoal): Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null> {
 		if (this.weaveAlign.has(sid)) return this.weaveAlign.get(sid) ?? null;
 		const pending = this.weaveAlignPending.get(sid);
 		if (pending) return pending;
-		const task = (async (): Promise<{ spine: number[]; hrefs: string[] } | null> => {
-			let result: { spine: number[]; hrefs: string[] } | null = null;
+		const task = (async (): Promise<{ spine: number[]; progress: number[]; hrefs: string[] } | null> => {
+			let result: { spine: number[]; progress: number[]; hrefs: string[] } | null = null;
 			try {
 				const tree = await this.weaveBridge?.getToc(sid);
 				const conv = weaveTocToStructure(tree ?? null);
@@ -987,7 +991,7 @@ export class PlanBoardView extends ItemView {
 					goalLeaves.length === convLeaves.length &&
 					goalLeaves.every((l, i) => l.name === convLeaves[i].name)
 				) {
-					result = { spine: conv.leafSpine, hrefs: conv.leafHref };
+					result = { spine: conv.leafSpine, progress: conv.leafProgress, hrefs: conv.leafHref };
 				}
 			} catch {
 				result = null;
@@ -1014,8 +1018,7 @@ export class PlanBoardView extends ItemView {
 
 	/** 推进事实落地（Q12+确认门 Q16）：越过叶子 → Notice 二选一（✓勾选 / 忽略落 ✋）。 */
 	private async onWeaveAdvance(d: WeaveAdvanceDetail): Promise<void> {
-		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.toChapter)) return;
-		if (d.toChapter <= d.fromChapter) return; // 单向只勾不退：回读不触发
+		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.chapterIndex)) return;
 		console.info("[PlanFlow] 收到阅读推进事件:", d);
 		const hit = this.findReaderGoalBySid(d.sid);
 		if (!hit) {
@@ -1027,7 +1030,11 @@ export class PlanBoardView extends ItemView {
 			this.warnWeaveMisaligned(d.sid, hit.goal.name);
 			return;
 		}
-		await this.confirmWeaveLeaves(hit, crossedLeafIndices(align.spine, d.fromChapter, d.toChapter));
+		const sectionProgress = Number.isFinite(d.sectionProgress) ? d.sectionProgress : -1;
+		await this.confirmWeaveLeaves(
+			hit,
+			passedLeafIndicesFine(align.spine, align.progress, d.chapterIndex, sectionProgress)
+		);
 	}
 
 	/** 对账兜底（Q13=B）：打开今日面板按书架当前位置批量确认（重启/跨设备最终一致）。 */
@@ -1054,7 +1061,18 @@ export class PlanBoardView extends ItemView {
 					this.warnWeaveMisaligned(g.readerSid, g.name);
 					continue;
 				}
-				const crossed = passedLeafIndices(align.spine, book.chapterIndex);
+				let crossed: number[];
+				if (this.weaveBridge.getPosition) {
+					const pos = await this.weaveBridge.getPosition(g.readerSid);
+					crossed = passedLeafIndicesFine(
+						align.spine,
+						align.progress,
+						pos?.chapterIndex ?? book.chapterIndex,
+						pos?.sectionProgress ?? -1
+					);
+				} else {
+					crossed = passedLeafIndices(align.spine, book.chapterIndex);
+				}
 				console.debug(
 					`[PlanFlow] 对账《${g.name}》: 章序 ${book.chapterIndex} · 锚点来源 ${g.readerAnchors?.length ? "落盘快照" : "实时对齐"} · 已越过 ${crossed.length} 叶`
 				);
@@ -4844,7 +4862,7 @@ class GoalEditModal extends Modal {
 	private readerSid = "";
 	private readerResume = 0;
 	/** 结构确认步推导的每叶锚点快照（确认后随目标落盘，跳转/推进只认它）。 */
-	private readerAnchorList: { spine: number; href: string }[] = [];
+	private readerAnchorList: { spine: number; href: string; progress?: number }[] = [];
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
 	private customUnitMode = false;
 	/** BZG 联动状态提示（视图侧按当前设置生成，复习表单展示）。 */
@@ -5457,7 +5475,11 @@ class GoalEditModal extends Modal {
 		}));
 		this.readerSid = book.sid;
 		// ADR-0009: 每叶锚点快照（含补遗回填结果，随目标落盘——跳转/推进只认它）
-		this.readerAnchorList = confirmed.leafSpine.map((spine, i) => ({ spine, href: confirmed.leafHref[i] }));
+		this.readerAnchorList = confirmed.leafSpine.map((spine, i) => ({
+			spine,
+			href: confirmed.leafHref[i],
+			progress: confirmed.leafProgress[i],
+		}));
 		// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
 		this.readerResume = resumeLeafCount(confirmed.leafSpine, book.chapterIndex);
 		this.goto(STEP_REVIEW);
@@ -6121,7 +6143,11 @@ function serializePlans(plans: PlanDef[], dailyByPlan?: Record<string, boolean>)
 				// ADR-0009：阅读器来源书稳定标识 + 每叶锚点快照（"spine|href" 紧凑序列）原样写回
 				if (g.readerSid) lines.push(`        readerSid: ${yamlScalar(g.readerSid)}`);
 				if (g.readerAnchors?.length) {
-					lines.push(`        readerAnchors: [${g.readerAnchors.map((a) => yamlScalar(`${a.spine}|${a.href}`)).join(", ")}]`);
+					lines.push(
+						`        readerAnchors: [${g.readerAnchors
+							.map((a) => yamlScalar(`${a.spine}|${a.href}${typeof a.progress === "number" ? `|${a.progress}` : ""}`))
+							.join(", ")}]`
+					);
 				}
 				if (g.structure && g.structure.length > 0) {
 					lines.push("        structure:");

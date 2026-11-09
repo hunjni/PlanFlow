@@ -869,5 +869,31 @@ check("norm: 标题归一化", normalizeTocLabel("6.27 高位窄幅震荡、放�
 	check("补遗: 首个锚点之前不误判", leading[0].spineIndex === -1 && leading[1].spineIndex === 0);
 }
 
+
+// --- 锚点快照第三字段（文件内进度） ------------------------------------------
+const fmAnchor3 = `---
+plans:
+  阅读:
+    type: 数量
+    goals:
+      - name: 测试书
+        count: 2
+        unit: 节
+        structure:
+          - unit: 章
+            counts: [2]
+        readerSid: epubsrc-abc
+        readerAnchors:
+          - "0|c1.xhtml|0.25"
+          - "1|c2.xhtml"
+---
+`;
+const defsA3 = parsePlansFromFrontmatter(fmAnchor3);
+const a3 = defsA3[0]?.goals[0]?.readerAnchors;
+check("anchors3: 三段解析 spine/href/progress", a3?.[0]?.spine === 0 && a3?.[0]?.href === "c1.xhtml" && a3?.[0]?.progress === 0.25, JSON.stringify(defsA3[0]?.goals[0]?.readerAnchors));
+check("anchors3: 两段旧格式无 progress", a3?.[1]?.href === "c2.xhtml" && a3?.[1]?.progress === undefined);
+const convF = weaveTocToStructure(bookTree);
+check("anchors3: 桥叶序 progress 数组对齐", !!convF && convF.leafProgress.length === convF.leafSpine.length && convF.leafProgress.every((x) => typeof x === "number"));
+
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
