@@ -56,6 +56,8 @@ import {
 	resumeLeafCount,
 	WEAVE_ADVANCE_EVENT,
 	weaveTocToStructure,
+	inferNeighborSpines,
+	resolveMissingAnchors,
 	type WeaveAdvanceDetail,
 	type WeaveBookSummary,
 	type WeaveBridgeApi,
@@ -5341,30 +5343,52 @@ class GoalEditModal extends Modal {
 
 		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
 		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 结构无误，安排阅读 →", attr: { type: "button" } });
-		ok.addEventListener("click", () => {
-			const confirmed = weaveTocToStructure(this.bookTree);
-			if (!confirmed || !this.pickedBook) {
-				new Notice("调整后的结构为空或非法：至少保留一个条目");
-				return;
-			}
-			this.nameValue = this.pickedBook.title || this.nameValue;
-			this.levels = confirmed.levels.map((lv) => ({
-				unit: lv.unit,
-				counts: [...lv.counts],
-				...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
-			}));
-			this.readerSid = this.pickedBook.sid;
-			// ADR-0009: 每叶锚点快照（确认树推导，随目标落盘——跳转/推进只认它）
-			this.readerAnchorList = confirmed.leafSpine.map((spine, i) => ({ spine, href: confirmed.leafHref[i] }));
-			// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
-			this.readerResume = resumeLeafCount(confirmed.leafSpine, this.pickedBook.chapterIndex);
-			this.goto(STEP_REVIEW);
-		});
+		ok.addEventListener("click", () => void this.confirmStructAndProceed());
 		const reextract = actions.createEl("button", { cls: "planboard-btn", text: "↺ 重新提取", attr: { type: "button" } });
 		reextract.addEventListener("click", () => void this.pickBook(book));
 		const back = actions.createEl("button", { cls: "planboard-btn", text: "← 重选书", attr: { type: "button" } });
 		back.addEventListener("click", () => this.goto(STEP_BOOK));
 		this.addCancelButton(actions);
+	}
+
+	/**
+	 * 确认结构 → 安排阅读。确认前先做锚点补遗（ADR-0009）：手动补录/改动的条目
+	 * 用实时目录做标题模糊匹配回填锚点（跳转可达），匹配不上的继承前一叶章序
+	 * （推进勾选按顺序阅读语义生效）；随后按确认树转换结构进确认页。
+	 */
+	private async confirmStructAndProceed(): Promise<void> {
+		const book = this.pickedBook;
+		if (!book || !this.bookTree) {
+			new Notice("提取结构已失效：请重选书");
+			return;
+		}
+		if (this.weave) {
+			let live: WeaveTocNode[] | null = null;
+			try {
+				live = await this.weave.getToc(book.sid);
+			} catch {
+				live = null;
+			}
+			resolveMissingAnchors(this.bookTree, live);
+			inferNeighborSpines(this.bookTree);
+		}
+		const confirmed = weaveTocToStructure(this.bookTree);
+		if (!confirmed) {
+			new Notice("调整后的结构为空或非法：至少保留一个条目");
+			return;
+		}
+		this.nameValue = book.title || this.nameValue;
+		this.levels = confirmed.levels.map((lv) => ({
+			unit: lv.unit,
+			counts: [...lv.counts],
+			...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
+		}));
+		this.readerSid = book.sid;
+		// ADR-0009: 每叶锚点快照（含补遗回填结果，随目标落盘——跳转/推进只认它）
+		this.readerAnchorList = confirmed.leafSpine.map((spine, i) => ({ spine, href: confirmed.leafHref[i] }));
+		// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
+		this.readerResume = resumeLeafCount(confirmed.leafSpine, book.chapterIndex);
+		this.goto(STEP_REVIEW);
 	}
 
 	/**

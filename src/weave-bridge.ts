@@ -205,3 +205,109 @@ export function passedLeafIndices(leafSpine: number[], chapterIndex: number): nu
 	}
 	return out;
 }
+
+// ---------------------------------------------------------------------------
+// 手工补录条目的锚点回填（ADR-0009 补遗）：手动加的目录条目没有跳转锚点——
+// 确认结构时拿它们的标题与阅读器实时目录做模糊匹配回填；匹配不上的按
+// 「继承前一个锚定叶的章序」参与推进勾选（顺序阅读语义）。
+// ---------------------------------------------------------------------------
+
+/** 目录标题归一化：去空白/全角空格，统一分隔符，去标点——只留实词字符。 */
+export function normalizeTocLabel(s: string): string {
+	return s
+		.replace(/[\s\u3000]/g, "")
+		.replace(/[|｜]/g, "·")
+		.replace(/[（）()、，。：:；;·．.\-—_/\\'"“”‘’【】[\]<>《》？！?!~“]/g, "");
+}
+
+/** 标题的编号前缀（「6.27」「第12章」「三、」…），模糊匹配的第二优先级用。 */
+const TOC_NUM_PREFIX_RE = /^(第?\s*[0-9一二三四五六七八九十百千]+(?:\s*[.．、]\s*\d+)*)/;
+
+function tocNumToken(s: string): string {
+	const m = TOC_NUM_PREFIX_RE.exec(s.trim());
+	return m ? m[1].replace(/\s/g, "") : "";
+}
+
+/**
+ * 用实时目录回填确认树中缺失的锚点（href 为空或 spine<0 的节点）。
+ * 三级匹配，每个实时条目只消费一次（防多条目吸到同一锚点）：
+ * 1. 归一化标题精确相等；2. 编号前缀相等（「6.27 …」对「6.27 …」）；
+ * 3. 归一化后互相包含（实词 ≥6 字，防短标题误吸）。匹配不上的保持缺失，
+ * 由 inferNeighborSpines 兜底。
+ */
+export function resolveMissingAnchors(tree: WeaveTocNode[], live: WeaveTocNode[] | null): void {
+	if (!live || live.length === 0) return;
+	const collect = (nodes: WeaveTocNode[], out: WeaveTocNode[]): void =>
+		nodes.forEach((n) => {
+			out.push(n);
+			collect(n.children, out);
+		});
+	const dfs: WeaveTocNode[] = [];
+	collect(tree, dfs);
+	const liveDfs: WeaveTocNode[] = [];
+	collect(live, liveDfs);
+	const used = new Set<number>();
+	const missing = dfs.filter((n) => !n.href || n.spineIndex < 0);
+	// 1. 归一化精确
+	for (const n of missing) {
+		const nl = normalizeTocLabel(n.label);
+		if (!nl) continue;
+		for (let i = 0; i < liveDfs.length; i++) {
+			if (used.has(i)) continue;
+			if (normalizeTocLabel(liveDfs[i].label) === nl) {
+				n.href = liveDfs[i].href;
+				n.spineIndex = liveDfs[i].spineIndex;
+				used.add(i);
+				break;
+			}
+		}
+	}
+	// 2. 编号前缀
+	for (const n of missing) {
+		if (n.href && n.spineIndex >= 0) continue;
+		const tok = tocNumToken(n.label);
+		if (!tok) continue;
+		for (let i = 0; i < liveDfs.length; i++) {
+			if (used.has(i)) continue;
+			if (tocNumToken(liveDfs[i].label) === tok) {
+				n.href = liveDfs[i].href;
+				n.spineIndex = liveDfs[i].spineIndex;
+				used.add(i);
+				break;
+			}
+		}
+	}
+	// 3. 归一化互相包含（实词 ≥6 字）
+	for (const n of missing) {
+		if (n.href && n.spineIndex >= 0) continue;
+		const nl = normalizeTocLabel(n.label);
+		if (nl.length < 6) continue;
+		for (let i = 0; i < liveDfs.length; i++) {
+			if (used.has(i)) continue;
+			const ml = normalizeTocLabel(liveDfs[i].label);
+			if (ml.length < 6) continue;
+			if (nl.includes(ml) || ml.includes(nl)) {
+				n.href = liveDfs[i].href;
+				n.spineIndex = liveDfs[i].spineIndex;
+				used.add(i);
+				break;
+			}
+		}
+	}
+}
+
+/**
+ * 锚点兜底推断：DFS 序上仍缺 spine 的节点继承「前一个锚定节点」的章序
+ * （顺序阅读语义——手工补录的节在其前一条所在章内，读到该章之后就该算越过）。
+ * 位于首个锚定节点之前的仍保持 -1（永不误判已读）。
+ */
+export function inferNeighborSpines(tree: WeaveTocNode[]): void {
+	let prev = -1;
+	const walk = (nodes: WeaveTocNode[]): void =>
+		nodes.forEach((n) => {
+			if (n.spineIndex < 0 && prev >= 0) n.spineIndex = prev;
+			if (n.spineIndex >= 0) prev = n.spineIndex;
+			walk(n.children);
+		});
+	walk(tree);
+}

@@ -833,5 +833,41 @@ check("modeLine: parent default line NOT matched (floor>0)", !matchesModeLine("�
 check("modeLine: parent default line NOT matched (floor=0)", !matchesModeLine("📈 日记 复盘+次日计划", "日记", 0, ""), undefined);
 check("modeLine: wrong floor amount not matched", !matchesModeLine("🗣️ 文献复习 5篇", "文献复习", 10, "篇"), undefined);
 
+
+// --- 手工补录条目的锚点回填（ADR-0009 补遗） --------------------------------
+import { normalizeTocLabel, resolveMissingAnchors, inferNeighborSpines } from "../src/weave-bridge";
+check("norm: 标题归一化", normalizeTocLabel("6.27 高位窄幅震荡、放量（二）") === "627高位窄幅震荡放量二", normalizeTocLabel("6.27 高位窄幅震荡、放量（二）"));
+{
+	const edited: WeaveTocNode[] = [
+		{ label: "第6章 量价分析", href: "c6.xhtml", spineIndex: 5, children: [
+			{ label: "6.26 缩量长阴破位+缩量长阳收复", href: "c6d.xhtml", spineIndex: 5, children: [] },
+			{ label: "6.27 高位窄幅震荡的放量", href: "", spineIndex: -1, children: [] },
+		] },
+		{ label: "第7章 趋势转折", href: "c7.xhtml", spineIndex: 6, children: [] },
+	];
+	const live: WeaveTocNode[] = [
+		{ label: "第6章 量价分析", href: "c6.xhtml", spineIndex: 5, children: [] },
+		{ label: "6.26 缩量长阴破位＋缩量长阳收复", href: "c6d.xhtml", spineIndex: 5, children: [] },
+		{ label: "6.27 高位窄幅震荡的放量", href: "c6e.xhtml", spineIndex: 5, children: [] },
+		{ label: "第7章 趋势转折", href: "c7.xhtml", spineIndex: 6, children: [] },
+	];
+	resolveMissingAnchors(edited, live);
+	check("补遗: 精确归一化匹配回填", edited[0].children[1].href === "c6e.xhtml" && edited[0].children[1].spineIndex === 5);
+	const added2: WeaveTocNode[] = [
+		{ label: "第1章 A", href: "a.xhtml", spineIndex: 0, children: [] },
+		{ label: "手工补的中间章（书里实际有但目录缺失）", href: "", spineIndex: -1, children: [] },
+		{ label: "第2章 B", href: "b.xhtml", spineIndex: 1, children: [] },
+	];
+	resolveMissingAnchors(added2, null);
+	inferNeighborSpines(added2);
+	check("补遗: 无实时目录时继承前叶章序", added2[1].spineIndex === 0, added2[1].spineIndex);
+	const leading: WeaveTocNode[] = [
+		{ label: "手工前言", href: "", spineIndex: -1, children: [] },
+		{ label: "第1章 A", href: "a.xhtml", spineIndex: 0, children: [] },
+	];
+	inferNeighborSpines(leading);
+	check("补遗: 首个锚点之前不误判", leading[0].spineIndex === -1 && leading[1].spineIndex === 0);
+}
+
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
