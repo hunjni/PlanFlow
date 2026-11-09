@@ -48,6 +48,8 @@ export interface PlanFlowSettings {
 	planOrder: string[];
 	/** 年度计划卡每卡高度（v1.7.2：拖拽下边缘调整，px）。 */
 	yearPlanHeights: Record<string, number>;
+	/** 年度卡量化目标框高度（v2.x：拖拽「量化目标⇆任务」分隔条调整，px，按计划名；0/缺省 = 自然高度）。 */
+	yearGoalBoxHeights: Record<string, number>;
 	/** 看板列顺序（v1.7.3：拖拽列头调整，计划名数组；空 = 按年度定义顺序）。 */
 	boardColumnOrder: string[];
 	/** 用户手动删除的自动分解任务名（v1.0.4）——防止 ensureAutoTasks 补额时"复活"被删任务。编辑/删除对应量化目标时清空相关条目。 */
@@ -66,6 +68,8 @@ export interface PlanFlowSettings {
 	 * 阅读位置推进确认勾选、任务跳转。fork 插件缺席时静默降级为粘贴导入。
 	 */
 	weaveEnabled: boolean;
+	/** ADR-0009: 推进勾选方式——false（默认）= 越过即静默勾选；true = 弹窗逐次确认。 */
+	weaveConfirmCheck: boolean;
 }
 
 export const DEFAULT_SETTINGS: PlanFlowSettings = {
@@ -101,12 +105,14 @@ tags: [复盘]
 	achievementSound: true,
 	planOrder: [],
 	yearPlanHeights: {},
+	yearGoalBoxHeights: {},
 	boardColumnOrder: [],
 	deletedAutoTasks: [],
 	diaryDir: "我的/日记",
 	summaryDiaryLast: "",
 	bzgEnabled: true,
 	weaveEnabled: true,
+	weaveConfirmCheck: false,
 };
 
 /** 文件夹选择弹窗：列出库内全部文件夹，点选即回调路径（Obsidian 标准交互）。 */
@@ -179,6 +185,12 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				desc: "只读 BZG 插件的复习记录与日记日文件：复习模式自动写入每日实际复习篇数并自动勾选达标；日记模式检测到当天日记有亲手写下的内容即自动打钩。BZG 未安装时自动降级为手动记录",
 				aliases: ["bzg", "联动", "复习", "日记检测"],
 				control: { type: "toggle", key: "bzgEnabled" },
+			},
+			{
+				name: "推进勾选需确认",
+				desc: "开启后每次越过小节会弹窗让你逐条勾选（防跳读误判）；默认关闭 = 读完越过即自动勾选，勾错了手动退勾即可（自动落 ✋ 不再碰）",
+				aliases: ["weaveConfirm", "确认勾选", "弹窗"],
+				control: { type: "toggle", key: "weaveConfirmCheck" },
 			},
 			{
 				name: "阅读联动（选书导目录/进度勾选/跳转）",
