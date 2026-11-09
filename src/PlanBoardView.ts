@@ -660,7 +660,7 @@ export class PlanBoardView extends ItemView {
 	/** ADR-0009: 锚点补齐后的重渲染去重（同一时刻只刷一次打卡列表）。 */
 	private weaveAlignRenderQueued = false;
 	/** ADR-0009: 进行中的推进确认通知（同一目标不重复弹；hide 时移除）。 */
-	private weaveNotices = new Map<string, Notice>();
+	private weaveNotices = new Map<string, { hide: () => void }>();
 
 	// DOM refs (nullable — guard before touching)
 	private panelEl: HTMLElement | null = null;
@@ -1083,30 +1083,45 @@ export class PlanBoardView extends ItemView {
 			.filter((t): t is PoolTask => !!t);
 		if (todo.length === 0) return;
 		const unit = hit.goal.unit || "节";
-		const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 ${todo.length} ${unit}`, 0);
-		this.weaveNotices.set(sid, notice);
-		const done = (): void => {
-			this.weaveNotices.delete(sid);
-			notice.hide();
-		};
-		const bar = notice.noticeEl.createDiv({ cls: "planboard-notice-actions" });
-		const okBtn = bar.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: `✓ 勾选 ${todo.length} ${unit}` });
-		okBtn.addEventListener("click", (e) => {
-			e.stopPropagation();
-			done();
-			void this.applyWeaveCheck(hit, todo, true);
-		});
-		const skipBtn = bar.createEl("button", { cls: "planboard-btn", text: "忽略" });
-		skipBtn.addEventListener("click", (e) => {
-			e.stopPropagation();
-			done();
-			void this.applyWeaveCheck(hit, todo, false);
-		});
-		// 点空白处关掉 = 本次不处理（下次推进/对账再问）
-		notice.noticeEl.addEventListener("click", (e) => {
-			if ((e.target as HTMLElement).closest("button")) return;
-			done();
-		});
+		if (todo.length === 1) {
+			// 单叶：非阻断 Notice 快速二选一
+			const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 1 ${unit}`, 0);
+			this.weaveNotices.set(sid, notice);
+			const done = (): void => {
+				this.weaveNotices.delete(sid);
+				notice.hide();
+			};
+			const bar = notice.noticeEl.createDiv({ cls: "planboard-notice-actions" });
+			const okBtn = bar.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 勾选" });
+			okBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				done();
+				void this.applyWeaveCheck(hit, todo, true);
+			});
+			const skipBtn = bar.createEl("button", { cls: "planboard-btn", text: "忽略" });
+			skipBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				done();
+				void this.applyWeaveCheck(hit, todo, false);
+			});
+			// 点空白处关掉 = 本次不处理（下次推进/对账再问）
+			notice.noticeEl.addEventListener("click", (e) => {
+				if ((e.target as HTMLElement).closest("button")) return;
+				done();
+			});
+			return;
+		}
+		// 多叶（大文件书跨章一次越过一批）：逐叶勾选弹窗——勾所选的，未勾的下次再问
+		const modal = new WeaveConfirmModal(
+			this.app,
+			hit.goal.name,
+			unit,
+			todo,
+			(picked) => this.applyWeaveCheck(hit, picked, true),
+			() => this.applyWeaveCheck(hit, todo, false)
+		);
+		this.weaveNotices.set(sid, { hide: () => modal.close() });
+		modal.open();
 	}
 
 	/** 确认结果写回：勾选（任务池 + 日记投影）或忽略（落 ✋，自动逻辑不再碰）。 */
@@ -4598,6 +4613,63 @@ class PlanEditModal extends Modal {
 }
 
 /** ADR-0001: quota 行「实际量」录入弹窗——留空保存 = 清除实际量、仅勾选记满当日配额。 */
+/**
+ * ADR-0009 推进确认（多叶形态）：大文件书一次跨章越过一批叶时，逐叶勾选
+ * 「哪些真的看完了」——勾所选中的；未选中的不落 ✋，下次推进/对账再问；
+ * 「全部忽略」才对整批落 ✋（此后自动不问不勾）。
+ */
+class WeaveConfirmModal extends Modal {
+	private readonly items: { task: PoolTask; picked: boolean }[];
+	constructor(
+		app: App,
+		private readonly goalName: string,
+		private readonly unit: string,
+		tasks: PoolTask[],
+		private readonly onCheck: (picked: PoolTask[]) => Promise<void>,
+		private readonly onIgnoreAll: () => Promise<void>
+	) {
+		super(app);
+		this.items = tasks.map((task) => ({ task, picked: true }));
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.addClass("planboard-modal");
+		contentEl.createEl("h3", { text: `📖《${this.goalName}》阅读位置已越过 ${this.items.length} ${this.unit}` });
+		contentEl.createDiv({
+			cls: "planboard-goal-preview",
+			text: "勾选真正看完的（这本书的章节文件较大，一次越过的部分可自行甄别）；未勾的下次再问",
+		});
+		const list = contentEl.createDiv({ cls: "planboard-struct-box" });
+		for (const it of this.items) {
+			const row = list.createDiv({ cls: "planboard-tree-row" });
+			const cb = row.createEl("input", { type: "checkbox", cls: "planboard-checkbox" });
+			cb.checked = true;
+			cb.addEventListener("change", () => {
+				it.picked = cb.checked;
+			});
+			row.createSpan({ cls: "planboard-tree-label", text: it.task.text });
+		}
+		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
+		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "✓ 勾选所选", attr: { type: "button" } });
+		ok.addEventListener("click", () => {
+			this.close();
+			void this.onCheck(this.items.filter((i) => i.picked).map((i) => i.task));
+		});
+		const ignoreAll = actions.createEl("button", { cls: "planboard-btn", text: "全部忽略 ✋", attr: { type: "button" } });
+		ignoreAll.addEventListener("click", () => {
+			this.close();
+			void this.onIgnoreAll();
+		});
+		const cancel = actions.createEl("button", { cls: "planboard-btn", text: "取消", attr: { type: "button" } });
+		cancel.addEventListener("click", () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
 class QuotaActualModal extends Modal {
 	private item: CheckItem;
 	private unit: string;
