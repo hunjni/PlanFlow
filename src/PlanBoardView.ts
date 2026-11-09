@@ -51,6 +51,7 @@ import { diaryDayWritten, loadBzgSnapshot, readBzgDiaryText, reviewPoolSize, rev
 import { parseToc, tocLeafRange, tocSummary } from "./toc";
 import {
 	getWeaveBridge,
+	passedLeafIndicesFine,
 	resumeLeafCount,
 	weaveTocToStructure,
 	inferNeighborSpines,
@@ -502,6 +503,39 @@ function attachResizeHandle(
 					plugin.settings[linked.key] = h;
 				}
 			}
+		};
+		const up = (): void => {
+			window.removeEventListener("pointermove", move);
+			window.removeEventListener("pointerup", up);
+			void plugin.saveSettings();
+		};
+		window.addEventListener("pointermove", move);
+		window.addEventListener("pointerup", up);
+	});
+}
+
+/** v2.x: 年度卡「量化目标框 ⇆ 任务区」拖拽分隔条——拖动调框高（每计划持久化 yearGoalBoxHeights），
+ *  任务区吃剩余空间。框高钳制上限随当前卡高收紧（-120 留给卡头/任务区），防止框把分隔条顶出卡外摸不到。 */
+function attachGoalsDivider(
+	card: HTMLElement,
+	goalsBox: HTMLElement,
+	plugin: PlanBoardPlugin,
+	plan: string,
+): void {
+	const divider = card.createDiv({ cls: "planboard-goals-divider", attr: { title: "拖动调整量化目标区高度" } });
+	let startY = 0;
+	let startH = 0;
+	divider.addEventListener("pointerdown", (e) => {
+		e.preventDefault();
+		e.stopPropagation();
+		startY = e.clientY;
+		startH = goalsBox.clientHeight;
+		const maxH = Math.max(80, Math.min(1200, card.clientHeight - 120));
+		const move = (ev: PointerEvent): void => {
+			const h = Math.min(maxH, Math.max(80, startH + (ev.clientY - startY)));
+			goalsBox.style.height = `${h}px`;
+			goalsBox.addClass("is-height-fixed");
+			plugin.settings.yearGoalBoxHeights[plan] = h;
 		};
 		const up = (): void => {
 			window.removeEventListener("pointermove", move);
@@ -3238,6 +3272,13 @@ export class PlanBoardView extends ItemView {
 			for (const goal of prog.goals) {
 				goalsBox.appendChild(this.renderYearGoalRow(goal, prog));
 			}
+			// v2.x: 恢复拖过的框高；框⇆任务区分隔条（CSS 仅在拖过卡高的卡显示，拖动调框高、任务区吃剩余）
+			const savedBox = this.plugin.settings.yearGoalBoxHeights[prog.plan] ?? 0;
+			if (savedBox > 0) {
+				goalsBox.style.height = `${savedBox}px`;
+				goalsBox.addClass("is-height-fixed");
+			}
+			attachGoalsDivider(card, goalsBox, this.plugin, prog.plan);
 		}
 
 		card.createDiv({ cls: "planboard-plan-tasks-title", text: "任务" });
@@ -5209,8 +5250,28 @@ class GoalEditModal extends Modal {
 			href: confirmed.leafHref[i],
 			progress: confirmed.leafProgress[i],
 		}));
-		// 接续阅读（Q11=B）按确认后的树推导锚点：当前章序之前的叶保存时预勾
-		this.readerResume = resumeLeafCount(confirmed.leafSpine, book.chapterIndex);
+		// 接续阅读（Q11=B）：按「章序+文件内进度」细粒度判定已越过叶（与对账同一把尺，
+		// 避免创建后对账又把「创建前已读的节」当新账弹出来）
+		let resumeChapter = book.chapterIndex;
+		let resumeProgress = -1;
+		const weave = this.weave as WeaveBridgeApi;
+		if (weave.getPosition) {
+			try {
+				const pos = await weave.getPosition(book.sid);
+				if (pos) {
+					resumeChapter = pos.chapterIndex;
+					resumeProgress = pos.sectionProgress;
+				}
+			} catch {
+				/* 取不到细粒度位置 → 回退章序口径 */
+			}
+		}
+		this.readerResume = passedLeafIndicesFine(
+			confirmed.leafSpine,
+			confirmed.leafProgress,
+			resumeChapter,
+			resumeProgress
+		).length;
 		this.goto(STEP_REVIEW);
 	}
 
