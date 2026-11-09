@@ -1079,12 +1079,19 @@ export class PlanBoardView extends ItemView {
 
 	/** 推进事实落地（Q12+确认门 Q16）：越过叶子 → Notice 二选一（✓勾选 / 忽略落 ✋）。 */
 	private async onWeaveAdvance(d: WeaveAdvanceDetail): Promise<void> {
+		// 桥懒重试：启动时序可能让首次探测落在 fork 加载完成之前（weaveBridge=null），
+		// 真实事件到达时重新探测一次——此后为正常引用
+		this.weaveBridge ??= getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
 		if (!this.weaveBridge || !d?.sid || !Number.isFinite(d.chapterIndex)) return;
 		console.info("[PlanFlow] 收到阅读推进事件:", d);
 		const hit = this.findReaderGoalBySid(d.sid);
 		if (!hit) {
 			console.info("[PlanFlow] 推进事件无对应联动目标（sid 未绑定）:", d.sid);
 			return;
+		}
+		// 旧两段锚点在此补齐 progress（迁移随事件走，不依赖面板刷新）
+		if (!hit.goal.readerAnchors?.every((a) => typeof a.progress === "number")) {
+			await this.migrateWeaveAnchorProgress(hit.goal);
 		}
 		const align = this.leafAnchorsFor(hit.goal) ?? (await this.resolveWeaveAlignment(d.sid, hit.goal));
 		if (!align) {
@@ -1100,6 +1107,7 @@ export class PlanBoardView extends ItemView {
 
 	/** 对账兜底（Q13=B）：打开今日面板按书架当前位置批量确认（重启/跨设备最终一致）。 */
 	private async reconcileWeaveReading(): Promise<void> {
+		this.weaveBridge ??= getWeaveBridge(this.app, this.plugin.settings.weaveEnabled);
 		if (!this.weaveBridge || this.planProgress.length === 0) return;
 		const now = Date.now();
 		if (now - this.lastWeaveReconcile < 60000) return; // 1 分钟节流：兜底不是追问
