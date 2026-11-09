@@ -383,6 +383,13 @@ async function confirmLeaves(
 		logDebug(deps.app, `confirm silent(${hit.goal.name}): crossed=${leafIdxs.length} 但可勾候选=0（已勾/已✋）`);
 		return;
 	}
+	// ADR-0009 v2: 静默模式（默认）——读完越过即自动勾选，不打扰阅读；
+	// 勾错的手动退勾即落 ✋（自动逻辑永不再碰）。设置开「推进勾选需确认」才走确认门。
+	if (deps.plugin.settings.weaveConfirmCheck !== true) {
+		logDebug(deps.app, `auto-check(${hit.goal.name}): 静默勾选 ${todo.length} 叶`);
+		void applyWeaveCheck(hit, todo, true, true);
+		return;
+	}
 	const unit = hit.goal.unit || "节";
 	if (todo.length === 1) {
 		const notice = new Notice(`📖《${hit.goal.name}》阅读位置已越过 1 ${unit}`, 0);
@@ -423,7 +430,7 @@ async function confirmLeaves(
 }
 
 /** 确认结果写回：勾选（任务池 + 日记投影）或忽略（落 ✋，自动逻辑不再碰）。 */
-async function applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: PoolTask[], check: boolean): Promise<void> {
+async function applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: PoolTask[], check: boolean, quiet = false): Promise<void> {
 	if (!deps) return;
 	const { app, plugin } = deps;
 	try {
@@ -439,7 +446,10 @@ async function applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: Poo
 		logDebug(app, `apply ERROR: ${e}`);
 		return;
 	}
-	new Notice(check ? `已勾选 ${tasks.length} ${hit.goal.unit || "节"}` : `已忽略 ${tasks.length} ${hit.goal.unit || "节"}（此后不再自动勾选，可手动勾）`);
+	new Notice(
+		check ? `📖《${hit.goal.name}》已自动勾选 ${tasks.length} ${hit.goal.unit || "节"}` : `已忽略 ${tasks.length} ${hit.goal.unit || "节"}（此后不再自动勾选，可手动勾）`,
+		quiet ? 3000 : 0
+	);
 	plugin.refreshView();
 }
 
