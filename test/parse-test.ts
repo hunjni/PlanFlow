@@ -895,5 +895,12 @@ check("anchors3: 两段旧格式无 progress", a3?.[1]?.href === "c2.xhtml" && a
 const convF = weaveTocToStructure(bookTree);
 check("anchors3: 桥叶序 progress 数组对齐", !!convF && convF.leafProgress.length === convF.leafSpine.length && convF.leafProgress.every((x) => typeof x === "number"));
 
+
+// --- 粘贴导入真实标题（ADR-0009 depthLabels） --------------------------------
+const pt = parseToc("第1章 初见\n  1.1 相遇\n  1.2 离别\n第2章 独白");
+check("paste labels: 附带每层标题", pt?.levels[0].labels?.[0] === "第1章 初见" && pt?.levels[1].labels?.[0] === "1.1 相遇", JSON.stringify(pt?.levels[1].labels));
+const ptLeaves = expandGoalStructure("书", pt!.levels);
+check("paste labels: 叶名带真实标题", ptLeaves[0]?.name === "书（第1章 初见·1.1 相遇）", ptLeaves[0]?.name);
+
 console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

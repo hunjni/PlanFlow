@@ -493,6 +493,7 @@ function attachResizeHandle(
 			// 内容溢出由各卡内容容器滚动/裁剪处理（见 styles.css 年度卡 plan-tasks 滚动）
 			const h = Math.min(1200, Math.max(80, startH + (ev.clientY - startY)));
 			target.style.height = `${h}px`;
+			card.addClass("is-height-fixed"); // 拖动即视为"拖过卡高"（年度卡量化目标框据此改为卡内滚动；其余卡类型无匹配 CSS，no-op）
 			writeH(h);
 			if (linked) {
 				const lt = linked.target();
@@ -3133,7 +3134,11 @@ export class PlanBoardView extends ItemView {
 			// v1.7.2: 卡下边缘拖拽调整高度（每卡独立持久化）
 			// v1.7.4: 任意保存值生效（含小于内容的——任务列表滚动承接，见 styles.css）
 			const saved = this.plugin.settings.yearPlanHeights[prog.plan] ?? 0;
-			if (saved > 0) card.style.height = `${saved}px`;
+			if (saved > 0) {
+				card.style.height = `${saved}px`;
+				// v2.x: 拖过卡高打标——量化目标框改在卡内滚动承接（否则被 overflow:hidden 静默裁剪，见 styles.css）
+				card.addClass("is-height-fixed");
+			}
 			const idx = colH[0] <= colH[1] ? 0 : 1;
 			cols[idx].appendChild(card);
 			colH[idx] += card.offsetHeight + 12; // 12 = 列内 gap
@@ -5309,7 +5314,11 @@ class GoalEditModal extends Modal {
 				new Notice("请先解析预览");
 				return;
 			}
-			this.levels = this.tocResult.levels.map((lv) => ({ unit: lv.unit, counts: [...lv.counts] }));
+			this.levels = this.tocResult.levels.map((lv) => ({
+				unit: lv.unit,
+				counts: [...lv.counts],
+				...(lv.labels?.length ? { labels: [...lv.labels] } : {}),
+			}));
 			this.goto(STEP_REVIEW);
 		});
 		const back = actions.createEl("button", { cls: "planboard-btn", text: "← 上一步", attr: { type: "button" } });

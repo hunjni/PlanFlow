@@ -57,6 +57,8 @@ export interface TocLine {
 
 export interface TocParseResult {
 	levels: GoalLevel[];
+	/** 每层真实标题（DFS 序；粘贴导入的行文本即标题——ADR-0009 补遗）。 */
+	depthLabels: string[][];
 	/** 识别为目录条目的行数。 */
 	lineCount: number;
 	/** 被跳过的非空行数（页码/「目录」标题等）。 */
@@ -68,6 +70,8 @@ export interface TocParseResult {
 interface TocNode {
 	depth: number;
 	unit: string;
+	/** 该条目的行文本（清洗后）——粘贴导入的真实标题来源。 */
+	label: string;
 	children: TocNode[];
 }
 
@@ -131,7 +135,7 @@ export function parseToc(text: string): TocParseResult | null {
 	//   2. 锚点更深 → 当前是锚点的孩子；锚点同级 → 当前是锚点的兄弟（挂锚点的父）；
 	//   3. 无同族锚点 → 挂栈顶（最近的跨族外层），栈空挂根。
 	// 例：第1章(U) → 1.1(N, 挂章下) → 1.2(N, 与 1.1 同级) → 第2章(U, 与第1章同级)。
-	const virtualRoot: TocNode = { depth: -1, unit: "", children: [] };
+	const virtualRoot: TocNode = { depth: -1, unit: "", label: "", children: [] };
 	const stack: { family: TocFamily; level: number; node: TocNode }[] = [];
 	for (const item of items) {
 		let anchorIdx = -1;
@@ -161,23 +165,26 @@ export function parseToc(text: string): TocParseResult | null {
 		if (depth >= MAX_TOC_LEVELS) {
 			// 超深：并到最深层（防御性，正常目录不会触发）
 			const leafParent = stack[stack.length - 1]?.node ?? virtualRoot;
-			leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, children: [] });
+			leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, label: item.title, children: [] });
 			continue;
 		}
-		const node: TocNode = { depth, unit: item.unit, children: [] };
+		const node: TocNode = { depth, unit: item.unit, label: item.title, children: [] };
 		(parent ?? virtualRoot).children.push(node);
 		stack.push({ family: item.family, level: item.level, node });
 	}
 	if (virtualRoot.children.length === 0) return null;
 
-	// 每层单位词：该层节点里最高频的命中单位词；缺失用默认链兜底
+	// 每层单位词（最高频兜底默认链）与真实标题（DFS 先序 = 引擎节点创建序）
 	let maxDepth = 0;
 	const freq: Map<string, number>[] = [];
+	const depthLabels: string[][] = [];
 	{
 		const walk = (nodes: TocNode[]): void => {
 			for (const n of nodes) {
 				while (freq.length <= n.depth) freq.push(new Map());
+				while (depthLabels.length <= n.depth) depthLabels.push([]);
 				if (n.unit) freq[n.depth].set(n.unit, (freq[n.depth].get(n.unit) ?? 0) + 1);
+				depthLabels[n.depth].push(n.label);
 				maxDepth = Math.max(maxDepth, n.depth + 1);
 				walk(n.children);
 			}
@@ -200,6 +207,9 @@ export function parseToc(text: string): TocParseResult | null {
 	// GoalLevel：level0 = [顶层节点数]；level n = 每个 level-(n-1) 节点（DFS 序）的子数目
 	const levels: GoalLevel[] = units.map((unit) => ({ unit, counts: [] }));
 	levels[0].counts = [virtualRoot.children.length];
+	for (let d = 0; d < levels.length; d++) {
+		if (depthLabels[d]?.some((l) => l.trim() !== "")) levels[d].labels = depthLabels[d];
+	}
 	{
 		let current = virtualRoot.children;
 		for (let lv = 1; lv < levels.length; lv++) {
@@ -211,7 +221,7 @@ export function parseToc(text: string): TocParseResult | null {
 	// 合法性：用展开引擎验证（非法返回 null，让用户走手填层级）
 	const leaves = expandGoalStructure("书", levels);
 	if (!leaves || leaves.length === 0) return null;
-	return { levels, lineCount: items.length, skipped, units };
+	return { levels, lineCount: items.length, skipped, units, depthLabels };
 }
 
 /** 摘要文本：「识别 42 行（跳过 3 行） · 章 ×3 → 节 ×12」。 */
