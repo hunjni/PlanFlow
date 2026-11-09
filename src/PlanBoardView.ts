@@ -990,6 +990,9 @@ export class PlanBoardView extends ItemView {
 			} catch {
 				result = null;
 			}
+			console.debug(
+				`[PlanFlow] 实时对齐《${goal.name}》(${sid}): ${result ? `成功 ${result.spine.length} 叶` : "失败（叶名/数量不一致或目录读取失败）"}`
+			);
 			this.weaveAlign.set(sid, result);
 			this.weaveAlignPending.delete(sid);
 			return result;
@@ -998,11 +1001,13 @@ export class PlanBoardView extends ItemView {
 		return task;
 	}
 
-	/** 对齐失效的一次性提示（结构被手动改过 → 联动停用，避免静默失效让用户以为坏了）。 */
+	/** 对齐失效的一次性提示（无落盘锚点的旧目标实时对齐失败 → 联动停用）。 */
 	private warnWeaveMisaligned(sid: string, goalName: string): void {
 		if (this.weaveAlignWarned.has(sid)) return;
 		this.weaveAlignWarned.add(sid);
-		new Notice(`📖《${goalName}》：目标结构已手动调整，阅读联动（推进勾选/跳转）停用；如需恢复可删除目标后从书架重建`);
+		// 常见于锚点特性上线前建的目标：结构改过或目录解析差异都会对齐失败；
+		// 快照目标（确认结构时落盘锚点）改名/微调也不失效，不走这条提示
+		new Notice(`📖《${goalName}》：无法与阅读器目录对齐，叶跳转/推进勾选停用；删除该目标后从书架重建一次即可（重建会落盘每叶锚点，此后改结构也不失效）`);
 	}
 
 	/** 推进事实落地（Q12+确认门 Q16）：越过叶子 → Notice 二选一（✓勾选 / 忽略落 ✋）。 */
@@ -1254,6 +1259,8 @@ export class PlanBoardView extends ItemView {
 			spec: ModeLineSpec;
 			mode: GoalMode;
 			floor: number;
+			/** 本轮自动逻辑应用后，该子行的最终勾选态（父行级联判定用）。 */
+			finalChecked?: boolean;
 		}
 		const autos: AutoOp[] = [];
 		for (const { plan, goal, label } of this.modeGoals) {
@@ -1306,12 +1313,49 @@ export class PlanBoardView extends ItemView {
 							const raw = line;
 							const idx = i;
 							ops.push((acc) => setQuotaActual(acc, idx, count, op.spec.unit, shouldCheck, raw));
-						} else if (shouldCheck && !checkedNow) {
-							const raw = line;
-							const idx = i;
-							ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
+							op.finalChecked = shouldCheck;
+						} else {
+							op.finalChecked = checkedNow || shouldCheck;
+							if (shouldCheck && !checkedNow) {
+								const raw = line;
+								const idx = i;
+								ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
+							}
 						}
 					} else if (op.mode === "diary" && diaryWrittenToday && !checkedNow) {
+						const raw = line;
+						const idx = i;
+						ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
+						op.finalChecked = true;
+					} else {
+						op.finalChecked = checkedNow;
+					}
+				}
+				// ADR-0006: 自动勾满某计划的全部模式子行 → 父打卡行自动勾（与手动级联同款）。
+				// 前提：该计划无待办任务池子任务（混合计划以任务池为准）；父行带 ✋ 手动豁免则跳过。
+				const planDone = new Map<string, boolean>();
+				for (const a of autos) {
+					const prev = planDone.get(a.spec.plan);
+					planDone.set(a.spec.plan, (prev === undefined ? true : prev) && (a.finalChecked ?? false));
+				}
+				const parentDone = new Set<string>();
+				let inCheck2 = false;
+				for (let i = 0; i < lines.length; i++) {
+					const line = lines[i];
+					if (/^##\s/.test(line)) {
+						inCheck2 = line.startsWith(CHECK_HEADING);
+						continue;
+					}
+					if (!inCheck2) continue;
+					const m = TASK_LINE_RE.exec(line);
+					if (!m || !m[3]) continue;
+					const plan = m[3];
+					if (!planDone.get(plan) || parentDone.has(plan)) continue;
+					const text = m[2].trim();
+					if (autos.some((a) => a.spec.plan === plan && matchesModeLine(text, a.spec.name, a.spec.floor, a.spec.unit))) continue;
+					parentDone.add(plan); // 同计划只认第一个非模式行作父行
+					const allDone = planDone.get(plan) === true && this.pendingPoolChildren(plan).length === 0;
+					if (m[1] !== "x" && !line.includes(MANUAL_MARK) && allDone) {
 						const raw = line;
 						const idx = i;
 						ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
@@ -2068,7 +2112,9 @@ export class PlanBoardView extends ItemView {
 			// ADR-0006: 勾满某计划的全部模式子行 → 父打卡行自动勾（ADR-0003「全子完成勾父」同款）
 			if (modeHit && checked && modeParent && !modeParent.checked) {
 				const siblings = this.modeChildrenOf(modeParent);
-				const allDone = siblings.every((c) => c.checked || c === item);
+				const allDone =
+					siblings.every((c) => c.checked || c === item) &&
+					(modeParent.plan ? this.pendingPoolChildren(modeParent.plan).length === 0 : true);
 				if (siblings.length > 0 && allDone) {
 					await this.app.vault.process(modeParent.file, (data) =>
 						toggleTaskLine(data, modeParent.line, true, modeParent.raw));

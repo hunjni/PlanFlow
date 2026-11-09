@@ -2862,3 +2862,9 @@
 	font-size: 10px;
 	line-height: 1;
 }
+
+/* ADR-0006: 模式子行（父打卡项下嵌套的具体运动/复习/日记目标） */
+.planboard-mode-child.is-checked .planboard-check-text {
+	text-decoration: line-through;
+	color: var(--text-faint);
+}
