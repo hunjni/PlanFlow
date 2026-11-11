@@ -1,9 +1,9 @@
 // test/obsidian-mock.ts
 var TFile = class {
   constructor(path) {
-    var _a44;
+    var _a56;
     this.path = path != null ? path : "";
-    this.name = (_a44 = this.path.split("/").pop()) != null ? _a44 : "";
+    this.name = (_a56 = this.path.split("/").pop()) != null ? _a56 : "";
   }
 };
 function parseYaml(src) {
@@ -115,6 +115,7 @@ function parseYaml(src) {
 
 // src/daily.ts
 var CHECK_HEADING = "## \u2705 \u4ECA\u65E5\u6253\u5361";
+var SUMMARY_HEADING = "## \u{1F4DD} \u4ECA\u65E5\u603B\u7ED3";
 var TASK_LINE_RE = /^- \[([ x])\] (.+?)(?: #计划\/(\S+))?(?: 🛫 (\d{4}-\d{2}-\d{2}))?(?: 📅 (\d{4}-\d{2}-\d{2}))?$/;
 function formatDate(d) {
   const y = d.getFullYear();
@@ -137,10 +138,77 @@ function weekRange(dateStr) {
   const start = addDays(d, 1 - day);
   return { start: formatDate(start), end: formatDate(addDays(start, 6)) };
 }
+function daysInMonth(year, month2) {
+  return new Date(year, month2, 0).getDate();
+}
 function dayCount(start, end) {
   const s = parseDateString(start);
   const e = parseDateString(end);
   return Math.round((e.getTime() - s.getTime()) / 864e5) + 1;
+}
+function parseDailyContent(file2, content, date) {
+  var _a56, _b30, _c12, _d5;
+  const lines = content.split("\n");
+  const checkItems = [];
+  const tempItems = [];
+  let inCheckSection = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheckSection = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheckSection)
+      continue;
+    const m2 = TASK_LINE_RE.exec(line);
+    if (!m2)
+      continue;
+    const checked = m2[1] === "x";
+    const plan = (_a56 = m2[3]) != null ? _a56 : null;
+    const base = {
+      text: m2[2].trim(),
+      plan,
+      checked,
+      due: (_c12 = (_b30 = m2[5]) != null ? _b30 : m2[4]) != null ? _c12 : null,
+      raw: line
+    };
+    if (plan) {
+      checkItems.push({ ...base, line: i, file: file2 });
+    } else {
+      tempItems.push({
+        ...base,
+        start: (_d5 = m2[4]) != null ? _d5 : null,
+        source: "daily",
+        file: file2,
+        index: i,
+        line: i,
+        togglable: true
+      });
+    }
+  }
+  return {
+    date,
+    file: file2,
+    content,
+    checkItems,
+    tempItems,
+    summary: extractSummary(content)
+  };
+}
+function extractSummary(content) {
+  const idx = content.indexOf(SUMMARY_HEADING);
+  if (idx === -1)
+    return "";
+  const after = content.slice(idx + SUMMARY_HEADING.length);
+  let end = after.length;
+  const nextHeading = /\n##\s/.exec(after);
+  if (nextHeading)
+    end = nextHeading.index;
+  let region = after.slice(0, end);
+  const callout = /\n\n>/.exec(region);
+  if (callout)
+    region = region.slice(0, callout.index);
+  return region.replace(/^\n+/, "").trimEnd();
 }
 function toggleTaskLine(content, lineIndex, checked, expectedRaw) {
   const lines = content.split("\n");
@@ -181,7 +249,7 @@ function buildQuotaCheckLine({ label, plan, quota, unit, date }) {
   const name = label ? `${label} ${plan}` : plan;
   return `- [ ] ${name} ${formatQuotaAmount(quota)}${unit} #\u8BA1\u5212/${plan} \u{1F6EB} ${date} \u{1F4C5} ${date}`;
 }
-function setQuotaActual(content, lineIndex, actual, unit, checked, expectedRaw, manual = false) {
+function setQuotaActual(content, lineIndex, actual, unit, checked, expectedRaw) {
   const lines = content.split("\n");
   let idx = lineIndex;
   if (expectedRaw && lines[idx] !== expectedRaw) {
@@ -197,7 +265,7 @@ function setQuotaActual(content, lineIndex, actual, unit, checked, expectedRaw, 
     return content;
   const text = m2[2].trim().replace(/（实[^）]*）\s*(?:✋\s*)?$/, "").replace(MANUAL_MARK, "").trimEnd();
   const actualPart = actual > 0 ? `\uFF08\u5B9E ${formatQuotaAmount(actual)}${unit}\uFF09` : "";
-  let rebuilt2 = `- [${checked ? "x" : " "}] ${text}${actualPart}${manual ? MANUAL_MARK : ""}`;
+  let rebuilt2 = `- [${checked ? "x" : " "}] ${text}${actualPart}`;
   if (m2[3])
     rebuilt2 += ` #\u8BA1\u5212/${m2[3]}`;
   if (m2[4])
@@ -233,6 +301,30 @@ function markTaskLineManual(content, lineIndex, expectedRaw) {
   lines[idx] = rebuilt2;
   return lines.join("\n");
 }
+function clearManualMark(content, lineIndex, expectedRaw) {
+  const lines = content.split("\n");
+  let idx = lineIndex;
+  if (expectedRaw && lines[idx] !== expectedRaw) {
+    idx = lines.findIndex((l) => l === expectedRaw);
+    if (idx === -1)
+      return content;
+  }
+  const line = lines[idx];
+  if (line === void 0 || !line.includes(MANUAL_MARK))
+    return content;
+  const m2 = TASK_LINE_RE.exec(line.trim());
+  if (!m2)
+    return content;
+  let rebuilt2 = `- [${m2[1]}] ${m2[2].replace(MANUAL_MARK, "").trimEnd()}`;
+  if (m2[3])
+    rebuilt2 += ` #\u8BA1\u5212/${m2[3]}`;
+  if (m2[4])
+    rebuilt2 += ` \u{1F6EB} ${m2[4]}`;
+  if (m2[5])
+    rebuilt2 += ` \u{1F4C5} ${m2[5]}`;
+  lines[idx] = rebuilt2;
+  return lines.join("\n");
+}
 function buildModeCheckLine({ plan, name, label, floor, unit }, date) {
   let content = label ? `${label} ${name}` : name;
   if (floor > 0)
@@ -245,6 +337,38 @@ function matchesModeLine(text, name, floor, unit) {
     return stripped.startsWith(name) && stripped.includes(`${formatQuotaAmount(floor)}${unit || ""}`);
   }
   return stripped === name;
+}
+function topLevelCheckRows(checkItems, isModeLine2) {
+  var _a56;
+  const childrenOf = /* @__PURE__ */ new Map();
+  const isChild = /* @__PURE__ */ new Set();
+  for (const item of checkItems) {
+    if (!item.plan || !isModeLine2(item))
+      continue;
+    const parent = checkItems.find((it) => it.plan === item.plan && !isModeLine2(it));
+    if (!parent)
+      continue;
+    isChild.add(item);
+    const arr = (_a56 = childrenOf.get(parent)) != null ? _a56 : [];
+    arr.push(item);
+    childrenOf.set(parent, arr);
+  }
+  return checkItems.filter((it) => !isChild.has(it)).map((item) => {
+    var _a57;
+    const modeChildren = (_a57 = childrenOf.get(item)) != null ? _a57 : [];
+    return {
+      item,
+      modeChildren,
+      done: item.checked || modeChildren.length > 0 && modeChildren.every((c) => c.checked)
+    };
+  });
+}
+function matchesWritingLine(text, name) {
+  const stripped = text.trim().replace(/^(?:[\p{Extended_Pictographic}\u{FE0F}\u{200D}\s])+/u, "").trim();
+  if (!stripped.startsWith(name))
+    return false;
+  const rest = stripped.slice(name.length);
+  return /\d/.test(rest);
 }
 function missingModeLines(content, specs, date) {
   const existing = /* @__PURE__ */ new Set();
@@ -299,10 +423,232 @@ function missingQuotaLines(content, quotas, date) {
   }
   return out;
 }
+function parentCheckTargets(content, facts, isModeLineText) {
+  var _a56, _b30;
+  const factByPlan = new Map(facts.map((f) => [f.plan, f]));
+  const modesDone = /* @__PURE__ */ new Map();
+  const parentAt = /* @__PURE__ */ new Map();
+  const lines = content.split("\n");
+  let inCheck = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const m2 = TASK_LINE_RE.exec(line);
+    if (!m2 || !m2[3])
+      continue;
+    const plan = m2[3];
+    const fact = factByPlan.get(plan);
+    if (!fact || !fact.live && !fact.factDone)
+      continue;
+    const text = m2[2].trim();
+    if (isModeLineText(plan, text)) {
+      const checked = m2[1] === "x";
+      modesDone.set(plan, ((_a56 = modesDone.get(plan)) != null ? _a56 : true) && checked);
+      continue;
+    }
+    if (!parentAt.has(plan))
+      parentAt.set(plan, { line: i, raw: line, checked: m2[1] === "x" });
+  }
+  const out = [];
+  for (const [plan, at] of parentAt) {
+    const fact = factByPlan.get(plan);
+    if (at.checked || at.raw.includes(MANUAL_MARK))
+      continue;
+    if (fact.factDone) {
+      out.push({ line: at.line, raw: at.raw, plan });
+      continue;
+    }
+    if (((_b30 = modesDone.get(plan)) != null ? _b30 : true) && fact.pendingEmpty)
+      out.push({ line: at.line, raw: at.raw, plan });
+  }
+  return out;
+}
+var CHORE_UNIT_ALIASES = [
+  [/^(day|daily|每天|每日|天天)$/, "day"],
+  [/^(week|weekly|每周|周)$/, "week"],
+  [/^(month|monthly|每月|月)$/, "month"],
+  [/^(year|yearly|annual|每年|年)$/, "year"]
+];
+function parseChoreCycle(raw) {
+  var _a56, _b30;
+  if (!raw || typeof raw !== "object")
+    return void 0;
+  const rec = raw;
+  const unitRaw = typeof rec.unit === "string" ? rec.unit : typeof rec["\u5355\u4F4D"] === "string" ? String(rec["\u5355\u4F4D"]) : "";
+  const v = unitRaw.trim().toLowerCase();
+  if (!v)
+    return void 0;
+  const unit = (_a56 = CHORE_UNIT_ALIASES.find(([re]) => re.test(v))) == null ? void 0 : _a56[1];
+  if (!unit)
+    return void 0;
+  const daysRaw = (_b30 = rec.days) != null ? _b30 : rec["\u65E5\u5B50"];
+  const toInt = (x) => typeof x === "number" ? x : parseInt(String(x).trim(), 10);
+  const list = (Array.isArray(daysRaw) ? daysRaw : String(daysRaw != null ? daysRaw : "").replace(/[[\]]/g, "").split(/[,，\s]+/)).map(toInt).filter((n) => Number.isFinite(n));
+  if (unit === "day")
+    return { unit, days: [] };
+  if (unit === "week") {
+    const days = [...new Set(list.filter((n) => n >= 0 && n <= 6))].sort((a, b) => a - b);
+    return days.length > 0 ? { unit, days } : void 0;
+  }
+  if (unit === "month") {
+    const days = [...new Set(list.filter((n) => n >= 1 && n <= 31))].sort((a, b) => a - b);
+    return days.length > 0 ? { unit, days } : void 0;
+  }
+  if (list.length !== 2)
+    return void 0;
+  const [mm, dd] = list;
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31)
+    return void 0;
+  return { unit, days: [mm, dd] };
+}
+function parseChoreOverdue(raw) {
+  const v = String(raw != null ? raw : "").trim().toLowerCase();
+  return /^(postpone|defer|往后延|顺延|延后)$/.test(v) ? "postpone" : void 0;
+}
+var CHORE_WEEKDAY_SHORT = ["\u65E5", "\u4E00", "\u4E8C", "\u4E09", "\u56DB", "\u4E94", "\u516D"];
+function choreCycleLabel(cycle, overdue) {
+  let base;
+  if (cycle.unit === "day")
+    base = "\u6BCF\u5929";
+  else if (cycle.unit === "week") {
+    const ds = [...cycle.days].sort((a, b) => a - b);
+    base = `\u6BCF${ds.map((d) => {
+      var _a56;
+      return `\u5468${(_a56 = CHORE_WEEKDAY_SHORT[d]) != null ? _a56 : "?"}`;
+    }).join("\u3001")}`;
+  } else if (cycle.unit === "month") {
+    const ds = [...cycle.days].sort((a, b) => a - b);
+    base = `\u6BCF\u6708 ${ds.join("\u3001")} \u53F7`;
+  } else {
+    const [mm, dd] = cycle.days;
+    base = `\u6BCF\u5E74 ${mm} \u6708 ${dd} \u65E5`;
+  }
+  return overdue === "postpone" ? `${base} \xB7 \u6F0F\u4E86\u5F80\u540E\u5EF6` : base;
+}
+function isChoreDueOn(cycle, date) {
+  const d = parseDateString(date);
+  if (cycle.unit === "day")
+    return true;
+  if (cycle.unit === "week")
+    return cycle.days.includes(d.getDay());
+  const dim = daysInMonth(d.getFullYear(), d.getMonth() + 1);
+  const dayOfMonth = d.getDate();
+  if (cycle.unit === "month") {
+    return cycle.days.some((x) => x === dayOfMonth || x > dim && dayOfMonth === dim);
+  }
+  const [mm, dd] = cycle.days;
+  return d.getMonth() + 1 === mm && (dd === dayOfMonth || dd > dim && dayOfMonth === dim);
+}
+function prevChoreOccurrence(cycle, date) {
+  if (cycle.unit === "day")
+    return date;
+  let cur = parseDateString(date);
+  for (let i = 0; i < 400; i++) {
+    const s = formatDate(cur);
+    if (isChoreDueOn(cycle, s))
+      return s;
+    cur = addDays(cur, -1);
+  }
+  return date;
+}
+function nextChoreOccurrence(cycle, date) {
+  let cur = addDays(parseDateString(date), 1);
+  for (let i = 0; i < 400; i++) {
+    const s = formatDate(cur);
+    if (isChoreDueOn(cycle, s))
+      return s;
+    cur = addDays(cur, 1);
+  }
+  return date;
+}
+function choreOccurrences(cycle, start, end, cap = 400) {
+  const out = [];
+  if (start > end)
+    return out;
+  let cur = parseDateString(start);
+  for (let i = 0; i < 800; i++) {
+    const s = formatDate(cur);
+    if (s > end)
+      break;
+    if (isChoreDueOn(cycle, s)) {
+      out.push(s);
+      if (out.length >= cap)
+        break;
+    }
+    cur = addDays(cur, 1);
+  }
+  return out;
+}
+function missingChoreLines(content, specs, date) {
+  const existing = /* @__PURE__ */ new Set();
+  const lines = content.split("\n");
+  let inCheck = false;
+  for (const line of lines) {
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const m2 = TASK_LINE_RE.exec(line);
+    if (!(m2 == null ? void 0 : m2[3]))
+      continue;
+    existing.add(`${m2[3]}|${m2[2].trim()}`);
+  }
+  const out = [];
+  for (const s of specs) {
+    let found = false;
+    for (const key of existing) {
+      const [plan, text] = key.split("|");
+      if (plan === s.plan && matchesModeLine(text, s.name, 0, "")) {
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+      out.push(buildModeCheckLine({ plan: s.plan, name: s.name, label: "", floor: 0, unit: "" }, date));
+  }
+  return out;
+}
+async function scanChoreHit(app, prefix, plan, name, from, to, backward = false) {
+  const fmt = (d) => formatDate(d);
+  let cur = backward ? parseDateString(to) : parseDateString(from);
+  const stopAt = backward ? from : to;
+  for (let i = 0; i < 800; i++) {
+    const ds = fmt(cur);
+    if (backward ? ds < stopAt : ds > stopAt)
+      return false;
+    const f = app.vault.getAbstractFileByPath(`${prefix}${ds}.md`);
+    if (f instanceof TFile) {
+      const content = await app.vault.cachedRead(f);
+      let inCheck = false;
+      for (const line of content.split("\n")) {
+        if (/^##\s/.test(line)) {
+          inCheck = line.startsWith(CHECK_HEADING);
+          continue;
+        }
+        if (!inCheck)
+          continue;
+        const m2 = TASK_LINE_RE.exec(line);
+        if (!m2 || m2[3] !== plan || m2[1] !== "x")
+          continue;
+        if (matchesModeLine(m2[2].trim(), name, 0, ""))
+          return true;
+      }
+    }
+    cur = addDays(cur, backward ? -1 : 1);
+  }
+  return false;
+}
 
 // src/tasks.ts
 function parseTaskPool(file2, content) {
-  var _a44, _b25, _c11;
+  var _a56, _b30, _c12;
   const tasks2 = [];
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -311,10 +657,10 @@ function parseTaskPool(file2, content) {
       continue;
     tasks2.push({
       text: m2[2].trim(),
-      plan: (_a44 = m2[3]) != null ? _a44 : null,
+      plan: (_a56 = m2[3]) != null ? _a56 : null,
       checked: m2[1] === "x",
-      start: (_b25 = m2[4]) != null ? _b25 : null,
-      due: (_c11 = m2[5]) != null ? _c11 : null,
+      start: (_b30 = m2[4]) != null ? _b30 : null,
+      due: (_c12 = m2[5]) != null ? _c12 : null,
       line: i,
       raw: lines[i],
       file: file2
@@ -364,18 +710,18 @@ function groupPoolTasksByGoal(tasks2, today, knownNames) {
       byName.set(name, [t]);
   }
   const coversToday = (t) => {
-    var _a44, _b25;
-    const s = (_a44 = t.start) != null ? _a44 : t.due;
-    const d = (_b25 = t.due) != null ? _b25 : t.start;
+    var _a56, _b30;
+    const s = (_a56 = t.start) != null ? _a56 : t.due;
+    const d = (_b30 = t.due) != null ? _b30 : t.start;
     return !!s && !!d && s <= today && today <= d;
   };
   const groups = [];
   for (const [name, groupTasks] of byName) {
     const pending = groupTasks.filter((t) => {
-      var _a44;
+      var _a56;
       if (t.checked)
         return false;
-      const effStart = (_a44 = t.start) != null ? _a44 : t.due;
+      const effStart = (_a56 = t.start) != null ? _a56 : t.due;
       return !!effStart && effStart <= today;
     });
     const todayDone = groupTasks.filter((t) => t.checked && coversToday(t));
@@ -383,6 +729,16 @@ function groupPoolTasksByGoal(tasks2, today, knownNames) {
     groups.push({ name, tasks: groupTasks, pending, todayDone, scheduled: scheduled2 });
   }
   return { groups, ungrouped };
+}
+function diffShareClear(prev, entries) {
+  const next = /* @__PURE__ */ new Map();
+  const cleared2 = [];
+  for (const e of entries) {
+    next.set(e.key, e.cleared);
+    if ((prev == null ? void 0 : prev.get(e.key)) === false && e.cleared)
+      cleared2.push(e.name);
+  }
+  return { next, cleared: cleared2 };
 }
 var STRUCT_UNITS = [
   { word: "\u90E8", restart: false },
@@ -426,15 +782,15 @@ var UNIT_SUCCESSORS = {
   \u6761: []
 };
 function suggestNextUnit(prevUnit) {
-  var _a44;
+  var _a56;
   const list = UNIT_SUCCESSORS[prevUnit.trim()];
-  return (_a44 = list == null ? void 0 : list[0]) != null ? _a44 : "\u8282";
+  return (_a56 = list == null ? void 0 : list[0]) != null ? _a56 : "\u8282";
 }
 function isRestartUnit(word) {
   return RESTART_UNITS.has(word.trim());
 }
 function expandGoalStructure(goalName, levels) {
-  var _a44, _b25, _c11;
+  var _a56, _b30, _c12;
   const clean = (v) => {
     const n = typeof v === "number" ? Math.floor(v) : parseInt(String(v), 10);
     return Number.isFinite(n) && n >= 0 ? n : 0;
@@ -442,20 +798,20 @@ function expandGoalStructure(goalName, levels) {
   if (!Array.isArray(levels) || levels.length === 0 || levels.length > 8)
     return [];
   const labelAt = (li, g) => {
-    var _a45, _b26, _c12;
-    return String((_c12 = (_b26 = (_a45 = levels[li]) == null ? void 0 : _a45.labels) == null ? void 0 : _b26[g - 1]) != null ? _c12 : "").trim();
+    var _a57, _b31, _c13;
+    return String((_c13 = (_b31 = (_a57 = levels[li]) == null ? void 0 : _a57.labels) == null ? void 0 : _b31[g - 1]) != null ? _c13 : "").trim();
   };
   let level = [];
   let roots = [];
   for (let li = 0; li < levels.length; li++) {
-    const unit = String((_b25 = (_a44 = levels[li]) == null ? void 0 : _a44.unit) != null ? _b25 : "").trim();
+    const unit = String((_b30 = (_a56 = levels[li]) == null ? void 0 : _a56.unit) != null ? _b30 : "").trim();
     if (!unit)
       return [];
     const restart = RESTART_UNITS.has(unit);
     const next = [];
     let g = 0;
     if (li === 0) {
-      const n = clean((_c11 = levels[0].counts) == null ? void 0 : _c11[0]);
+      const n = clean((_c12 = levels[0].counts) == null ? void 0 : _c12[0]);
       if (n <= 0)
         return [];
       for (let i = 1; i <= n; i++) {
@@ -548,10 +904,10 @@ function chaptersToStructure(chapters) {
   ];
 }
 function expandGoalLeaves(goalName, goal) {
-  var _a44, _b25;
-  if ((_a44 = goal.structure) == null ? void 0 : _a44.length)
+  var _a56, _b30;
+  if ((_a56 = goal.structure) == null ? void 0 : _a56.length)
     return expandGoalStructure(goalName, goal.structure);
-  if ((_b25 = goal.chapters) == null ? void 0 : _b25.length)
+  if ((_b30 = goal.chapters) == null ? void 0 : _b30.length)
     return expandGoalStructure(goalName, chaptersToStructure(goal.chapters));
   return null;
 }
@@ -696,8 +1052,8 @@ function buildBzgSnapshot(items2, cfg) {
   };
 }
 function reviewedOn(snap2, localDay) {
-  var _a44, _b25;
-  return (_b25 = (_a44 = snap2.byDay.get(localDay)) == null ? void 0 : _a44.size) != null ? _b25 : 0;
+  var _a56, _b30;
+  return (_b30 = (_a56 = snap2.byDay.get(localDay)) == null ? void 0 : _a56.size) != null ? _b30 : 0;
 }
 function distinctReviewedInRange(snap2, start, end) {
   let count = 0;
@@ -739,6 +1095,9 @@ function computeQuotaDaily(total, start, end) {
     return total;
   return Math.round(total / days * 10) / 10;
 }
+function computeWritingDaily(total, initial, start, end) {
+  return computeQuotaDaily(Math.max(0, total - initial), start, end);
+}
 function quotaExpected(dailyQuota, start, end, today) {
   if (today < start)
     return 0;
@@ -747,9 +1106,9 @@ function quotaExpected(dailyQuota, start, end, today) {
 }
 function filterTasksInRange(tasks2, start, end) {
   return tasks2.filter((t) => {
-    var _a44, _b25;
-    const s = (_a44 = t.start) != null ? _a44 : t.due;
-    const e = (_b25 = t.due) != null ? _b25 : t.start;
+    var _a56, _b30;
+    const s = (_a56 = t.start) != null ? _a56 : t.due;
+    const e = (_b30 = t.due) != null ? _b30 : t.start;
     if (!s || !e)
       return false;
     return s <= end && e >= start;
@@ -761,14 +1120,14 @@ function summarizeTasks(tasks2) {
   return { total, done, percent: total === 0 ? 0 : Math.round(done / total * 100) };
 }
 function parsePlansFromFrontmatter(content) {
-  var _a44, _b25, _c11;
+  var _a56, _b30, _c12;
   const fmMatch = /^---\n([\s\S]*?)\n---/.exec(content);
   if (!fmMatch)
     return [];
   let data;
   try {
-    const parsed = parseYaml(fmMatch[1]);
-    data = parsed && typeof parsed === "object" ? parsed : null;
+    const parsed2 = parseYaml(fmMatch[1]);
+    data = parsed2 && typeof parsed2 === "object" ? parsed2 : null;
   } catch (e) {
     return [];
   }
@@ -777,7 +1136,7 @@ function parsePlansFromFrontmatter(content) {
     return [];
   const defs = [];
   const push = (name, obj) => {
-    var _a45;
+    var _a57;
     const trimmed = name.trim();
     if (!trimmed)
       return;
@@ -793,7 +1152,7 @@ function parsePlansFromFrontmatter(content) {
       targetCount = goals.reduce((acc, g) => acc + g.count, 0);
     } else {
       type = readPlanType(obj, target);
-      const m2 = (_a45 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a45 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
+      const m2 = (_a57 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a57 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
       targetCount = type === "numeric" && m2 ? parseInt(m2[1], 10) : 0;
     }
     defs.push({
@@ -827,7 +1186,7 @@ function parsePlansFromFrontmatter(content) {
         }
       } else if (el && typeof el === "object") {
         const obj = el;
-        const name = (_c11 = (_b25 = (_a44 = obj.name) != null ? _a44 : obj.plan) != null ? _b25 : obj["\u540D\u79F0"]) != null ? _c11 : obj["\u8BA1\u5212"];
+        const name = (_c12 = (_b30 = (_a56 = obj.name) != null ? _a56 : obj.plan) != null ? _b30 : obj["\u540D\u79F0"]) != null ? _c12 : obj["\u8BA1\u5212"];
         if (typeof name === "string") {
           push(name, obj);
         } else {
@@ -874,7 +1233,7 @@ function readPlanString(obj, keys) {
   return "";
 }
 function readPlanGoals(obj) {
-  var _a44, _b25, _c11, _d5;
+  var _a56, _b30, _c12, _d5, _e4, _f2, _g2, _h2, _i2;
   if (!obj || !Array.isArray(obj.goals))
     return [];
   const out = [];
@@ -882,7 +1241,7 @@ function readPlanGoals(obj) {
     if (typeof g === "string") {
       const m2 = /^(.+?)\s+(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天|章|节)?(?:\s+(\d{4}-\d{2}-\d{2})~\s*(\d{4}-\d{2}-\d{2}))?$/.exec(g.trim());
       if (m2) {
-        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a44 = m2[3]) != null ? _a44 : "\u4E2A", start: m2[4], end: m2[5] });
+        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a56 = m2[3]) != null ? _a56 : "\u4E2A", start: m2[4], end: m2[5] });
       }
       continue;
     }
@@ -894,8 +1253,8 @@ function readPlanGoals(obj) {
       continue;
     const mode = parseGoalMode(readPlanString(rec, ["mode", "\u6A21\u5F0F"]));
     const count = typeof rec.count === "number" ? rec.count : typeof rec["\u6570\u91CF"] === "number" ? rec["\u6570\u91CF"] : (() => {
-      var _a45;
-      const cv = (_a45 = rec.count) != null ? _a45 : rec["\u6570\u91CF"];
+      var _a57;
+      const cv = (_a57 = rec.count) != null ? _a57 : rec["\u6570\u91CF"];
       return parseInt(cv == null ? "0" : typeof cv === "string" || typeof cv === "number" ? String(cv) : "0", 10);
     })();
     if (!mode && (!count || Number.isNaN(count) || count <= 0))
@@ -915,15 +1274,40 @@ function readPlanGoals(obj) {
     const goal = { name: name.trim(), count, unit, start: start || void 0, end: end || void 0 };
     if (mode) {
       goal.mode = mode;
-      const rawFloor = (_c11 = (_b25 = rec.floor) != null ? _b25 : rec["\u4E0B\u9650"]) != null ? _c11 : rec["\u6BCF\u65E5"];
+      const rawFloor = (_c12 = (_b30 = rec.floor) != null ? _b30 : rec["\u4E0B\u9650"]) != null ? _c12 : rec["\u6BCF\u65E5"];
       const floorVal = typeof rawFloor === "number" ? rawFloor : parseFloat(String(rawFloor != null ? rawFloor : ""));
       if (Number.isFinite(floorVal) && floorVal > 0)
         goal.floor = floorVal;
       else if (mode === "review")
         goal.floor = 1;
+      const cycle = parseChoreCycle((_d5 = rec.cycle) != null ? _d5 : rec["\u5468\u671F"]);
+      if (cycle)
+        goal.cycle = cycle;
+      const overdue = parseChoreOverdue((_e4 = rec.overdue) != null ? _e4 : rec["\u903E\u671F"]);
+      if (overdue)
+        goal.overdue = overdue;
     }
     if (chapters && chapters.length > 0)
       goal.chapters = chapters;
+    const rawGoalQuota = (_f2 = rec.writingQuota) != null ? _f2 : rec["\u5B57\u6570\u914D\u989D"];
+    if (rawGoalQuota && typeof rawGoalQuota === "object") {
+      const q = rawGoalQuota;
+      const qNum = (v) => typeof v === "number" ? v : typeof v === "string" ? parseFloat(v) : NaN;
+      const qStr = (keys) => readPlanString(q, keys);
+      const qTotal = qNum((_g2 = q.total) != null ? _g2 : q["\u603B\u91CF"]);
+      if (Number.isFinite(qTotal) && qTotal > 0) {
+        const qStart = qStr(["start", "\u5F00\u59CB", "\u8D77"]).trim() || void 0;
+        const qEnd = qStr(["end", "\u7ED3\u675F", "\u6B62", "\u622A\u6B62"]).trim() || void 0;
+        const qInitial = qNum((_h2 = q.initial) != null ? _h2 : q["\u521D\u59CB"]);
+        goal.writingQuota = {
+          total: qTotal,
+          unit: qStr(["unit", "\u5355\u4F4D"]) || (mode === "writing" ? "\u5B57" : ""),
+          ...qStart ? { start: qStart } : {},
+          ...qEnd ? { end: qEnd } : {},
+          ...Number.isFinite(qInitial) && qInitial > 0 ? { initial: qInitial } : {}
+        };
+      }
+    }
     const readerSid = readPlanString(rec, ["readerSid", "\u9605\u8BFB\u5668\u4E66"]);
     if (readerSid)
       goal.readerSid = readerSid;
@@ -958,7 +1342,7 @@ function readPlanGoals(obj) {
           continue;
         const obj2 = lv;
         const unit2 = readPlanString(obj2, ["unit", "\u5355\u4F4D"]);
-        const rawCounts = (_d5 = obj2.counts) != null ? _d5 : obj2["\u6570\u76EE"];
+        const rawCounts = (_i2 = obj2.counts) != null ? _i2 : obj2["\u6570\u76EE"];
         if (!unit2 || (rawCounts === void 0 || rawCounts === null))
           continue;
         const list = (Array.isArray(rawCounts) ? rawCounts : String(rawCounts).replace(/[[\]]/g, "").split(/[,，\s]+/)).map(toInt).filter((c) => Number.isFinite(c) && c >= 0);
@@ -979,10 +1363,10 @@ function readPlanGoals(obj) {
   return out;
 }
 function readPlanQuota(obj) {
-  var _a44, _b25, _c11, _d5, _e4;
+  var _a56, _b30, _c12, _d5, _e4;
   if (!obj)
     return null;
-  const raw = (_b25 = (_a44 = obj.quota) != null ? _a44 : obj["\u5B9A\u989D"]) != null ? _b25 : obj["\u65E5\u5B9A\u989D"];
+  const raw = (_b30 = (_a56 = obj.quota) != null ? _a56 : obj["\u5B9A\u989D"]) != null ? _b30 : obj["\u65E5\u5B9A\u989D"];
   let rec = null;
   if (raw && typeof raw === "object") {
     rec = raw;
@@ -994,7 +1378,7 @@ function readPlanQuota(obj) {
   }
   if (!rec)
     return null;
-  const totalRaw = (_d5 = (_c11 = rec.total) != null ? _c11 : rec["\u603B\u91CF"]) != null ? _d5 : rec["\u6570\u91CF"];
+  const totalRaw = (_d5 = (_c12 = rec.total) != null ? _c12 : rec["\u603B\u91CF"]) != null ? _d5 : rec["\u6570\u91CF"];
   const total = typeof totalRaw === "number" ? totalRaw : parseFloat(String(totalRaw != null ? totalRaw : ""));
   if (!Number.isFinite(total) || total <= 0)
     return null;
@@ -1018,6 +1402,10 @@ function parseGoalMode(raw) {
     return "diary";
   if (/^(exercise|运动|锻炼)$/.test(v))
     return "exercise";
+  if (/^(writing|写作|小说|写小说)$/.test(v))
+    return "writing";
+  if (/^(chore|生活|日常|家务)$/.test(v))
+    return "chore";
   return void 0;
 }
 function readPlanType(obj, target) {
@@ -1053,7 +1441,7 @@ var CN_ORD_RE = /^[一二三四五六七八九十百]+[、.．]/;
 var MAX_TOC_LEVELS = 8;
 var MAX_TOC_LINES = 500;
 function parseTocLine(rawLine) {
-  var _a44;
+  var _a56;
   let line = rawLine.trim();
   line = line.replace(/^[-*•·]\s*(?:\[[ x]\]\s*)?/, "");
   if (!line)
@@ -1070,7 +1458,7 @@ function parseTocLine(rawLine) {
   const num = /^(\d+)(?:[.、](\d+))?(?:\.(\d+))?/.exec(line);
   if (num) {
     const depth = num[3] ? 2 : num[2] ? 1 : 0;
-    return { title: line, level: depth, family: "N", unit: (_a44 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a44 : `\u7EA7${depth + 1}` };
+    return { title: line, level: depth, family: "N", unit: (_a56 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a56 : `\u7EA7${depth + 1}` };
   }
   if (CN_ORD_RE.test(line)) {
     return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
@@ -1084,7 +1472,7 @@ function parseTocLine(rawLine) {
   return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
 }
 function parseToc(text) {
-  var _a44, _b25, _c11;
+  var _a56, _b30, _c12, _d5;
   const items2 = [];
   let skipped = 0;
   for (const l of text.split(/\r?\n/)) {
@@ -1101,7 +1489,7 @@ function parseToc(text) {
   }
   if (items2.length === 0)
     return null;
-  const virtualRoot = { depth: -1, unit: "", children: [] };
+  const virtualRoot = { depth: -1, unit: "", label: "", children: [] };
   const stack = [];
   for (const item of items2) {
     let anchorIdx = -1;
@@ -1126,11 +1514,11 @@ function parseToc(text) {
     }
     const depth = parent ? parent.depth + 1 : 0;
     if (depth >= MAX_TOC_LEVELS) {
-      const leafParent = (_b25 = (_a44 = stack[stack.length - 1]) == null ? void 0 : _a44.node) != null ? _b25 : virtualRoot;
-      leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, children: [] });
+      const leafParent = (_b30 = (_a56 = stack[stack.length - 1]) == null ? void 0 : _a56.node) != null ? _b30 : virtualRoot;
+      leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, label: item.title, children: [] });
       continue;
     }
-    const node = { depth, unit: item.unit, children: [] };
+    const node = { depth, unit: item.unit, label: item.title, children: [] };
     (parent != null ? parent : virtualRoot).children.push(node);
     stack.push({ family: item.family, level: item.level, node });
   }
@@ -1138,14 +1526,18 @@ function parseToc(text) {
     return null;
   let maxDepth = 0;
   const freq = [];
+  const depthLabels = [];
   {
     const walk = (nodes) => {
-      var _a45;
+      var _a57;
       for (const n of nodes) {
         while (freq.length <= n.depth)
           freq.push(/* @__PURE__ */ new Map());
+        while (depthLabels.length <= n.depth)
+          depthLabels.push([]);
         if (n.unit)
-          freq[n.depth].set(n.unit, ((_a45 = freq[n.depth].get(n.unit)) != null ? _a45 : 0) + 1);
+          freq[n.depth].set(n.unit, ((_a57 = freq[n.depth].get(n.unit)) != null ? _a57 : 0) + 1);
+        depthLabels[n.depth].push(n.label);
         maxDepth = Math.max(maxDepth, n.depth + 1);
         walk(n.children);
       }
@@ -1156,7 +1548,7 @@ function parseToc(text) {
   for (let i = 0; i < maxDepth; i++) {
     let best = "";
     let bestN = 0;
-    for (const [w, n] of (_c11 = freq[i]) != null ? _c11 : []) {
+    for (const [w, n] of (_c12 = freq[i]) != null ? _c12 : []) {
       if (n > bestN) {
         best = w;
         bestN = n;
@@ -1166,6 +1558,10 @@ function parseToc(text) {
   }
   const levels = units.map((unit) => ({ unit, counts: [] }));
   levels[0].counts = [virtualRoot.children.length];
+  for (let d = 0; d < levels.length; d++) {
+    if ((_d5 = depthLabels[d]) == null ? void 0 : _d5.some((l) => l.trim() !== ""))
+      levels[d].labels = depthLabels[d];
+  }
   {
     let current = virtualRoot.children;
     for (let lv = 1; lv < levels.length; lv++) {
@@ -1176,27 +1572,89 @@ function parseToc(text) {
   const leaves = expandGoalStructure("\u4E66", levels);
   if (!leaves || leaves.length === 0)
     return null;
-  return { levels, lineCount: items2.length, skipped, units };
+  return { levels, lineCount: items2.length, skipped, units, depthLabels };
 }
 function tocSummary(result) {
   const parts = result.levels.map((lv) => `${lv.unit} \xD7${lv.counts.reduce((a, b) => a + b, 0)}`);
   return `\u8BC6\u522B ${result.lineCount} \u884C${result.skipped ? `\uFF08\u8DF3\u8FC7 ${result.skipped} \u884C\uFF09` : ""} \xB7 ${parts.join(" \u2192 ")}`;
 }
 
+// src/diary-sync.ts
+var DIARY_ESSAY_HEADING = "# \u968F\u7B14";
+var DIARY_REVIEW_HEADING = "# \u5F53\u65E5\u590D\u76D8";
+var DIARY_NEXTDAY_HEADING = "# \u6B21\u65E5\u8BA1\u5212";
+function trimTrailingBlanks(arr) {
+  let n = arr.length;
+  while (n > 0 && arr[n - 1].trim() === "")
+    n--;
+  return n;
+}
+function nextDayPlanTransform(content, text) {
+  const lines = content.split("\n");
+  const body = [];
+  for (const l of text.split("\n"))
+    body.push(l);
+  body.length = trimTrailingBlanks(body);
+  let start = 0;
+  while (start < body.length && body[start].trim() === "")
+    start++;
+  const bodyLines = body.slice(start);
+  const nextH1 = (from) => {
+    for (let i = from; i < lines.length; i++) {
+      if (/^#\s/.test(lines[i]))
+        return i;
+    }
+    return lines.length;
+  };
+  const planIdx = lines.findIndex((l) => l.trim() === DIARY_NEXTDAY_HEADING);
+  if (planIdx >= 0) {
+    const end = nextH1(planIdx + 1);
+    lines.splice(planIdx + 1, end - planIdx - 1, "", ...bodyLines, "");
+    return lines.join("\n");
+  }
+  const reviewIdx = lines.findIndex((l) => l.trim() === DIARY_REVIEW_HEADING);
+  const anchorIdx = reviewIdx >= 0 ? reviewIdx : lines.findIndex((l) => l.trim() === DIARY_ESSAY_HEADING);
+  if (anchorIdx === -1)
+    return null;
+  lines.splice(nextH1(anchorIdx + 1), 0, DIARY_NEXTDAY_HEADING, "", ...bodyLines, "");
+  return lines.join("\n");
+}
+function extractNextDayPlanSection(content) {
+  const lines = content.split("\n");
+  const idx = lines.findIndex((l) => l.trim() === DIARY_NEXTDAY_HEADING);
+  if (idx === -1)
+    return null;
+  let end = lines.length;
+  for (let i = idx + 1; i < lines.length; i++) {
+    if (/^#\s/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  const body = lines.slice(idx + 1, end);
+  let s = 0;
+  while (s < body.length && body[s].trim() === "")
+    s++;
+  let e = body.length;
+  while (e > s && body[e - 1].trim() === "")
+    e--;
+  return body.slice(s, e).join("\n");
+}
+
 // src/weave-bridge.ts
 function weaveTocToStructure(tree) {
-  var _a44;
+  var _a56;
   if (!tree || tree.length === 0)
     return null;
   const freq = [];
   const walkFreq = (nodes, depth) => {
-    var _a45;
+    var _a57;
     for (const n of nodes) {
       while (freq.length <= depth)
         freq.push(/* @__PURE__ */ new Map());
       const w = extractTocUnitWord(n.label);
       if (w)
-        freq[depth].set(w, ((_a45 = freq[depth].get(w)) != null ? _a45 : 0) + 1);
+        freq[depth].set(w, ((_a57 = freq[depth].get(w)) != null ? _a57 : 0) + 1);
       walkFreq(n.children, depth + 1);
     }
   };
@@ -1251,7 +1709,7 @@ function weaveTocToStructure(tree) {
       visit(n, 0);
   }
   for (let lv = 0; lv < levels.length; lv++) {
-    if ((_a44 = labelRows[lv]) == null ? void 0 : _a44.some((l) => l.trim() !== ""))
+    if ((_a56 = labelRows[lv]) == null ? void 0 : _a56.some((l) => l.trim() !== ""))
       levels[lv].labels = labelRows[lv];
   }
   if (levels[0].counts[0] <= 0)
@@ -1913,10 +2371,14 @@ var marked = markTaskLineManual(toggled, 0);
 check("manual mark applied", marked.includes(MANUAL_MARK) && marked.startsWith("- [x]"), marked);
 check("manual mark idempotent", markTaskLineManual(marked, 0) === marked, void 0);
 check("manual actual parsed with \u270B", parseQuotaActual(`\u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 10\u7BC7\uFF09${MANUAL_MARK}`) === 10, void 0);
-var rewritten = setQuotaActual(marked, 0, 10, "\u7BC7", true, void 0, true);
-check("setQuotaActual keeps manual mark", rewritten.includes(MANUAL_MARK) && rewritten.includes("\uFF08\u5B9E 10\u7BC7\uFF09"), rewritten);
-var autoRewrite = setQuotaActual(marked, 0, 3, "\u7BC7", false, void 0, false);
+var rewritten = setQuotaActual(marked, 0, 10, "\u7BC7", true);
+check("setQuotaActual drops manual mark (ADR-0011)", !rewritten.includes(MANUAL_MARK) && rewritten.includes("\uFF08\u5B9E 10\u7BC7\uFF09"), rewritten);
+var autoRewrite = setQuotaActual(marked, 0, 3, "\u7BC7", false);
 check("auto rewrite strips manual mark", !autoRewrite.includes(MANUAL_MARK) && autoRewrite.startsWith("- [ ]"), autoRewrite);
+var cleared = clearManualMark(marked, 0);
+check("clearManualMark strips \u270B keeps state", !cleared.includes(MANUAL_MARK) && cleared.startsWith("- [x]") && cleared.includes("5\u7BC7"), cleared);
+check("clearManualMark idempotent", clearManualMark(cleared, 0) === cleared, void 0);
+check("clearManualMark no-mark no-op", clearManualMark(toggled, 0) === toggled, void 0);
 check("goal name: multi-level leaf", extractGoalName("\u8BA4\u77E5\u89C9\u9192\uFF08\u7B2C 5 \u7AE0\u7B2C 2 \u8282\uFF09") === "\u8BA4\u77E5\u89C9\u9192");
 check("goal name: flat leaf", extractGoalName("\u516C\u4F17\u53F7\u6587\u7AE0\uFF08\u7B2C 12 \u7BC7\uFF09") === "\u516C\u4F17\u53F7\u6587\u7AE0");
 check("goal name: manual task \u2192 null", extractGoalName("\u8BFB\u4E66\u7B14\u8BB0\u6574\u7406") === null);
@@ -2103,6 +2565,102 @@ check("modeLine: diary exact matches", matchesModeLine("\u{1F4DD} \u65E5\u8BB0",
 check("modeLine: parent default line NOT matched (floor>0)", !matchesModeLine("\u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6", "\u8FD0\u52A8", 30, "\u5206\u949F"), void 0);
 check("modeLine: parent default line NOT matched (floor=0)", !matchesModeLine("\u{1F4C8} \u65E5\u8BB0 \u590D\u76D8+\u6B21\u65E5\u8BA1\u5212", "\u65E5\u8BB0", 0, ""), void 0);
 check("modeLine: wrong floor amount not matched", !matchesModeLine("\u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7", "\u6587\u732E\u590D\u4E60", 10, "\u7BC7"), void 0);
+var dailyMd = [
+  "# 2026-11-10",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F4C8} \u590D\u76D8 \u590D\u76D8+\u6B21\u65E5\u8BA1\u5212 #\u8BA1\u5212/\u590D\u76D8",
+  "- [x] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB",
+  "- [x] \u{1F9E0} \u7B14\u8BB0\u590D\u4E60 #\u8BA1\u5212/\u7B14\u8BB0\u590D\u4E60",
+  "- [x] \u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 9\u7BC7\uFF09 #\u8BA1\u5212/\u7B14\u8BB0\u590D\u4E60",
+  "- [x] \u{1F4DD} \u65E5\u8BB0 #\u8BA1\u5212/\u65E5\u8BB0",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u62C9\u5347 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u{1F3C3} \u516B\u6BB5\u9526 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u5E73\u677F\u6491 3\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n");
+var dailyFile = new TFile();
+dailyFile.path = "2025/\u6BCF\u65E5/2026-11-10.md";
+dailyFile.name = "2026-11-10.md";
+var parsed = parseDailyContent(dailyFile, dailyMd, "2026-11-10");
+check("topRows: \u89E3\u6790\u51FA 9 \u884C\u5E26\u8BA1\u5212\u6807\u7B7E\u884C", parsed.checkItems.length === 9, parsed.checkItems.length);
+var modeGoals = [
+  { plan: "\u7B14\u8BB0\u590D\u4E60", name: "\u6587\u732E\u590D\u4E60", floor: 5, unit: "\u7BC7" },
+  { plan: "\u8FD0\u52A8", name: "\u62C9\u5347", floor: 1, unit: "\u6B21" },
+  { plan: "\u8FD0\u52A8", name: "\u516B\u6BB5\u9526", floor: 1, unit: "\u6B21" },
+  { plan: "\u8FD0\u52A8", name: "\u5E73\u677F\u6491", floor: 3, unit: "\u7EC4" }
+];
+var isModeLine = (it) => modeGoals.some((g) => g.plan === it.plan && matchesModeLine(it.text, g.name, g.floor, g.unit));
+var rows = topLevelCheckRows(parsed.checkItems, isModeLine);
+check("topRows: \u5927\u9879\u603B\u6570 = 5\uFF084 \u4E2A\u6A21\u5F0F\u5B50\u884C\u6298\u53E0\uFF09", rows.length === 5, rows.length);
+check("topRows: \u5B8C\u6210\u5927\u9879 = 3", rows.filter((r) => r.done).length === 3, rows.filter((r) => r.done).length);
+var _a41;
+check("topRows: \u7236\u884C\u52FE\u9009\u5373\u5B8C\u6210\uFF08\u7B14\u8BB0\u590D\u4E60\uFF09", ((_a41 = rows.find((r) => r.item.plan === "\u7B14\u8BB0\u590D\u4E60")) == null ? void 0 : _a41.done) === true);
+var _a42;
+check("topRows: \u5B50\u884C\u672A\u5168\u52FE\u7236\u884C\u4E0D\u7B97\u5B8C\u6210\uFF08\u8FD0\u52A8\uFF09", ((_a42 = rows.find((r) => r.item.plan === "\u8FD0\u52A8")) == null ? void 0 : _a42.done) === false);
+var _a43;
+check("topRows: \u7236\u884C\u6302\u5230\u5168\u90E8\u6A21\u5F0F\u5B50\u884C\uFF08\u8FD0\u52A8 3 \u5B50\uFF09", ((_a43 = rows.find((r) => r.item.plan === "\u8FD0\u52A8")) == null ? void 0 : _a43.modeChildren.length) === 3);
+var gapMd = dailyMd.replace("- [x] \u{1F9E0} \u7B14\u8BB0\u590D\u4E60", "- [ ] \u{1F9E0} \u7B14\u8BB0\u590D\u4E60").replace("- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8", "- [x] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8");
+var gapRows = topLevelCheckRows(parseDailyContent(dailyFile, gapMd, "2026-11-10").checkItems, isModeLine);
+var _a44;
+check("topRows: \u7236\u672A\u52FE\u5B50\u5168\u52FE = \u5B8C\u6210\uFF08\u56DE\u586B\u95F4\u9699\u4E0D\u541E\u5B8C\u6210\u5EA6\uFF09", ((_a44 = gapRows.find((r) => r.item.plan === "\u7B14\u8BB0\u590D\u4E60")) == null ? void 0 : _a44.done) === true);
+var _a45;
+check("topRows: \u7236\u52FE\u5B50\u672A\u5168\u52FE = \u5B8C\u6210\uFF08\u7236\u52FE\u4F18\u5148\uFF09", ((_a45 = gapRows.find((r) => r.item.plan === "\u8FD0\u52A8")) == null ? void 0 : _a45.done) === true);
+var orphanMd = [
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [x] \u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 9\u7BC7\uFF09 #\u8BA1\u5212/\u7B14\u8BB0\u590D\u4E60"
+].join("\n");
+var orphanRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanMd, "2026-11-10").checkItems, isModeLine);
+check("topRows: \u65E0\u7236\u884C\u6A21\u5F0F\u884C\u4FDD\u6301\u9876\u5C42\u4E14\u8BA1\u5165", orphanRows.length === 1 && orphanRows[0].modeChildren.length === 0 && orphanRows[0].done, JSON.stringify(orphanRows));
+check("topRows: \u65E0\u6A21\u5F0F\u884C = \u5168\u90E8\u72EC\u7ACB\u5927\u9879", topLevelCheckRows(parsed.checkItems, () => false).length === 9);
+var rollupMd = [
+  "# 2026-11-11",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB",
+  "- [x] \u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 9\u7BC7\uFF09 #\u8BA1\u5212/\u7B14\u8BB0\u590D\u4E60",
+  "- [ ] \u{1F9E0} \u7B14\u8BB0\u590D\u4E60 #\u8BA1\u5212/\u7B14\u8BB0\u590D\u4E60",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u62C9\u5347 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u5E73\u677F\u6491 3\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u{1F9D8} \u51A5\u60F3 #\u8BA1\u5212/\u51A5\u60F3"
+].join("\n");
+var rollupFacts = [
+  { plan: "\u9605\u8BFB", live: true, pendingEmpty: true },
+  { plan: "\u7B14\u8BB0\u590D\u4E60", live: true, pendingEmpty: true },
+  { plan: "\u8FD0\u52A8", live: true, pendingEmpty: true },
+  { plan: "\u51A5\u60F3", live: false, pendingEmpty: true }
+  // 纯打卡计划：无目标恒不自动勾
+];
+var rollupModePredicate = (plan, text) => modeGoals.some((g) => g.plan === plan && matchesModeLine(text, g.name, g.floor, g.unit));
+var rollupTargets = parentCheckTargets(rollupMd, rollupFacts, rollupModePredicate);
+check("rollup: \u5F85\u529E\u6E05\u7A7A \u2192 \u9605\u8BFB\u7236\u884C\u5165\u8D26", rollupTargets.some((t) => t.plan === "\u9605\u8BFB"), rollupTargets);
+check("rollup: \u6A21\u5F0F\u884C\u5168\u52FE \u2192 \u7B14\u8BB0\u590D\u4E60\u7236\u884C\u5165\u8D26\uFF08\u6A21\u5F0F\u884C\u5728\u524D\u4E0D\u6321\u7236\u884C\u8BC6\u522B\uFF09", rollupTargets.some((t) => t.plan === "\u7B14\u8BB0\u590D\u4E60"));
+check("rollup: \u6A21\u5F0F\u884C\u5168\u52FE \u2192 \u8FD0\u52A8\u7236\u884C\u5165\u8D26", rollupTargets.some((t) => t.plan === "\u8FD0\u52A8"));
+check("rollup: \u7EAF\u6253\u5361\u884C\uFF08\u65E0\u76EE\u6807\uFF09\u4E0D\u81EA\u52A8\u52FE", !rollupTargets.some((t) => t.plan === "\u51A5\u60F3"));
+var _a46;
+check("rollup: \u76EE\u6807\u5E26\u884C\u53F7\u4E0E\u539F\u6587\uFF08\u53EF\u76F4\u843D toggleTaskLine\uFF09", ((_a46 = rollupTargets.find((t) => t.plan === "\u9605\u8BFB")) == null ? void 0 : _a46.line) === 2);
+var applied = rollupTargets.reduce((acc, t) => toggleTaskLine(acc, t.line, true, t.raw), rollupMd);
+check("rollup: \u843D\u52FE\u540E\u7236\u884C\u4E3A [x]", applied.includes("- [x] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB"), applied.split("\n")[2]);
+check("rollup: \u5F85\u529E\u672A\u6E05\u4E0D\u52FE", !parentCheckTargets(rollupMd, rollupFacts.map((f) => f.plan === "\u9605\u8BFB" ? { ...f, pendingEmpty: false } : f), rollupModePredicate).some((t) => t.plan === "\u9605\u8BFB"));
+check("rollup: \u7A97\u53E3\u5916\u8BA1\u5212\u4E0D\u52FE", !parentCheckTargets(rollupMd, rollupFacts.map((f) => f.plan === "\u9605\u8BFB" ? { ...f, live: false } : f), rollupModePredicate).some((t) => t.plan === "\u9605\u8BFB"));
+check("rollup: \u7236\u884C \u270B \u8C41\u514D", !parentCheckTargets(rollupMd.replace("- [ ] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB", "- [ ] \u{1F4D6} \u9605\u8BFB \u270B #\u8BA1\u5212/\u9605\u8BFB"), rollupFacts, rollupModePredicate).some((t) => t.plan === "\u9605\u8BFB"));
+check("rollup: \u5DF2\u52FE\u7236\u884C\u4E0D\u518D\u5165\u8D26\uFF08\u5E42\u7B49\uFF09", !parentCheckTargets(rollupMd.replace("- [ ] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB", "- [x] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB"), rollupFacts, rollupModePredicate).some((t) => t.plan === "\u9605\u8BFB"));
+check("rollup: \u6A21\u5F0F\u5B50\u884C\u672A\u5168\u52FE\u4E0D\u52FE\u7236\u884C", !parentCheckTargets(rollupMd.replace("- [x] \u{1F3C3} \u62C9\u5347 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", "- [ ] \u{1F3C3} \u62C9\u5347 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"), rollupFacts, rollupModePredicate).some((t) => t.plan === "\u8FD0\u52A8"));
+var twiceTargets = parentCheckTargets(rollupMd + "\n- [ ] \u{1F4D6} \u53C8\u4E00\u884C #\u8BA1\u5212/\u9605\u8BFB", rollupFacts, rollupModePredicate);
+check("rollup: \u540C\u8BA1\u5212\u53EA\u8BA4\u7B2C\u4E00\u4E2A\u975E\u6A21\u5F0F\u884C", twiceTargets.filter((t) => t.plan === "\u9605\u8BFB").length === 1);
+check("rollup: \u53EA\u626B\u4ECA\u65E5\u6253\u5361\u533A", parentCheckTargets("## \u{1F4CC} \u5176\u4ED6\n- [ ] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB\n", [{ plan: "\u9605\u8BFB", live: true, pendingEmpty: true }], () => false).length === 0);
+var factMd = [
+  "# 2026-11-11",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8"
+].join("\n");
+var factFacts = [{ plan: "\u590D\u76D8", live: false, pendingEmpty: true, factDone: true }];
+var factTargets = parentCheckTargets(factMd, factFacts, () => false);
+check("fact: \u4E8B\u5B9E\u4E3A\u771F \u2192 \u65E0\u7A97\u53E3/\u65E0\u5F85\u529E\u4E5F\u52FE\u7236\u884C", factTargets.length === 1 && factTargets[0].plan === "\u590D\u76D8", factTargets);
+check("fact: \u4E8B\u5B9E\u4E3A\u5047 \u2192 \u7EAF\u6253\u5361\u884C\u4ECD\u4E0D\u52FE", parentCheckTargets(factMd, [{ plan: "\u590D\u76D8", live: false, pendingEmpty: true }], () => false).length === 0);
+check("fact: factDone:false \u540C\u4E0D\u52FE", parentCheckTargets(factMd, [{ plan: "\u590D\u76D8", live: false, pendingEmpty: true, factDone: false }], () => false).length === 0);
+check("fact: \u270B \u8C41\u514D\u5BF9\u4E8B\u5B9E\u52FE\u540C\u6837\u751F\u6548", parentCheckTargets(factMd.replace("- [ ] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8", "- [ ] \u{1F4C8} \u590D\u76D8 \u270B #\u8BA1\u5212/\u590D\u76D8"), factFacts, () => false).length === 0);
+check("fact: \u5DF2\u52FE\u5E42\u7B49\u4E0D\u518D\u5165\u8D26", parentCheckTargets(factMd.replace("- [ ] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8", "- [x] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8"), factFacts, () => false).length === 0);
+check("fact: \u4E8B\u5B9E\u52FE\u53EF\u76F4\u843D toggleTaskLine", toggleTaskLine(factMd, factTargets[0].line, true, factTargets[0].raw).includes("- [x] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8"));
 check("norm: \u6807\u9898\u5F52\u4E00\u5316", normalizeTocLabel("6.27 \u9AD8\u4F4D\u7A84\u5E45\u9707\u8361\u3001\u653E\u91CF\uFF08\u4E8C\uFF09") === "627\u9AD8\u4F4D\u7A84\u5E45\u9707\u8361\u653E\u91CF\u4E8C", normalizeTocLabel("6.27 \u9AD8\u4F4D\u7A84\u5E45\u9707\u8361\u3001\u653E\u91CF\uFF08\u4E8C\uFF09"));
 {
   const edited = [
@@ -2153,14 +2711,285 @@ plans:
 ---
 `;
 var defsA3 = parsePlansFromFrontmatter(fmAnchor3);
-var _a41, _b22;
-var a3 = (_b22 = (_a41 = defsA3[0]) == null ? void 0 : _a41.goals[0]) == null ? void 0 : _b22.readerAnchors;
-var _a42, _b23, _c10, _d4, _e3;
-check("anchors3: \u4E09\u6BB5\u89E3\u6790 spine/href/progress", ((_a42 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _a42.spine) === 0 && ((_b23 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _b23.href) === "c1.xhtml" && ((_c10 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _c10.progress) === 0.25, JSON.stringify((_e3 = (_d4 = defsA3[0]) == null ? void 0 : _d4.goals[0]) == null ? void 0 : _e3.readerAnchors));
-var _a43, _b24;
-check("anchors3: \u4E24\u6BB5\u65E7\u683C\u5F0F\u65E0 progress", ((_a43 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _a43.href) === "c2.xhtml" && ((_b24 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _b24.progress) === void 0);
+var _a47, _b22;
+var a3 = (_b22 = (_a47 = defsA3[0]) == null ? void 0 : _a47.goals[0]) == null ? void 0 : _b22.readerAnchors;
+var _a48, _b23, _c10, _d4, _e3;
+check("anchors3: \u4E09\u6BB5\u89E3\u6790 spine/href/progress", ((_a48 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _a48.spine) === 0 && ((_b23 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _b23.href) === "c1.xhtml" && ((_c10 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _c10.progress) === 0.25, JSON.stringify((_e3 = (_d4 = defsA3[0]) == null ? void 0 : _d4.goals[0]) == null ? void 0 : _e3.readerAnchors));
+var _a49, _b24;
+check("anchors3: \u4E24\u6BB5\u65E7\u683C\u5F0F\u65E0 progress", ((_a49 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _a49.href) === "c2.xhtml" && ((_b24 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _b24.progress) === void 0);
 var convF = weaveTocToStructure(bookTree);
 check("anchors3: \u6865\u53F6\u5E8F progress \u6570\u7EC4\u5BF9\u9F50", !!convF && convF.leafProgress.length === convF.leafSpine.length && convF.leafProgress.every((x) => typeof x === "number"));
-console.log(failed === 0 ? "\nALL PASSED" : `
+var pt = parseToc("\u7B2C1\u7AE0 \u521D\u89C1\n  1.1 \u76F8\u9047\n  1.2 \u79BB\u522B\n\u7B2C2\u7AE0 \u72EC\u767D");
+var _a50, _b25;
+check("paste labels: \u9644\u5E26\u6BCF\u5C42\u6807\u9898", ((_a50 = pt == null ? void 0 : pt.levels[0].labels) == null ? void 0 : _a50[0]) === "\u7B2C1\u7AE0 \u521D\u89C1" && ((_b25 = pt == null ? void 0 : pt.levels[1].labels) == null ? void 0 : _b25[0]) === "1.1 \u76F8\u9047", JSON.stringify(pt == null ? void 0 : pt.levels[1].labels));
+var ptLeaves = expandGoalStructure("\u4E66", pt.levels);
+var _a51, _b26;
+check("paste labels: \u53F6\u540D\u5E26\u771F\u5B9E\u6807\u9898", ((_a51 = ptLeaves[0]) == null ? void 0 : _a51.name) === "\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.1 \u76F8\u9047\uFF09", (_b26 = ptLeaves[0]) == null ? void 0 : _b26.name);
+var fmWriting = `---
+plans:
+  - name: \u5C0F\u8BF4
+    label: "\u270D\uFE0F"
+    goals:
+      - name: \u300A\u4E09\u4F53\u300B
+        count: 0
+        unit: \u5B57
+        mode: writing
+        floor: 1166.7
+        writingQuota:
+          total: 100000
+          unit: \u5B57
+          start: 2026-01-01
+          end: 2026-12-31
+          initial: 20000
+      - name: \u300A\u9ED1\u6697\u68EE\u6797\u300B
+        count: 3
+        unit: \u7AE0
+        mode: writing
+        structure:
+          - unit: \u7AE0
+            counts: [3]
+---
+`;
+var defsW = parsePlansFromFrontmatter(fmWriting);
+var wPlan = defsW[0];
+check("writing: \u8BA1\u5212\u4E3A\u6570\u91CF\u578B", (wPlan == null ? void 0 : wPlan.type) === "numeric");
+var wq = wPlan == null ? void 0 : wPlan.goals[0];
+check("writing: mode=writing \u89E3\u6790", (wq == null ? void 0 : wq.mode) === "writing");
+var _a52, _b27;
+check("writing: \u76EE\u6807\u7EA7\u5B57\u6570\u914D\u989D\u89E3\u6790", ((_a52 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a52.total) === 1e5 && ((_b27 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _b27.end) === "2026-12-31", JSON.stringify(wq == null ? void 0 : wq.writingQuota));
+var _a53;
+check("writing: \u63A5\u7EED\u521D\u59CB\u91CF\u89E3\u6790", ((_a53 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a53.initial) === 2e4);
+check("writing: floor \u51BB\u7ED3\u914D\u989D\u539F\u6837\u4FDD\u7559", (wq == null ? void 0 : wq.floor) === 1166.7);
+var wc = wPlan == null ? void 0 : wPlan.goals[1];
+var _a54, _b28, _c11;
+check("writing: \u6309\u7AE0\u8282 = 1 \u7EA7\u7AE0\u7ED3\u6784\u5E73\u94FA", (wc == null ? void 0 : wc.mode) === "writing" && ((_c11 = (_b28 = (_a54 = wc == null ? void 0 : wc.structure) == null ? void 0 : _a54[0]) == null ? void 0 : _b28.counts) == null ? void 0 : _c11[0]) === 3 && !(wc == null ? void 0 : wc.writingQuota));
+var wLeaves = expandGoalLeaves("\u300A\u9ED1\u6697\u68EE\u6797\u300B", wc);
+var _a55, _b29;
+check("writing: \u7AE0\u53F6\u547D\u540D\u300C\u7B2C N \u7AE0\u300D\u5168\u4E66\u8FDE\u7EED", ((_a55 = wLeaves == null ? void 0 : wLeaves[0]) == null ? void 0 : _a55.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 1 \u7AE0\uFF09" && ((_b29 = wLeaves == null ? void 0 : wLeaves[2]) == null ? void 0 : _b29.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 3 \u7AE0\uFF09", JSON.stringify(wLeaves == null ? void 0 : wLeaves.map((l) => l.name)));
+check("writing daily: 8 \u4E07\u5B57 \xF7 365 \u5929", computeWritingDaily(1e5, 2e4, "2026-01-01", "2026-12-31") === Math.round(8e4 / 365 * 10) / 10, computeWritingDaily(1e5, 2e4, "2026-01-01", "2026-12-31"));
+check("writing daily: initial=0 \u4E0E quota \u540C\u53E3\u5F84", computeWritingDaily(1e5, 0, "2026-01-01", "2026-01-31") === computeQuotaDaily(1e5, "2026-01-01", "2026-01-31"));
+check("writing line: \u8BC6\u522B\u914D\u989D\u884C\u542B\u5B9E\u91CF", matchesWritingLine("\u270D\uFE0F \u300A\u4E09\u4F53\u300B 1166.7\u5B57\uFF08\u5B9E 800\u5B57\uFF09", "\u300A\u4E09\u4F53\u300B"));
+check("writing line: \u8BC6\u522B\u5386\u53F2\u65E7\u914D\u989D\u884C", matchesWritingLine("\u270D\uFE0F \u300A\u4E09\u4F53\u300B 999\u5B57", "\u300A\u4E09\u4F53\u300B"));
+check("writing line: \u65E0\u6570\u5B57\u4E0D\u8BA4\uFF08\u8BA1\u5212\u9ED8\u8BA4\u884C\u9632\u8BEF\u5224\uFF09", !matchesWritingLine("\u270D\uFE0F \u300A\u4E09\u4F53\u300B \u6BCF\u5929\u5199", "\u300A\u4E09\u4F53\u300B"));
+check("writing line: \u4ED6\u4EBA\u540D\u5B57\u4E0D\u8BA4", !matchesWritingLine("\u270D\uFE0F \u300A\u7403\u72B6\u95EA\u7535\u300B 500\u5B57", "\u300A\u4E09\u4F53\u300B"));
+{
+  const r = diffShareClear(null, [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: true }]);
+  check("shareClear: \u9996\u8F6E\u57FA\u7EBF\u4E0D\u63D0\u9192", r.cleared.length === 0, r.cleared);
+  check("shareClear: \u9996\u8F6E\u5FEB\u7167\u843D\u4F4D", r.next.get("\u9605\u8BFB||\u4E09\u4F53") === true);
+}
+{
+  const prev = /* @__PURE__ */ new Map([["\u9605\u8BFB||\u4E09\u4F53", false]]);
+  const r = diffShareClear(prev, [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: true }]);
+  check("shareClear: false\u2192true \u8DC3\u8FC1\u63D0\u9192", r.cleared.length === 1 && r.cleared[0] === "\u4E09\u4F53", r.cleared);
+}
+{
+  const prev = /* @__PURE__ */ new Map([["\u9605\u8BFB||\u4E09\u4F53", true]]);
+  const r = diffShareClear(prev, [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: true }]);
+  check("shareClear: \u5DF2\u6E05\u7A7A\u4FDD\u6301\u9759\u9ED8", r.cleared.length === 0, r.cleared);
+}
+{
+  const prev = /* @__PURE__ */ new Map([["\u9605\u8BFB||\u4E09\u4F53", false]]);
+  const r = diffShareClear(prev, [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: false }]);
+  check("shareClear: \u672A\u6E05\u7A7A\u9759\u9ED8\u4E14\u5FEB\u7167\u8DDF\u968F", r.cleared.length === 0 && r.next.get("\u9605\u8BFB||\u4E09\u4F53") === false);
+}
+{
+  const prev = /* @__PURE__ */ new Map([["\u9605\u8BFB||\u4E09\u4F53", false], ["\u9605\u8BFB||\u7EA2\u697C\u68A6", false]]);
+  const r = diffShareClear(prev, [
+    { key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: true },
+    { key: "\u9605\u8BFB||\u7EA2\u697C\u68A6", name: "\u7EA2\u697C\u68A6", cleared: true }
+  ]);
+  check("shareClear: \u540C\u6279\u591A\u4E66\u9F50\u8DC3\u8FC1\uFF08\u5408\u5E76\u4E00\u6761\uFF09", r.cleared.length === 2 && r.next.size === 2, r.cleared);
+}
+{
+  const prev = /* @__PURE__ */ new Map([["\u9605\u8BFB||\u65E7\u4E66", false]]);
+  const r = diffShareClear(prev, [
+    { key: "\u9605\u8BFB||\u65E7\u4E66", name: "\u65E7\u4E66", cleared: false },
+    { key: "\u9605\u8BFB||\u65B0\u4E66", name: "\u65B0\u4E66", cleared: true }
+  ]);
+  check("shareClear: \u9996\u89C1\u5373\u6E05\u7A7A\u6309\u57FA\u7EBF\u4E0D\u63D0\u9192", r.cleared.length === 0 && r.next.size === 2, r.cleared);
+}
+{
+  const afterUncheck = diffShareClear(/* @__PURE__ */ new Map([["\u9605\u8BFB||\u4E09\u4F53", true]]), [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: false }]);
+  check("shareClear: \u9000\u52FE\u56DE\u843D\u9759\u9ED8", afterUncheck.cleared.length === 0 && afterUncheck.next.get("\u9605\u8BFB||\u4E09\u4F53") === false);
+  const afterRecheck = diffShareClear(afterUncheck.next, [{ key: "\u9605\u8BFB||\u4E09\u4F53", name: "\u4E09\u4F53", cleared: true }]);
+  check("shareClear: \u91CD\u52FE\u518D\u8DC3\u8FC1\u518D\u63D0\u9192", afterRecheck.cleared.length === 1, afterRecheck.cleared);
+}
+{
+  const diary = ["# \u7761\u7720\u76F8\u5173", "23:30-07:00", "", "# \u968F\u7B14", "\u60F3\u5230\u4EC0\u4E48\u5199\u4EC0\u4E48\u3002", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  const out = nextDayPlanTransform(diary, "\u660E\u65E5\u5F85\u529E\u4E00");
+  const expected = ["# \u7761\u7720\u76F8\u5173", "23:30-07:00", "", "# \u968F\u7B14", "\u60F3\u5230\u4EC0\u4E48\u5199\u4EC0\u4E48\u3002", "", "# \u6B21\u65E5\u8BA1\u5212", "", "\u660E\u65E5\u5F85\u529E\u4E00", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  check("nextDay: \u9996\u5199\u63D2\u5728\u968F\u7B14\u8282\u5C3E", out === expected, out);
+}
+{
+  const diary = ["# \u968F\u7B14", "\u968F\u7B14\u5185\u5BB9", "", "# \u5F53\u65E5\u590D\u76D8", "\u590D\u76D8\u5185\u5BB9", "", "## \u660E\u65E5\u8BA1\u5212", "- \u65E7\u5185\u5BB9", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  const out = nextDayPlanTransform(diary, "\u65B0\u8BA1\u5212");
+  const expected = ["# \u968F\u7B14", "\u968F\u7B14\u5185\u5BB9", "", "# \u5F53\u65E5\u590D\u76D8", "\u590D\u76D8\u5185\u5BB9", "", "## \u660E\u65E5\u8BA1\u5212", "- \u65E7\u5185\u5BB9", "", "# \u6B21\u65E5\u8BA1\u5212", "", "\u65B0\u8BA1\u5212", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  check("nextDay: \u951A\u70B9\u5F53\u65E5\u590D\u76D8\u8282\u5C3E\uFF0C## \u5B50\u8282\u4E0D\u88AB\u622A\u65AD", out === expected, out);
+}
+{
+  const diary = ["# \u968F\u7B14", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  const once = nextDayPlanTransform(diary, "\u8BA1\u5212\u5185\u5BB9");
+  const twice = nextDayPlanTransform(once, "\u8BA1\u5212\u5185\u5BB9");
+  check("nextDay: \u91CD\u590D\u5199\u5165\u5E42\u7B49", twice === once, twice);
+  check("nextDay: \u6807\u9898\u552F\u4E00", once.split("# \u6B21\u65E5\u8BA1\u5212").length === 2, once);
+}
+{
+  const diary = ["# \u968F\u7B14", "\u5185\u5BB9", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  const out = nextDayPlanTransform(diary, "\n\u7B2C\u4E00\u884C\n\n## \u5206\u8282\n\u7B2C\u4E8C\u884C\n\n");
+  const expected = ["# \u968F\u7B14", "\u5185\u5BB9", "", "# \u6B21\u65E5\u8BA1\u5212", "", "\u7B2C\u4E00\u884C", "", "## \u5206\u8282", "\u7B2C\u4E8C\u884C", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  check("nextDay: \u6B63\u6587\u7A7A\u884C/\u5B50\u6807\u9898\u539F\u6837\uFF0C\u9996\u5C3E\u7A7A\u884C\u89C4\u6574", out === expected, out);
+}
+{
+  check("nextDay: \u53CC\u951A\u70B9\u7F3A\u5931\u8FD4\u56DE null", nextDayPlanTransform("# \u65E5\u8BB0\n\u6B63\u6587\n", "x") === null, void 0);
+  const moved = ["# \u6B21\u65E5\u8BA1\u5212", "", "\u65E7\u8BA1\u5212", "", "# \u968F\u7B14", "\u5185\u5BB9", ""].join("\n");
+  const out = nextDayPlanTransform(moved, "\u65B0\u8BA1\u5212");
+  const expectedMoved = ["# \u6B21\u65E5\u8BA1\u5212", "", "\u65B0\u8BA1\u5212", "", "# \u968F\u7B14", "\u5185\u5BB9", ""].join("\n");
+  check("nextDay: \u5DF2\u6709\u5C0F\u8282\u539F\u4F4D\u66FF\u6362\u4E0D\u642C\u5BB6", out === expectedMoved, out);
+}
+{
+  const diary = ["# \u968F\u7B14", "\u5185\u5BB9", "", "# \u6B21\u65E5\u8BA1\u5212", "", "\u7B2C\u4E00\u884C", "", "## \u5206\u8282", "\u7B2C\u4E8C\u884C", "", "# \u65B0\u95FB\u8054\u64AD", ""].join("\n");
+  check("extract nextDay: \u6B63\u6587\u542B\u5B50\u6807\u9898", extractNextDayPlanSection(diary) === ["\u7B2C\u4E00\u884C", "", "## \u5206\u8282", "\u7B2C\u4E8C\u884C"].join("\n"), extractNextDayPlanSection(diary));
+  check("extract nextDay: \u65E0\u5C0F\u8282\u8FD4\u56DE null", extractNextDayPlanSection("# \u968F\u7B14\n\u5185\u5BB9\n") === null, void 0);
+}
+{
+  const c = parseChoreCycle({ unit: "week", days: [0] });
+  check("cycle: week \u5355\u4F4D\u76F4\u8BA4", (c == null ? void 0 : c.unit) === "week" && c.days.length === 1 && c.days[0] === 0, c);
+  const d = parseChoreCycle({ unit: "\u6BCF\u5929", days: [1, 2] });
+  check("cycle: \u4E2D\u6587\u5355\u4F4D\u6BCF\u5929\uFF08days \u5FFD\u7565\u5F52\u7A7A\uFF09", (d == null ? void 0 : d.unit) === "day" && d.days.length === 0, d);
+  const m2 = parseChoreCycle({ unit: "month", days: "21, 1, 11" });
+  check("cycle: \u5B57\u7B26\u4E32 days \u89E3\u6790\u5E76\u6392\u5E8F\u53BB\u91CD", !!m2 && m2.unit === "month" && m2.days.join(",") === "1,11,21", m2);
+  const y = parseChoreCycle({ unit: "year", days: [3, 1] });
+  check("cycle: year \u4E8C\u5143\u7EC4 [\u6708, \u65E5]", (y == null ? void 0 : y.unit) === "year" && y.days[0] === 3 && y.days[1] === 1, y);
+  check("cycle: \u975E\u5BF9\u8C61 \u2192 undefined", parseChoreCycle("week") === void 0, void 0);
+  check("cycle: week \u7A7A days \u2192 undefined", parseChoreCycle({ unit: "week", days: [] }) === void 0, void 0);
+  check("cycle: week \u8D8A\u754C \u2192 undefined", parseChoreCycle({ unit: "week", days: [7] }) === void 0, void 0);
+  check("cycle: month \u8D8A\u754C \u2192 undefined", parseChoreCycle({ unit: "month", days: [0, 32] }) === void 0, void 0);
+  check("cycle: year \u7F3A\u65E5\u5B50 \u2192 undefined", parseChoreCycle({ unit: "year", days: [3] }) === void 0, void 0);
+  check("cycle: \u672A\u77E5\u5355\u4F4D \u2192 undefined", parseChoreCycle({ unit: "hour", days: [1] }) === void 0, void 0);
+  check("overdue: postpone \u76F4\u8BA4", parseChoreOverdue("postpone") === "postpone", void 0);
+  check("overdue: \u4E2D\u6587\u5F80\u540E\u5EF6", parseChoreOverdue("\u5F80\u540E\u5EF6") === "postpone", void 0);
+  check("overdue: \u653E\u5F03/skip \u2192 undefined\uFF08\u7F3A\u7701\u5373\u653E\u5F03\uFF0C\u4E0D\u843D\u76D8\uFF09", parseChoreOverdue("\u653E\u5F03") === void 0 && parseChoreOverdue("skip") === void 0, void 0);
+  check("label: \u6BCF\u5929", choreCycleLabel({ unit: "day", days: [] }) === "\u6BCF\u5929", void 0);
+  check("label: \u6BCF\u5468\u5355\u65E5", choreCycleLabel({ unit: "week", days: [0] }) === "\u6BCF\u5468\u65E5", void 0);
+  check("label: \u6BCF\u5468\u591A\u65E5", choreCycleLabel({ unit: "week", days: [4, 1] }) === "\u6BCF\u5468\u4E00\u3001\u5468\u56DB", void 0);
+  check("label: \u6BCF\u6708\u591A\u53F7", choreCycleLabel({ unit: "month", days: [21, 1, 11] }) === "\u6BCF\u6708 1\u300111\u300121 \u53F7", void 0);
+  check("label: \u6BCF\u5E74", choreCycleLabel({ unit: "year", days: [3, 1] }) === "\u6BCF\u5E74 3 \u6708 1 \u65E5", void 0);
+  check("label: \u987A\u5EF6\u540E\u7F00", choreCycleLabel({ unit: "day", days: [] }, "postpone") === "\u6BCF\u5929 \xB7 \u6F0F\u4E86\u5F80\u540E\u5EF6", void 0);
+}
+{
+  const daily = { unit: "day", days: [] };
+  check("due: \u6BCF\u5929\u6052\u771F", isChoreDueOn(daily, "2026-11-11") && isChoreDueOn(daily, "2027-01-01"), void 0);
+  const sunday = { unit: "week", days: [0] };
+  check("due: \u6BCF\u5468\u65E5\u2014\u2014\u5468\u65E5\u771F\u5468\u4E00\u5047", isChoreDueOn(sunday, "2026-11-15") && !isChoreDueOn(sunday, "2026-11-16"), void 0);
+  const monThu = { unit: "week", days: [1, 4] };
+  check("due: \u6BCF\u5468\u4E00/\u56DB\u2014\u2014\u4E24\u5929\u771F\u5176\u4F59\u5047", isChoreDueOn(monThu, "2026-11-09") && isChoreDueOn(monThu, "2026-11-12") && !isChoreDueOn(monThu, "2026-11-10"), void 0);
+  const month31 = { unit: "month", days: [31] };
+  check("due: \u6BCF\u670831\u53F7\u2014\u2014\u5927\u6708\u771F\u5C0F\u6708\u843D\u6708\u672B", isChoreDueOn(month31, "2026-01-31") && !isChoreDueOn(month31, "2026-04-29") && isChoreDueOn(month31, "2026-04-30"), void 0);
+  const year229 = { unit: "year", days: [2, 29] };
+  check("due: \u6BCF\u5E742/29\u2014\u2014\u95F0\u5E74\u771F\u5E73\u5E74\u843D2/28", isChoreDueOn(year229, "2024-02-29") && isChoreDueOn(year229, "2023-02-28") && !isChoreDueOn(year229, "2023-03-01"), void 0);
+  check("prev: \u5468\u4E00\u5F80\u56DE\u627E\u4E0A\u5468\u65E5", prevChoreOccurrence(sunday, "2026-11-16") === "2026-11-15", prevChoreOccurrence(sunday, "2026-11-16"));
+  check("prev: \u8BE5\u505A\u65E5\u5F53\u5929\u8FD4\u56DE\u5F53\u5929", prevChoreOccurrence(sunday, "2026-11-15") === "2026-11-15", void 0);
+  check("prev: \u6BCF\u670831\u53F7\u4ECE4/10\u56DE\u9000\u52303/31", prevChoreOccurrence(month31, "2026-04-10") === "2026-03-31", prevChoreOccurrence(month31, "2026-04-10"));
+  check("prev: \u5E74\u5EA6\u4ECE2/20\u56DE\u9000\u5230\u53BB\u5E743/1", prevChoreOccurrence({ unit: "year", days: [3, 1] }, "2026-02-20") === "2025-03-01", void 0);
+  check("next: \u5468\u65E5\u7684\u4E0B\u4E00\u4E2A\u662F\u4E0B\u5468\u65E5", nextChoreOccurrence(sunday, "2026-11-15") === "2026-11-22", void 0);
+  check("next: 4/30\uFF08\u6708\u672B\u56DE\u843D\uFF09\u7684\u4E0B\u4E00\u4E2A\u662F5/31", nextChoreOccurrence(month31, "2026-04-30") === "2026-05-31", nextChoreOccurrence(month31, "2026-04-30"));
+  check("next: \u5E74\u5EA63/2\u7684\u4E0B\u4E00\u4E2A\u662F\u660E\u5E743/1", nextChoreOccurrence({ unit: "year", days: [3, 1] }, "2026-03-02") === "2027-03-01", void 0);
+  const occ = choreOccurrences(monThu, "2026-11-09", "2026-11-22");
+  check("occ: \u6BCF\u5468\u4E00/\u56DB\u4E24\u5468\u679A\u4E3E 4 \u6B21", occ.join(",") === "2026-11-09,2026-11-12,2026-11-16,2026-11-19", occ);
+  check("occ: \u8D77\u70B9=\u8BE5\u505A\u65E5\u542B\u9996\u4E0D\u542B\u5C3E\u540E", choreOccurrences(sunday, "2026-11-15", "2026-11-15").join(",") === "2026-11-15", void 0);
+  check("occ: \u8D77\u70B9\u665A\u4E8E\u7EC8\u70B9 \u2192 \u7A7A", choreOccurrences(sunday, "2026-11-20", "2026-11-15").length === 0, void 0);
+  check("occ: cap \u622A\u65AD", choreOccurrences(daily, "2026-01-01", "2026-12-31", 10).length === 10, void 0);
+  check("occ: \u6BCF\u5E74\u7A97\u53E3\u5185\u81F3\u591A\u4E00\u6B21", choreOccurrences({ unit: "year", days: [3, 1] }, "2026-01-01", "2026-12-31").join(",") === "2026-03-01", void 0);
+}
+{
+  const content = [
+    "---",
+    "date: 2026-11-11",
+    "---",
+    "# \u{1F4C5} 2026-11-11 \u661F\u671F\u4E09",
+    "",
+    CHECK_HEADING,
+    "- [ ] \u{1F3E0} \u65E5\u5E38\u751F\u6D3B #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11",
+    "- [x] \u6D17\u7897 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11",
+    "",
+    "## \u{1F4DD} \u4ECA\u65E5\u603B\u7ED3",
+    ""
+  ].join("\n");
+  const out = missingChoreLines(content, [
+    { plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u6D17\u7897" },
+    { plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u505A\u536B\u751F" }
+  ], "2026-11-11");
+  check(
+    "choreLines: \u5DF2\u5B58\u5728\uFF08\u542B\u5DF2\u52FE\uFF09\u4E0D\u91CD\u5EFA\uFF0C\u7F3A\u5931\u8865\u4E00\u884C",
+    out.length === 1 && out[0] === "- [ ] \u505A\u536B\u751F #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11",
+    out
+  );
+}
+{
+  const content = [
+    CHECK_HEADING,
+    "- [ ] \u6D17\u7897\u673A #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11",
+    "- [ ] \u6D17\u7897 #\u8BA1\u5212/\u5BB6\u52A1 \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11",
+    "- [ ] \u4E70\u83DC\uFF08\u7B2C 2 \u6B21\uFF09 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11"
+  ].join("\n");
+  const out = missingChoreLines(content, [
+    { plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u6D17\u7897" },
+    { plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u4E70\u83DC" }
+  ], "2026-11-11");
+  check("choreLines: \u7CBE\u786E\u5339\u914D\u2014\u2014\u8FD1\u540D/\u5F02\u8BA1\u5212/\u5E26\u540E\u7F00\u90FD\u4E0D\u9876\u66FF", out.length === 2, out);
+}
+void (async () => {
+  const day = (name, lines) => {
+    const f = new TFile();
+    f.path = `\u8BA1\u52122026/\u6BCF\u65E5/${name}.md`;
+    contents.set(f.path, [CHECK_HEADING, ...lines].join("\n"));
+    return f;
+  };
+  const contents = /* @__PURE__ */ new Map();
+  const files = [
+    day("2026-11-09", ["- [x] \u6D17\u7897 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-09 \u{1F4C5} 2026-11-09"]),
+    day("2026-11-10", ["- [ ] \u6D17\u7897 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-10 \u{1F4C5} 2026-11-10"]),
+    day("2026-11-11", ["- [x] \u6D17\u7897\u673A #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11", "- [ ] \u6D17\u7897 #\u8BA1\u5212/\u5BB6\u52A1 \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11"])
+  ];
+  const app = {
+    vault: {
+      getAbstractFileByPath: (p) => {
+        var _a56;
+        return (_a56 = files.find((f) => f.path === p)) != null ? _a56 : null;
+      },
+      cachedRead: async (f) => {
+        var _a56;
+        return (_a56 = contents.get(f.path)) != null ? _a56 : "";
+      }
+    }
+  };
+  const prefix = "\u8BA1\u52122026/\u6BCF\u65E5/";
+  check(
+    "scanHit: \u547D\u4E2D\u5DF2\u52FE\u884C\uFF08\u6B63\u5411\uFF09",
+    await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-09", "2026-11-09"),
+    void 0
+  );
+  check(
+    "scanHit: \u672A\u52FE\u4E0D\u7B97\u547D\u4E2D",
+    !await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-10", "2026-11-10"),
+    void 0
+  );
+  check(
+    "scanHit: \u8FD1\u540D/\u5F02\u8BA1\u5212\u4E0D\u9876\u66FF\uFF08\u6D17\u7897\u673A/\u5BB6\u52A1\u884C\u4E0D\u7B97\uFF09",
+    !await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-11", "2026-11-11"),
+    void 0
+  );
+  check(
+    "scanHit: \u7A97\u53E3\u5185\u4EFB\u4E00\u5929\u547D\u4E2D\u5373\u771F\uFF0811-09 \u5DF2\u52FE\uFF09",
+    await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-09", "2026-11-10"),
+    void 0
+  );
+  check(
+    "scanHit: backward \u4ECE to \u7AEF\u56DE\u626B\u547D\u4E2D\uFF08\u8D8A\u8FC7 11-10 \u672A\u52FE\uFF0C\u547D\u4E2D 11-09\uFF09",
+    await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-09", "2026-11-10", true),
+    void 0
+  );
+  console.log(failed === 0 ? "\nALL PASSED" : `
 ${failed} FAILED`);
-process.exit(failed === 0 ? 0 : 1);
+  process.exit(failed === 0 ? 0 : 1);
+})();

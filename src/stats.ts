@@ -2,16 +2,27 @@ import { App, TFile, parseYaml } from "obsidian";
 import {
 	CHECK_HEADING,
 	MANUAL_MARK,
+	addDays,
+	choreOccurrences,
 	countWorkdays,
 	dayCount,
 	daysInMonth,
+	formatDate,
 	getISOWeek,
 	matchesModeLine,
+	matchesWritingLine,
+	nextChoreOccurrence,
+	parseChoreCycle,
+	parseChoreOverdue,
 	parseDailyContent,
 	parseQuotaActual,
 	parseQuotaAmount,
 	parseTempTasksFromFrontmatter,
+	parseDateString,
+	scanChoreHit,
 	weekRange,
+	type ChoreOverdue,
+	type GoalCycle,
 } from "./daily";
 import type { GoalLevel, PoolTask } from "./tasks";
 import { listTasks } from "./tasks";
@@ -40,8 +51,10 @@ export type PeriodType = "week" | "month" | "year";
  * - review：文献复习（纯每日下限，实际量来自 BZG 复习记录）
  * - diary：每日日记（打卡行，完成事实来自 BZG 日记日文件写作内容）
  * - exercise：运动（打卡 + 可选时长/次数）
+ * - writing：写作（ADR-0010：按字数 = 目标级字数配额；按章节 = 1 级「章」结构走任务池）
+ * - chore：生活（ADR-0016：固定日子式周期，事项级逾期策略，周期窗口命中统计）
  */
-export type GoalMode = "reading" | "review" | "diary" | "exercise";
+export type GoalMode = "reading" | "review" | "diary" | "exercise" | "writing" | "chore";
 
 export interface PlanRate {
 	plan: string;
@@ -83,12 +96,42 @@ export interface PlanGoal {
 	 * 非空 = 启用联动（跳转/推进事实/对账）。
 	 */
 	readerSid?: string;
+
 	/**
 	 * ADR-0009: 每叶跳转/推进锚点快照（DFS 叶序对齐：spine = 所在章序，href = 章内锚点）。
 	 * 结构确认时落盘——此后跳转与推进映射只认这份快照，不依赖阅读器实时目录
 	 * （结构改名/微调不失效）；无此字段的旧目标回退实时对齐。
 	 */
 	readerAnchors?: { spine: number; href: string; progress?: number }[];
+
+	/**
+	 * ADR-0010 写作模式·按字数：目标级字数配额（与计划级 PlanQuota 同构，随目标走）。
+	 * 每日配额冻结在 floor（=(total−initial)÷天数，创建时算死）；进度 = (initial + Σ行事实) ÷ total。
+	 * writing 模式且无此字段 = 按章节（structure 平铺，任务池口径）。
+	 */
+	writingQuota?: PlanGoalQuota;
+
+	/**
+	 * ADR-0016 生活模式：固定日子式周期（unit + 日子集合，语义见 daily.ts GoalCycle）。
+	 * 生活事项按此轮到即做；缺省视为每天（与打卡型同口径）。
+	 */
+	cycle?: GoalCycle;
+	/** ADR-0016 逾期策略：仅 postpone 落盘（往后延，挂账到补做）；缺省 = 放弃。 */
+	overdue?: ChoreOverdue;
+}
+
+/** ADR-0010: 目标级字数配额定义（写作模式·按字数）。 */
+export interface PlanGoalQuota {
+	/** 总字数. */
+	total: number;
+	/** 单位（写作模式恒「字」，保留字段以便复用）. */
+	unit: string;
+	/** Start date (defaults to the annual plan period start). */
+	start?: string;
+	/** Deadline (defaults to the annual plan period end). */
+	end?: string;
+	/** 接续写作：建目标时已累计的字数（计入进度分子，不参与每日配额）. */
+	initial?: number;
 }
 
 /** Quota definition under a quota-type plan (ADR-0001 日定额型). */
@@ -162,6 +205,14 @@ export interface ModeGoalStats {
 	todayActual?: number | null;
 	/** exercise 专属：累计实际量。 */
 	totalAmount?: number;
+	/** writing 专属（ADR-0010）：目标总字数 / 单位 / 接续初始量。 */
+	quotaTotal?: number;
+	quotaUnit?: string;
+	quotaInitial?: number;
+	/** writing 专属：当前冻结的每日配额（floor）与落后判定。 */
+	quotaDaily?: number;
+	quotaExpected?: number;
+	quotaBehind?: boolean;
 }
 
 /** Progress of one quota-type plan (ADR-0001). */
@@ -190,6 +241,14 @@ export function computeQuotaDaily(total: number, start: string, end: string): nu
 	const days = dayCount(start, end);
 	if (days <= 0) return total;
 	return Math.round((total / days) * 10) / 10;
+}
+
+/**
+ * ADR-0010 写作按字数：每日配额 = (总量 − 接续初始量) ÷ 窗口天数（创建时一次算死，落后不追赶）。
+ * 与 computeQuotaDaily 同精度口径；initial 计入进度分子，不参与摊派。
+ */
+export function computeWritingDaily(total: number, initial: number, start: string, end: string): number {
+	return computeQuotaDaily(Math.max(0, total - initial), start, end);
 }
 
 /** Expected cumulative amount by `today` (clamped to the plan window; never predicts the future). */
@@ -322,6 +381,10 @@ export async function computePeriodStats(
 	const defs = await readAnnualDefs(app, rootPath, year);
 	const quotaDefs = defs.filter((d) => d.type === "quota" && d.quota);
 	const quotaPlans = new Set(quotaDefs.map((d) => d.name));
+	// ADR-0016: 生活计划打卡事实 = (计划|日期|事项名) 集合，打卡率走周期窗口命中（不走常规逐日口径）
+	const choreDefs = defs.filter((d) => hasChoreGoal(d));
+	const chorePlanNames = new Set(choreDefs.map((d) => d.name));
+	const choreChecks = new Set<string>(); // `${plan}|${date}|${name}`
 
 	// --- Plan check-in rates -------------------------------------------------
 	const prefix = `${rootPath}/${yearDir}/每日/`;
@@ -355,6 +418,15 @@ export async function computePeriodStats(
 				}
 				continue;
 			}
+			// ADR-0016: 生活事项行——记录勾选事实（日期+事项名），不进常规逐日打卡率
+			if (chorePlanNames.has(item.plan)) {
+				if (item.checked) {
+					const def = choreDefs.find((d) => d.name === item.plan);
+					const g = def?.goals.find((x) => x.mode === "chore" && matchesModeLine(item.text, x.name, 0, ""));
+					if (g) choreChecks.add(`${item.plan}|${date}|${g.name}`);
+				}
+				continue;
+			}
 			planSeen.add(item.plan);
 			if (item.checked) checkedPlans.add(item.plan);
 		}
@@ -378,13 +450,46 @@ export async function computePeriodStats(
 		}
 	}
 
-	const planRates: PlanRate[] = Array.from(planSeen)
-		.sort()
-		.map((plan) => {
-			const total = workdayPlans.has(plan) ? workdays : totalDays;
-			const done = planDays.get(plan) ?? 0;
-			return { plan, done, total, percent: total === 0 ? 0 : Math.round((done / total) * 100) };
-		});
+	// ADR-0016: 生活计划打卡率 = 周期窗口命中 ÷ 该做次数（Σ over goals）。分母沿用周期口径：
+	// 周/月至今（rateEnd）、年全窗口（与年度卡同尺可横向比较）；命中窗口截止到 rateEnd 与今天。
+	const choreRates: PlanRate[] = [];
+	for (const d of choreDefs) {
+		let done = 0;
+		let total = 0;
+		for (const g of d.goals) {
+			if (g.mode !== "chore") continue;
+			const cycle: GoalCycle = g.cycle ?? { unit: "day", days: [] };
+			const gStart = g.start || start;
+			const gEnd = g.end || end;
+			const dues = choreOccurrences(cycle, gStart, gEnd, 800);
+			for (let i = 0; i < dues.length; i++) {
+				if (dues[i] > rateEnd) break;
+				total++;
+				const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, dues[i]);
+				const winTo = formatDate(addDays(parseDateString(next), -1));
+				const scanTo = [winTo, rateEnd, today].reduce((a, b) => (b < a ? b : a));
+				for (let dd = dues[i]; dd <= scanTo; ) {
+					if (choreChecks.has(`${d.name}|${dd}|${g.name}`)) {
+						done++;
+						break;
+					}
+					dd = formatDate(addDays(parseDateString(dd), 1));
+				}
+			}
+		}
+		choreRates.push({ plan: d.name, done, total, percent: total === 0 ? 0 : Math.round((done / total) * 100) });
+	}
+
+	const planRates: PlanRate[] = [
+		...Array.from(planSeen)
+			.sort()
+			.map((plan) => {
+				const total = workdayPlans.has(plan) ? workdays : totalDays;
+				const done = planDays.get(plan) ?? 0;
+				return { plan, done, total, percent: total === 0 ? 0 : Math.round((done / total) * 100) };
+			}),
+		...choreRates,
+	];
 
 	// --- Temp task completion ------------------------------------------------
 	const tempFiles = collectTempTaskFiles(app, rootPath, yearDir, label, type);
@@ -643,8 +748,33 @@ function readPlanGoals(obj?: Record<string, unknown>): PlanGoal[] {
 			const floorVal = typeof rawFloor === "number" ? rawFloor : parseFloat(String(rawFloor ?? ""));
 			if (Number.isFinite(floorVal) && floorVal > 0) goal.floor = floorVal;
 			else if (mode === "review") goal.floor = 1;
+			// ADR-0016 生活模式：固定日子式周期 + 逾期策略（非法/缺省静默回退：无周期=每天、无策略=放弃）
+			const cycle = parseChoreCycle(rec.cycle ?? rec["周期"]);
+			if (cycle) goal.cycle = cycle;
+			const overdue = parseChoreOverdue(rec.overdue ?? rec["逾期"]);
+			if (overdue) goal.overdue = overdue;
 		}
 		if (chapters && chapters.length > 0) goal.chapters = chapters;
+		// ADR-0010 写作模式·按字数：目标级字数配额（total 必填 >0；unit 缺省「字」；initial 为接续初始量）
+		const rawGoalQuota: unknown = rec.writingQuota ?? rec["字数配额"];
+		if (rawGoalQuota && typeof rawGoalQuota === "object") {
+			const q = rawGoalQuota as Record<string, unknown>;
+			const qNum = (v: unknown): number => (typeof v === "number" ? v : typeof v === "string" ? parseFloat(v) : NaN);
+			const qStr = (keys: string[]): string => readPlanString(q, keys);
+			const qTotal = qNum(q.total ?? q["总量"]);
+			if (Number.isFinite(qTotal) && qTotal > 0) {
+				const qStart = qStr(["start", "开始", "起"]).trim() || undefined;
+				const qEnd = qStr(["end", "结束", "止", "截止"]).trim() || undefined;
+				const qInitial = qNum(q.initial ?? q["初始"]);
+				goal.writingQuota = {
+					total: qTotal,
+					unit: qStr(["unit", "单位"]) || (mode === "writing" ? "字" : ""),
+					...(qStart ? { start: qStart } : {}),
+					...(qEnd ? { end: qEnd } : {}),
+					...(Number.isFinite(qInitial) && qInitial > 0 ? { initial: qInitial } : {}),
+				};
+			}
+		}
 		// ADR-0009 weave 阅读器联动：来源书稳定标识 + 每叶锚点快照（"spine|href" 紧凑流式序列）
 		const readerSid = readPlanString(rec, ["readerSid", "阅读器书"]);
 		if (readerSid) goal.readerSid = readerSid;
@@ -736,13 +866,16 @@ function parseGoalMode(raw: string): GoalMode | undefined {
 	if (/^(review|复习)$/.test(v)) return "review";
 	if (/^(diary|日记)$/.test(v)) return "diary";
 	if (/^(exercise|运动|锻炼)$/.test(v)) return "exercise";
+	if (/^(writing|写作|小说|写小说)$/.test(v)) return "writing";
+	if (/^(chore|生活|日常|家务)$/.test(v)) return "chore";
 	return undefined;
 }
 
 /**
- * ADR-0006: 模式目标进度统计（review/diary/exercise）。
+ * ADR-0006/0010: 模式目标进度统计（review/diary/exercise + writing 按字数）。
  * 数据源 = 文件事实（每日笔记打卡行）+ BZG 只读快照（review.json / 日记日文件）。
  * 统计窗口 = 目标显式窗口 → 年度计划周期 → 自然年；应达标天数只算已过部分。
+ * writing（ADR-0010）：按字数走目标级配额口径（见函数首分支）；按章节不进本函数（任务池口径）。
  */
 export async function computeModeGoalStats(
 	app: App,
@@ -760,6 +893,115 @@ export async function computeModeGoalStats(
 	const floor = goal.floor ?? 0;
 	const dueEnd = today < end ? today : end;
 	const dueDays = today < start ? 0 : Math.max(0, dayCount(start, dueEnd));
+
+	// ADR-0010 写作模式·按字数：目标级字数配额，进度 = (initial + Σ行事实) ÷ 总量。
+	// 行事实 = （实 N）；无实际量的勾选日按**行内**配额数记（历史行不随编辑漂移，文件事实为准）。
+	// hitDays 语义 = 动笔天数（当天有行且勾选或实际量 > 0）；streak = 连续动笔天数。
+	if (mode === "writing" && goal.writingQuota) {
+		const q = goal.writingQuota;
+		const qStart = q.start ?? start;
+		const qEnd = q.end ?? end;
+		const initial = q.initial ?? 0;
+		// floor 冻结在创建时；手写 frontmatter 缺 floor 时按口径现算兜底
+		const daily = floor > 0 ? floor : computeWritingDaily(q.total, initial, qStart, qEnd);
+		const scanEnd = today < qStart ? qStart : today > qEnd ? qEnd : today;
+		const prefix = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/每日/`;
+		let cumulative = initial;
+		let hitDays = 0;
+		const days: boolean[] = [];
+		for (let d = qStart; d <= scanEnd; ) {
+			let hit = false;
+			const f = app.vault.getAbstractFileByPath(`${prefix}${d}.md`);
+			if (f instanceof TFile) {
+				const content = await app.vault.cachedRead(f);
+				let inCheck = false;
+				for (const line of content.split("\n")) {
+					if (/^##\s/.test(line)) {
+						inCheck = line.startsWith(CHECK_HEADING);
+						continue;
+					}
+					if (!inCheck) continue;
+					const m = TASK_LINE_RE.exec(line);
+					if (!m || m[3] !== planName) continue;
+					const text = m[2].trim();
+					if (!matchesWritingLine(text, goal.name)) continue;
+					const actual = parseQuotaActual(text);
+					const checked = m[1] === "x";
+					const rowQuota = parseQuotaAmount(text) ?? daily;
+					cumulative += actual ?? (checked ? rowQuota : 0);
+					hit = checked || (actual != null && actual > 0);
+					break;
+				}
+			}
+			if (hit) hitDays++;
+			days.push(hit);
+			// 日期推进（ISO 字符串逐日）
+			const [yy, mm, dd] = d.split("-").map(Number);
+			const next = new Date(yy, mm - 1, dd + 1);
+			d = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}-${String(next.getDate()).padStart(2, "0")}`;
+		}
+		let streak = 0;
+		{
+			let i = days.length - 1;
+			if (i >= 0 && !days[i]) i--;
+			while (i >= 0 && days[i]) {
+				streak++;
+				i--;
+			}
+		}
+		const dueWindow = today < qStart ? 0 : Math.max(0, dayCount(qStart, scanEnd));
+		const expected = initial + Math.round(daily * dueWindow * 10) / 10;
+		const stats: ModeGoalStats = {
+			mode,
+			dueDays: dueWindow,
+			hitDays,
+			streak,
+			percent: Math.min(100, Math.round((cumulative / q.total) * 100)),
+			totalAmount: Math.round(cumulative * 10) / 10,
+			quotaTotal: q.total,
+			quotaUnit: q.unit || "字",
+			...(initial > 0 ? { quotaInitial: initial } : {}),
+			quotaDaily: daily,
+			quotaExpected: expected,
+			quotaBehind: cumulative + 1e-9 < expected,
+		};
+		return stats;
+	}
+
+	// ADR-0016 生活模式：周期窗口命中——从该做日起、下次该做日前任何一天勾了都算该次命中
+	//（一条规则覆盖每日事项、往后延的逾期补做、放弃事项的手改补卡）。缺 cycle 兜底每天。
+	// dueDays/hitDays = 已开始的该做次数 / 命中次数；streak = 连续命中的周期数（当前周期
+	// 未命中则从上一周期起算，与逐日模式同构）。
+	if (mode === "chore") {
+		const cycle: GoalCycle = goal.cycle ?? { unit: "day", days: [] };
+		const prefix = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/每日/`;
+		const dues = choreOccurrences(cycle, start, dueEnd);
+		const hits: boolean[] = [];
+		for (let i = 0; i < dues.length; i++) {
+			// 命中窗口 = [该做日, 下次该做日前]，末次封顶到统计窗口终点（不数未来）
+			const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, dues[i]);
+			const winTo = formatDate(addDays(parseDateString(next), -1));
+			const clampTo = winTo < dueEnd ? winTo : dueEnd;
+			hits.push(await scanChoreHit(app, prefix, planName, goal.name, dues[i], clampTo));
+		}
+		const hitDays = hits.filter(Boolean).length;
+		let streak = 0;
+		{
+			let i = hits.length - 1;
+			if (i >= 0 && !hits[i]) i--;
+			while (i >= 0 && hits[i]) {
+				streak++;
+				i--;
+			}
+		}
+		return {
+			mode,
+			dueDays: dues.length,
+			hitDays,
+			streak,
+			percent: dues.length > 0 ? Math.min(100, Math.round((hitDays / dues.length) * 100)) : 0,
+		};
+	}
 
 	const prefix = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/每日/`;
 	interface DayLine {
@@ -860,6 +1102,13 @@ export async function computeModeGoalStats(
 	return stats;
 }
 
+/**
+ * ADR-0016: 计划里是否含生活事项目标（父行豁免镜像对账、每日模板豁免共用）。
+ */
+export function hasChoreGoal(def: { goals: { mode?: GoalMode }[] }): boolean {
+	return def.goals.some((g) => g.mode === "chore");
+}
+
 function readPlanType(obj: Record<string, unknown> | undefined, target: string): PlanDef["type"] {
 	let t = "";
 	if (obj) {
@@ -913,7 +1162,8 @@ export async function computeAnnualPlanProgress(
 			// ADR-0006: 模式目标（review/diary/exercise）不走任务池，走专属统计
 			const goalProgress: PlanGoalProgress[] = await Promise.all(
 				def.goals.map(async (g) => {
-					if (g.mode && g.mode !== "reading") {
+					// ADR-0006/0010: 模式目标走专属统计；写作按章节（无字数配额）例外——任务池口径，同阅读/通用
+					if (g.mode === "writing" ? !!g.writingQuota : g.mode && g.mode !== "reading") {
 						const stats = await computeModeGoalStats(app, rootPath, year, def.name, g, today, bzg);
 						return { ...g, done: stats.hitDays, total: stats.dueDays, percent: stats.percent, modeStats: stats };
 					}
@@ -957,7 +1207,9 @@ export async function computeAnnualPlanProgress(
 				let percent = totalCount > 0 ? Math.round((doneCount / totalCount) * 100) : 0;
 				// ADR-0006: 无任务池事实但有模式目标 → 进度 = 模式目标达标率均值
 				const modePercents = goalProgress.filter((g) => g.modeStats).map((g) => g.percent);
-				if (totalCount === 0 && modePercents.length > 0) {
+				// ADR-0016: 生活计划例外——聚合 = Σ命中 ÷ Σ该做（周期窗口口径的 planRate），非各目标均值
+				if (hasChoreGoal(def) && rate) percent = rate.percent;
+				else if (totalCount === 0 && modePercents.length > 0) {
 					percent = Math.round(modePercents.reduce((a, b) => a + b, 0) / modePercents.length);
 				}
 				return {

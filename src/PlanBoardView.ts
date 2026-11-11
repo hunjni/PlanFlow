@@ -1,29 +1,39 @@
 import { App, ButtonComponent, ItemView, MarkdownView, Menu, Modal, Notice, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf, parseYaml } from "obsidian";
 import type PlanBoardPlugin from "../main";
-import type { CheckItem, DailyData, ModeLineSpec } from "./daily";
+import type { CheckItem, ChoreOverdue, ChoreLineSpec, DailyData, GoalCycle, ModeLineSpec, ParentRollupFact } from "./daily";
 import {
 	MANUAL_MARK,
 	appendCheckItem,
 	buildCheckLine,
+	clearManualMark,
 	CHECK_HEADING,
 	buildDailyTemplate,
 	buildQuotaCheckLine,
 	buildReviewTemplate,
+	choreCycleLabel,
+	choreOccurrences,
 	dayCount,
 	addDays,
 	formatDate,
 	formatQuotaAmount,
+	isChoreDueOn,
+	missingChoreLines,
+	CHORE_WEEKDAY_SHORT,
 	missingModeLines,
 	missingQuotaLines,
 	markTaskLineManual,
 	matchesModeLine,
 	moveTaskLine,
+	parentCheckTargets,
 	parseDailyContent,
 	parseDateString,
 	parseQuotaActual,
+	prevChoreOccurrence,
 	removeLine,
 	replaceSummary,
+	scanChoreHit,
 	setQuotaActual,
+	topLevelCheckRows,
 	TASK_LINE_RE,
 	todayStr,
 	toggleTaskLine,
@@ -36,15 +46,17 @@ import {
 	computePeriodStats,
 	computeAnnualPlanProgress,
 	computeQuotaDaily,
+	computeWritingDaily,
 	filterTasksInRange,
+	hasChoreGoal,
 	parsePlansFromFrontmatter,
 	readPlanPeriod,
 } from "./stats";
-import type { AutoTaskPlan, BookGroup, NewTaskInput, PoolTask } from "./tasks";
-import { addTask, DAY_MS, deleteTask, editTask, ensureAutoTasks, extractGoalName, groupPoolTasksByGoal, isAutoTask, isRestartUnit, listTasks, planCounterUnit, suggestNextUnit, toggleTask, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, STRUCT_UNITS, type ChapterRescheduleContext, type GoalLeaf, type GoalLevel } from "./tasks";
+import type { AutoTaskPlan, BookGroup, NewTaskInput, PoolTask, ShareClearEntry } from "./tasks";
+import { addTask, DAY_MS, deleteTask, diffShareClear, editTask, ensureAutoTasks, extractGoalName, groupPoolTasksByGoal, isAutoTask, isRestartUnit, listTasks, planCounterUnit, suggestNextUnit, toggleTask, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, STRUCT_UNITS, type ChapterRescheduleContext, type GoalLeaf, type GoalLevel } from "./tasks";
 import { badgeCounts, computeStreak, readMonthBadges, readPeriodBadges, settleMonth, settleMonthCheckin, settleWeek, settleWeekCheckin, tierFor } from "./achievements";
 import { attachGanttDrag } from "./gantt-drag";
-import { syncPlanTrackingToDiary, syncPoolTaskToDiary, writeReviewToDiary, writeSummaryToDiary, extractReviewSection, buildReviewPrefill, type TrackingItem } from "./diary-sync";
+import { syncPlanTrackingToDiary, syncPoolTaskToDiary, writeReviewToDiary, writeSummaryToDiary, extractReviewSection, buildReviewPrefill, extractNextDayPlanSection, writeNextDayPlanToDiary, type TrackingItem } from "./diary-sync";
 import { DEFAULT_PLAN_COLORS, type PlanTemplate } from "./settings";
 import type { BzgSnapshot } from "./bzg";
 import { diaryDayWritten, loadBzgSnapshot, readBzgDiaryText, reviewPoolSize, reviewedOn } from "./bzg";
@@ -116,6 +128,41 @@ function playAchievementSound(): void {
 		osc2.start(now);
 		osc2.stop(now + 0.4);
 		window.setTimeout(() => void ctx.close(), 800);
+	} catch {
+		/* 音效失败不影响功能 */
+	}
+}
+
+/** 份额清空提醒音效：WebAudio 合成「叮-咚」下行双音（E6→C6，零资源文件），与成就音的上行扫频区分。 */
+function playShareClearSound(): void {
+	try {
+		const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+		if (!Ctx) return;
+		const ctx = new Ctx();
+		const now = ctx.currentTime;
+		// 「叮」E6（1318.5Hz）短音
+		const ding = ctx.createOscillator();
+		ding.type = "sine";
+		ding.frequency.setValueAtTime(1318.5, now);
+		const dingGain = ctx.createGain();
+		dingGain.gain.setValueAtTime(0.0001, now);
+		dingGain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+		dingGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+		ding.connect(dingGain).connect(ctx.destination);
+		ding.start(now);
+		ding.stop(now + 0.3);
+		// 「咚」C6（1046.5Hz）接续长音
+		const dong = ctx.createOscillator();
+		dong.type = "sine";
+		dong.frequency.setValueAtTime(1046.5, now + 0.18);
+		const dongGain = ctx.createGain();
+		dongGain.gain.setValueAtTime(0.0001, now + 0.18);
+		dongGain.gain.exponentialRampToValueAtTime(0.16, now + 0.22);
+		dongGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+		dong.connect(dongGain).connect(ctx.destination);
+		dong.start(now + 0.18);
+		dong.stop(now + 0.65);
+		window.setTimeout(() => void ctx.close(), 900);
 	} catch {
 		/* 音效失败不影响功能 */
 	}
@@ -618,15 +665,27 @@ interface GoalInput {
 	floor?: number;
 	/** ADR-0009: weave 阅读器联动——来源书 sid + 接续阅读预勾叶数 + 每叶锚点快照。 */
 	reader?: { sid: string; resumeLeaves: number; anchors?: { spine: number; href: string; progress?: number }[] };
+	/** ADR-0010 写作模式·按字数：总量 + 接续已累计字数（floor 由保存链按窗口冻结计算）。 */
+	writingQuota?: { total: number; initial: number };
+	/** ADR-0010 写作模式·按章节：接续预勾章数（与接续阅读同一预勾实现）。 */
+	resumeLeaves?: number;
+	/** ADR-0016 生活模式：固定日子式周期 + 逾期策略（postpone 落盘，缺省放弃）。 */
+	cycle?: GoalCycle;
+	overdue?: ChoreOverdue;
 }
 
-/** 目标模式展示元数据（ADR-0006）。 */
+/** 目标模式展示元数据（ADR-0006/0010/0016）。 */
 const GOAL_MODE_META: Record<GoalMode, { emoji: string; label: string; desc: string }> = {
 	reading: { emoji: "📖", label: "阅读书籍", desc: "按书籍结构逐节拆解，自动安排阅读时长" },
+	writing: { emoji: "✍️", label: "写小说", desc: "按字数（每日配额）或按章节（逐章任务）量化，下拉选择" },
 	review: { emoji: "🔁", label: "复习", desc: "每天至少复习 N 篇文献，实际量自动来自 BZG" },
 	diary: { emoji: "📝", label: "日记", desc: "每天至少一篇日记，检测到当天有亲手写下的内容即自动打钩" },
 	exercise: { emoji: "🏃", label: "运动", desc: "每日运动打卡，可附记时长或次数" },
+	chore: { emoji: "🏠", label: "生活", desc: "洗碗、做卫生、买菜等：按固定日子循环（每天/每周日/每月几号/每年某日），漏了可放弃或顺延" },
 };
+
+/** ADR-0016: 生活事项的承载计划名（保存时缺则自动创建，label 🏠）。 */
+const CHORE_PLAN_NAME = "日常生活";
 
 /** 运动模式常用单位（下拉直选；「自定义…」兜底任意单位词）。 */
 const EXERCISE_UNITS = ["次", "组", "分钟", "小时", "公里", "千卡"];
@@ -686,6 +745,8 @@ export class PlanBoardView extends ItemView {
 	private bzgSnapshot: BzgSnapshot | null = null;
 	/** ADR-0006: 当前模式目标清单（实按钮判定/自动勾选；buildHomeData 时重建）。 */
 	private modeGoals: { plan: string; goal: PlanGoal; label: string }[] = [];
+	/** ADR-0016: 生活事项挂账事实（`${plan}|${name}` → 有旧挂账未清），ensureChoreTracking 重建，逾期徽标判定用。 */
+	private choreDebtMap = new Map<string, boolean>();
 	/** ADR-0009: weave 阅读器桥（设置开关门控；fork 缺席/形状不符为 null）。 */
 	private weaveBridge: WeaveBridgeApi | null = null;
 	/** ADR-0009: sid → 叶序锚点缓存（spine 章序 + href；结构与目录形状一致才缓存，null = 形状不符）。 */
@@ -705,6 +766,8 @@ export class PlanBoardView extends ItemView {
 	private summaryEl: HTMLTextAreaElement | null = null;
 	/** 打卡自动生成区（完成/未完成/鼓励语，v1.4）。 */
 	private summaryAutoEl: HTMLElement | null = null;
+	/** ADR-0014: 「昨日留的计划」只读块（昨日日记「# 次日计划」的实时侧读展示）。 */
+	private yesterdayPlanEl: HTMLElement | null = null;
 	private progressNumberEl: HTMLElement | null = null;
 	private todayBadgeEl: HTMLElement | null = null;
 	private progressFillEl: HTMLElement | null = null;
@@ -921,7 +984,8 @@ export class PlanBoardView extends ItemView {
 		this.quotaPlanSet = new Set(this.planProgress.filter((p) => p.isQuota).map((p) => p.plan));
 		this.modeGoals = this.planProgress.flatMap((p) =>
 			p.goals
-				.filter((g) => g.mode && g.mode !== "reading")
+				// ADR-0006/0010: 模式目标每日行走惰性补写；写作按章节是任务池口径，无每日行
+				.filter((g) => g.mode && g.mode !== "reading" && !(g.mode === "writing" && !g.writingQuota))
 				.map((g) => ({ plan: p.plan, goal: g, label: p.label }))
 		);
 	}
@@ -989,20 +1053,23 @@ export class PlanBoardView extends ItemView {
 
 	/**
 	 * v2.7: 今日打卡默认项 = 年度计划里 daily 计划的自动推导（无独立模板数据）。
-	 * name = "{label} {计划名}"、duration = action、复盘计划自动带复盘链接。
+	 * name = "{label} {计划名}"、duration = action。
+	 * ADR-0014: 复盘计划不再自动追加 `→ [[{date} 复盘]]` 链接——写复盘自 ADR-0004 扩展三
+	 * 起写入日记，链接目标文件从不存在，天天挂空链；手动建项的「含复盘链接」开关不受影响。
 	 */
 	private async buildDefaultCheckItems(): Promise<PlanTemplate[]> {
 		const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
 		const defs = await this.readAnnualPlanDefs(root, this.today.slice(0, 4));
 		if (!defs) return [];
 		return defs
-			.filter((d) => d.daily && d.type !== "quota") // ADR-0001: quota 计划的每日行由配额惰性生成，不进模板推导
+			// ADR-0001: quota 计划的每日行由配额惰性生成，不进模板推导
+			// ADR-0016: 生活计划的父行/事项行由 ensureChoreTracking 惰性生成——空日整计划不出现
+			.filter((d) => d.daily && d.type !== "quota" && !hasChoreGoal(d))
 			.map((d) => ({
 				name: composeCheckItemName(d.label, d.name),
 				duration: d.action ?? "",
 				plan: d.name,
-				// tradingDay 现在只表示「打卡率按工作日统计」（ADR-0005 v3），不再附带复盘链接
-				includeReview: d.name === "复盘",
+				includeReview: false,
 			}));
 	}
 
@@ -1034,9 +1101,10 @@ export class PlanBoardView extends ItemView {
 				name: d.name,
 				target: d.target,
 				targetCount: d.targetCount,
-				// ADR-0006: 模式目标（复习/日记/运动）不进任务池分解引擎，只有阅读/通用目标分解
+				// ADR-0006/0010: 模式目标不进任务池分解引擎（复习/日记/运动/写作按字数），
+				// 阅读与写作按章节（无字数配额 = structure 平铺）分解
 				goals: d.goals
-					.filter((g) => !g.mode || g.mode === "reading")
+					.filter((g) => !g.mode || g.mode === "reading" || (g.mode === "writing" && !g.writingQuota))
 					.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure })),
 			}));
 		if (autoPlans.length === 0) return;
@@ -1097,7 +1165,8 @@ export class PlanBoardView extends ItemView {
 	 * - 复习：BZG 今日实际复习篇数 → 写 `（实 M{unit}）`，M ≥ 当日下限自动勾选
 	 * - 日记：当天日记日文件有亲手写下的内容（随笔/触动点）→ 自动勾选
 	 * - 运动：无自动（手动打卡 +「实」记录）
-	 * 手动优先（`✋` 标记行一律跳过；未达下限也照实记录实际量）。
+	 * 事实优先（ADR-0011）：勾选/实数是完成事实的镜像，手动勾退不豁免——刷新即按事实回填；
+	 * 未达下限也照实记录实际量（不勾选）。模式行存量 `✋` 顺带清除。
 	 */
 	private async ensureModeGoalTracking(): Promise<void> {
 		if (this.modeGoals.length === 0) return;
@@ -1109,11 +1178,11 @@ export class PlanBoardView extends ItemView {
 			spec: ModeLineSpec;
 			mode: GoalMode;
 			floor: number;
-			/** 本轮自动逻辑应用后，该子行的最终勾选态（父行级联判定用）。 */
-			finalChecked?: boolean;
 		}
 		const autos: AutoOp[] = [];
 		for (const { plan, goal, label } of this.modeGoals) {
+			// ADR-0016: 生活事项的惰性补写走 ensureChoreTracking（该做日 + 逾期挂账），不日日出行
+			if (goal.mode === "chore") continue;
 			const start = goal.start || period.start;
 			const end = goal.end || period.end;
 			if (this.today < start || this.today > end) continue;
@@ -1153,8 +1222,9 @@ export class PlanBoardView extends ItemView {
 					const text = m[2].trim();
 					const op = autos.find((a) => m[3] === a.spec.plan && matchesModeLine(text, a.spec.name, a.spec.floor, a.spec.unit));
 					if (!op) continue;
-					if (line.includes(MANUAL_MARK)) continue; // 手动优先：✋ 行自动逻辑绝不碰
 					const checkedNow = m[1] === "x";
+					// ADR-0011 事实优先：✋ 不再豁免模式行；每行至多一个写回操作（防 expectedRaw 定位互踩）
+					let pushed = false;
 					if (op.mode === "review" && bzg) {
 						const count = reviewedOn(bzg, today);
 						const cur = parseQuotaActual(text);
@@ -1163,54 +1233,29 @@ export class PlanBoardView extends ItemView {
 							const raw = line;
 							const idx = i;
 							ops.push((acc) => setQuotaActual(acc, idx, count, op.spec.unit, shouldCheck, raw));
-							op.finalChecked = shouldCheck;
+							pushed = true;
 						} else {
-							op.finalChecked = checkedNow || shouldCheck;
 							if (shouldCheck && !checkedNow) {
 								const raw = line;
 								const idx = i;
 								ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
+								pushed = true;
 							}
 						}
 					} else if (op.mode === "diary" && diaryWrittenToday && !checkedNow) {
 						const raw = line;
 						const idx = i;
 						ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
-						op.finalChecked = true;
-					} else {
-						op.finalChecked = checkedNow;
+						pushed = true;
 					}
-				}
-				// ADR-0006: 自动勾满某计划的全部模式子行 → 父打卡行自动勾（与手动级联同款）。
-				// 前提：该计划无待办任务池子任务（混合计划以任务池为准）；父行带 ✋ 手动豁免则跳过。
-				const planDone = new Map<string, boolean>();
-				for (const a of autos) {
-					const prev = planDone.get(a.spec.plan);
-					planDone.set(a.spec.plan, (prev === undefined ? true : prev) && (a.finalChecked ?? false));
-				}
-				const parentDone = new Set<string>();
-				let inCheck2 = false;
-				for (let i = 0; i < lines.length; i++) {
-					const line = lines[i];
-					if (/^##\s/.test(line)) {
-						inCheck2 = line.startsWith(CHECK_HEADING);
-						continue;
-					}
-					if (!inCheck2) continue;
-					const m = TASK_LINE_RE.exec(line);
-					if (!m || !m[3]) continue;
-					const plan = m[3];
-					if (!planDone.get(plan) || parentDone.has(plan)) continue;
-					const text = m[2].trim();
-					if (autos.some((a) => a.spec.plan === plan && matchesModeLine(text, a.spec.name, a.spec.floor, a.spec.unit))) continue;
-					parentDone.add(plan); // 同计划只认第一个非模式行作父行
-					const allDone = planDone.get(plan) === true && this.pendingPoolChildren(plan).length === 0;
-					if (m[1] !== "x" && !line.includes(MANUAL_MARK) && allDone) {
+					if (!pushed && line.includes(MANUAL_MARK)) {
 						const raw = line;
 						const idx = i;
-						ops.push((acc) => toggleTaskLine(acc, idx, true, raw));
+						ops.push((acc) => clearManualMark(acc, idx, raw));
 					}
 				}
+				// ADR-0006/0013: 「勾满模式子行/清空任务池待办 → 父行自动勾」已上移到
+				// ensureParentRollup（刷新链在模式回填之后统一对账，全计划同一把尺）。
 				return ops.reduce((acc, fn) => fn(acc), out);
 			});
 		} finally {
@@ -1218,8 +1263,214 @@ export class PlanBoardView extends ItemView {
 		}
 	}
 
+	/**
+	 * ADR-0013: 刷新期父行对账——把「待办清空 → 勾父」（ADR-0003/0008）从今日打卡的
+	 * 两条交互路径推广到一切勾选来源（阅读联动自动勾、周/月/年卡勾任务、外部编辑）。
+	 * 挂在今日刷新链上（所有来源都经 refreshToday 收敛），在模式回填
+	 * （ensureModeGoalTracking）之后跑：文件里模式子行已是事实态，父行判定全依文件 +
+	 * 任务池快照。单向镜像：手动取消父行不落豁免，事实未变时刷新即重勾；要长期免勾
+	 * 可在父行手加 ✋（本对账沿用的豁免记号）。幂等：已勾/✋/非活窗口计划一律跳过。
+	 */
+	private async ensureParentRollup(): Promise<void> {
+		const file = this.getTodayFile();
+		if (!file) return;
+		const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
+		const year = this.today.slice(0, 4);
+		const period = (await readPlanPeriod(this.app, root, year)) ?? { start: `${year}-01-01`, end: `${year}-12-31` };
+		const today = this.today;
+		// 活窗口守卫：任一目标今日在窗内才参与对账（与模式回填的窗口口径一致）；
+		// 纯打卡行/定额行无目标 → 恒不自动勾，窗口已过的计划也不再日日白勾。
+		// ADR-0015: 复盘行例外——它的完成事实 = 今天日记「# 当日复盘」小节非空
+		//（文件事实：写复盘弹窗写入、直接在日记手写都算），factDone 直通勾父行。
+		let reviewFactDone = false;
+		const diaryDir = this.plugin.settings.diaryDir.replace(/\/+$/, "").trim();
+		if (diaryDir) {
+			const df = this.app.vault.getAbstractFileByPath(`${diaryDir}/${today}.md`);
+			if (df instanceof TFile) {
+				const body = extractReviewSection(await this.app.vault.cachedRead(df));
+				reviewFactDone = body !== null && body.trim() !== "";
+			}
+		}
+		const facts: ParentRollupFact[] = this.planProgress.map((p) => ({
+			plan: p.plan,
+			// ADR-0016: 生活计划父行不进对账——生活事项无事实镜像（Q5a），手动取消父行是终态，
+			// 勾满事项自动勾父走 toggleCheckItem 交互级联（ADR-0003/0006 同款）
+			live: !hasChoreGoal(p) && p.goals.some((g) => (g.start || period.start) <= today && today <= (g.end || period.end)),
+			pendingEmpty: this.pendingPoolChildren(p.plan).length === 0,
+			...(p.plan === "复盘" ? { factDone: reviewFactDone } : {}),
+		}));
+		const isModeLineText = (plan: string, text: string): boolean =>
+			this.modeGoals.some((mg) => mg.plan === plan && matchesModeLine(text, mg.goal.name, mg.goal.floor ?? 0, mg.goal.unit || ""));
+		// 常态无账可对：先用缓存读预检，避免无谓写文件；写回前在进程回调内对最新内容重扫（防竞态错位）。
+		const pre = parentCheckTargets(await this.app.vault.cachedRead(file), facts, isModeLineText);
+		if (pre.length === 0) return;
+		this.selfWrite = true;
+		try {
+			await this.app.vault.process(file, (data) => {
+				const targets = parentCheckTargets(data, facts, isModeLineText);
+				return targets.reduce((acc, t) => toggleTaskLine(acc, t.line, true, t.raw), data);
+			});
+		} finally {
+			this.selfWrite = false;
+		}
+	}
+
+	/** ADR-0016: 该计划是否生活计划（含生活事项目标）。 */
+	private isChorePlan(plan: string | null): boolean {
+		if (!plan) return false;
+		return this.planProgress.some((p) => p.plan === plan && hasChoreGoal(p));
+	}
+
+	/**
+	 * ADR-0016: 一次扫描今日打卡区该计划的行型（父行 / 事项行 / 未勾事项行的行号）。
+	 * 父行 = 不匹配任何事项名的打卡行；事项行 = matchesModeLine 精确匹配。
+	 */
+	private choreLineShapes(
+		content: string,
+		plan: string,
+		itemNames: string[]
+	): { hasParent: boolean; hasItem: boolean; uncheckedItemLines: { line: number; raw: string }[] } {
+		let hasParent = false;
+		let hasItem = false;
+		const uncheckedItemLines: { line: number; raw: string }[] = [];
+		let inCheck = false;
+		const lines = content.split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			if (/^##\s/.test(line)) {
+				inCheck = line.startsWith(CHECK_HEADING);
+				continue;
+			}
+			if (!inCheck) continue;
+			const m = TASK_LINE_RE.exec(line);
+			if (!m || m[3] !== plan) continue;
+			const isItem = itemNames.some((n) => matchesModeLine(m[2].trim(), n, 0, ""));
+			if (isItem) {
+				hasItem = true;
+				if (m[1] !== "x") uncheckedItemLines.push({ line: i, raw: line });
+			} else {
+				hasParent = true;
+			}
+		}
+		return { hasParent, hasItem, uncheckedItemLines };
+	}
+
+	/**
+	 * ADR-0016: 生活事项今日行惰性补写（该做日 + 逾期挂账）+ 父行自愈 + 陈旧挂账清除。
+	 * - 该做日：isChoreDueOn(cycle, today) → 出行
+	 * - 逾期挂账：overdue=postpone 且最近一个该做日至今（不含今天）回扫无已勾行 → 出行；
+	 *   挂账事实记入 choreDebtMap（渲染逾期徽标用——该做日恰逢旧挂账、每天周期也能亮标）。
+	 *   勾一次清全部挂账（回扫命中即视为已清）。
+	 * - 陈旧挂账：非 postpone 事项在非该做日仍留有未勾行（策略刚从往后延改回放弃）→ 移除
+	 *   （共识：策略改放弃时当前挂账立即消失；仅删今日未勾行，已勾记录与历史文件不动）。
+	 * - 父行：今日有事项行（现存的或本次要补的）而父行缺失时补写（父行 = 大项口径顶层行）；
+	 *   空日（无该做、无挂账）整计划不出行——不进今日进度分母、不断连击。
+	 * 幂等：只在今日文件补缺失行/删陈旧未勾行，绝不回写历史（与 quota/模式行同铁律）。
+	 */
+	private async ensureChoreTracking(): Promise<void> {
+		const chorePlans = this.planProgress.filter((p) => hasChoreGoal(p));
+		if (chorePlans.length === 0) return;
+		const file = this.getTodayFile();
+		if (!file) return;
+		const today = this.today;
+		const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
+		const prefix = `${root}/${yearDirName(today.slice(0, 4))}/每日/`;
+		const yesterday = formatDate(addDays(parseDateString(today), -1));
+		// 今日应出行的事项（该做 or 挂账）+ 挂账事实（徽标判定）
+		const dueSpecs = new Map<string, { names: string[]; label: string; specs: ChoreLineSpec[] }>();
+		const staleSpecs = new Map<string, { names: string[]; label: string; specs: ChoreLineSpec[] }>();
+		this.choreDebtMap = new Map();
+		for (const p of chorePlans) {
+			for (const g of p.goals) {
+				if (g.mode !== "chore") continue;
+				const cycle: GoalCycle = g.cycle ?? { unit: "day", days: [] };
+				if (isChoreDueOn(cycle, today)) {
+					if (g.overdue === "postpone") {
+						// 该做日也可能带着旧挂账（上期漏了今天该做）——徽标照实亮
+						const lastDue = prevChoreOccurrence(cycle, yesterday);
+						const debt = !(await scanChoreHit(this.app, prefix, p.plan, g.name, lastDue, yesterday, true));
+						if (debt) this.choreDebtMap.set(`${p.plan}|${g.name}`, true);
+					}
+					this.addChoreSpec(dueSpecs, p.plan, p.label, g.name);
+					continue;
+				}
+				if (g.overdue !== "postpone") continue;
+				const lastDue = prevChoreOccurrence(cycle, yesterday);
+				if (await scanChoreHit(this.app, prefix, p.plan, g.name, lastDue, yesterday, true)) continue;
+				this.choreDebtMap.set(`${p.plan}|${g.name}`, true);
+				this.addChoreSpec(dueSpecs, p.plan, p.label, g.name);
+			}
+		}
+		const content = await this.app.vault.cachedRead(file);
+		// 陈旧挂账行（非 postpone 且今天不该做）→ 待删
+		for (const p of chorePlans) {
+			for (const g of p.goals) {
+				if (g.mode !== "chore" || g.overdue === "postpone") continue;
+				const cycle: GoalCycle = g.cycle ?? { unit: "day", days: [] };
+				if (isChoreDueOn(cycle, today)) continue;
+				this.addChoreSpec(staleSpecs, p.plan, p.label, g.name);
+			}
+		}
+		// 预检：要补的行（缺失事项 + 缺父行）或要删的陈旧行，有一才写
+		let needsWrite = staleSpecs.size > 0;
+		for (const [plan, info] of dueSpecs) {
+			const missing = missingChoreLines(content, info.specs, today);
+			const { hasParent, hasItem } = this.choreLineShapes(content, plan, info.names);
+			if (missing.length > 0 || (hasItem && !hasParent)) needsWrite = true;
+		}
+		if (!needsWrite) return;
+		this.selfWrite = true;
+		try {
+			await this.app.vault.process(file, (data) => {
+				let out = data;
+				// 先补/删，行号重算一次完成：删除按 expectedRaw 定位（行漂移安全）
+				for (const [, info] of staleSpecs) {
+					const { uncheckedItemLines } = this.choreLineShapes(out, info.specs[0].plan, info.names);
+					for (const stale of info.specs) {
+						const hit = uncheckedItemLines.find((l) => matchesModeLine(TASK_LINE_RE.exec(l.raw)?.[2]?.trim() ?? "", stale.name, 0, ""));
+						if (hit) out = removeLine(out, hit.line, hit.raw);
+					}
+				}
+				for (const [plan, info] of dueSpecs) {
+					if (!this.choreLineShapes(out, plan, info.names).hasParent) {
+						// 父行先于事项行（文件序 = 展示序：父行在上、事项折叠其下）
+						const parentLine = buildCheckLine({
+							name: composeCheckItemName(info.label, plan),
+							duration: "",
+							plan,
+							includeReview: false,
+							date: today,
+						});
+						out = appendCheckItem(out, parentLine);
+					}
+					const missing = missingChoreLines(out, info.specs, today);
+					out = missing.reduce((acc, line) => appendCheckItem(acc, line), out);
+				}
+				return out;
+			});
+		} finally {
+			this.selfWrite = false;
+		}
+	}
+
+	/** ADR-0016: 按计划聚合今日应出行/待删的事项规格（Map upsert）。 */
+	private addChoreSpec(
+		map: Map<string, { names: string[]; label: string; specs: ChoreLineSpec[] }>,
+		plan: string,
+		label: string,
+		name: string
+	): void {
+		const cur = map.get(plan) ?? { names: [], label: label ?? "", specs: [] };
+		cur.names.push(name);
+		cur.specs.push({ plan, name });
+		if (label) cur.label = label;
+		map.set(plan, cur);
+	}
+
 	private async refreshToday(): Promise<void> {
 		await this.buildHomeData();
+		// 份额清空提醒：须先于任何音效位（任务卡徽章/今日徽章的成就音在本轮可能升档）
+		this.detectShareClears();
 		await this.updateStreak();
 		this.updateHomeDate();
 
@@ -1238,6 +1489,10 @@ export class PlanBoardView extends ItemView {
 		await this.ensureQuotaCheckItemsForToday();
 		// ADR-0006: 模式目标（复习/日记/运动）行惰性补写 + BZG 自动写实量/自动勾选
 		await this.ensureModeGoalTracking();
+		// ADR-0016: 生活事项该做日/逾期挂账行惰性补写 + 父行自愈（空日整计划不出现）
+		await this.ensureChoreTracking();
+		// ADR-0013: 父行对账（待办清空 → 勾父，一切勾选来源统一收敛；须在模式回填后跑）
+		await this.ensureParentRollup();
 
 		const file = this.getTodayFile();
 		if (!file) {
@@ -1253,6 +1508,8 @@ export class PlanBoardView extends ItemView {
 		this.updateProgress();
 		this.updateChecklist();
 		this.updateSummary();
+		// ADR-0014: 侧读昨日日记「# 次日计划」到总结卡只读块
+		void this.updateYesterdayPlan();
 		// ADR-0004 扩展: 今日打卡计划项全量镜像到日记「## 完成情况跟踪」（含未勾选）
 		void this.syncTrackingToDiary();
 	}
@@ -1356,6 +1613,8 @@ export class PlanBoardView extends ItemView {
 		summaryHeader.createDiv({ cls: "planboard-card-title", text: "📝 今日总结" });
 		// v1.4: 打卡自动生成区（完成/未完成/鼓励语，只读展示，不写文件）
 		this.summaryAutoEl = summaryCard.createDiv({ cls: "planboard-summary-auto" });
+		// ADR-0014: 「昨日留的计划」只读块——实时侧读昨日日记「# 次日计划」（无文件/无小节整块隐藏）
+		this.yesterdayPlanEl = summaryCard.createDiv({ cls: "planboard-yesterday-plan planboard-hidden" });
 		this.summaryEl = summaryCard.createEl("textarea", {
 			cls: "planboard-summary-input",
 			attr: { placeholder: "今天完成了什么？写点什么吧…" },
@@ -1368,12 +1627,14 @@ export class PlanBoardView extends ItemView {
 			void this.saveSummary();
 		});
 		// v1.4: 复盘入口移到总结区底部（不占 header）
-		// v1.7.5: 底部按钮排——「写入备注」+「写复盘」并排（flex 行，各占一半）
+		// v1.7.5: 底部按钮排——并排 flex 行（ADR-0014 起三枚：「写入备注」「写复盘」「次日计划」，各占三分之一）
 		const summaryActions = summaryCard.createDiv({ cls: "planboard-summary-actions" });
 		const writeBtn = summaryActions.createEl("button", { cls: "planboard-btn planboard-btn-outline planboard-review-btn", text: "📥 写入备注" });
 		writeBtn.addEventListener("click", () => void this.writeSummaryToDiary());
 		const reviewBtn = summaryActions.createEl("button", { cls: "planboard-btn planboard-btn-outline planboard-review-btn planboard-review-bottom", text: "📝 写复盘 →" });
 		reviewBtn.addEventListener("click", () => this.openReviewModal());
+		const nextDayBtn = summaryActions.createEl("button", { cls: "planboard-btn planboard-btn-outline planboard-review-btn planboard-review-bottom", text: "📆 次日计划" });
+		nextDayBtn.addEventListener("click", () => void this.openNextDayPlanModal(this.today));
 		// v1.4: 总结卡也可拖底部调高（textarea flex 填充），与打卡卡联动同步
 		if (this.plugin.settings.summaryCardHeight > 0) summaryCard.style.height = `${this.plugin.settings.summaryCardHeight}px`;
 		attachResizeHandle(summaryCard, summaryCard, this.plugin, "summaryCardHeight", {
@@ -1484,12 +1745,12 @@ export class PlanBoardView extends ItemView {
 		attachPlanSort(card, container, this.plugin, plan, cols);
 	}
 
-	/** 🔥 连续打卡天数：从昨天往前数，每天全部打卡勾选才计一天。X=0 不显示。 */
+	/** 🔥 连续打卡天数：从昨天往前数，每天全部大项完成才计一天（ADR-0012 大项口径）。 */
 	private async updateStreak(): Promise<void> {
 		if (!this.streakEl) return;
 		const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
 		const year = this.today.slice(0, 4);
-		const streak = await computeStreak(this.app, root, year, this.today);
+		const streak = await computeStreak(this.app, root, year, this.today, (it) => this.modeLineMatch(it) !== null);
 		if (streak > 0) {
 			this.streakEl.setText(`🔥 连续打卡 ${streak} 天`);
 			this.streakEl.removeClass("planboard-hidden");
@@ -1533,7 +1794,8 @@ export class PlanBoardView extends ItemView {
 			if (tier.cls !== prev && prev !== "") {
 				el.addClass("planboard-badge-pop");
 				window.setTimeout(() => el.removeClass("planboard-badge-pop"), 700);
-				if (this.plugin.settings.achievementSound) playAchievementSound();
+				// 份额清空音本轮已播则让位（同刷新只播一个音，防双音叠糊；下轮成就音照常）
+				if (this.plugin.settings.achievementSound && !this.shareChimeThisCycle) playAchievementSound();
 			}
 			const pct = total === 0 ? 0 : Math.round((done / total) * 100);
 			el.setAttribute("title", `完成率 ${pct}%（${total > 0 ? `${done}/${total}` : "暂无任务"}），达成${tier.qualifier}`);
@@ -1549,11 +1811,16 @@ export class PlanBoardView extends ItemView {
 	private lastTierKey = "";
 	/** 今日徽章是否已初始化（首次渲染不播音效，v1.4）。 */
 	private badgeInitialized = false;
+	/** 份额清空提醒：上一轮各书「今日份额已清空」快照（键 = 计划名||书名）；null = 首轮基线（不提醒）。 */
+	private shareClearSnapshot: Map<string, boolean> | null = null;
+	/** 本轮刷新是否播了份额清空音——true 则成就音本轮让位一次（同刷新只播一个音）。 */
+	private shareChimeThisCycle = false;
 
 	private updateProgress(): void {
-		const checks = this.dailyData?.checkItems ?? [];
-		const done = checks.filter((c) => c.checked).length;
-		const total = checks.length;
+		// ADR-0012 大项口径：顶层计划行计数，模式子行折叠进父行（与渲染嵌套同一把尺）
+		const rows = topLevelCheckRows(this.dailyData?.checkItems ?? [], (it) => this.modeLineMatch(it) !== null);
+		const done = rows.filter((r) => r.done).length;
+		const total = rows.length;
 		const pct = total === 0 ? 0 : Math.round((done / total) * 100);
 		this.progressNumberEl?.setText(total === 0 ? "0/0" : `${done}/${total}`);
 		// Dynamic width is the only in-DOM value; the 200ms animation comes from CSS.
@@ -1577,7 +1844,8 @@ export class PlanBoardView extends ItemView {
 					void this.todayBadgeEl.offsetWidth;
 					this.todayBadgeEl.addClass("planboard-badge-pop");
 					window.setTimeout(() => this.todayBadgeEl?.removeClass("planboard-badge-pop"), 800);
-					if (this.plugin.settings.achievementSound) playAchievementSound();
+					// 份额清空音本轮已播则让位（同刷新只播一个音，防双音叠糊；下轮成就音照常）
+				if (this.plugin.settings.achievementSound && !this.shareChimeThisCycle) playAchievementSound();
 				}
 				this.badgeInitialized = true;
 				this.todayBadgeEl.setAttribute("title", `今日完成率 ${pct}%，达成${tier.qualifier}`);
@@ -1589,28 +1857,40 @@ export class PlanBoardView extends ItemView {
 		}
 	}
 
+	/**
+	 * 份额清空提醒（CONTEXT.md 术语）：每轮刷新对「今日有安排的书」做清空态快照对比，
+	 * false → true 跃迁即提醒（提示音 + Notice，同批多书合并一条）。挂在数据读取后、
+	 * 任何音效位之前——成就音据此让位一轮；首轮基线不提醒。四条勾选路径（手动勾、
+	 * 推进自动勾、联动回写、书行连带）统一经刷新收敛到此处检测，不在勾选侧各埋钩子。
+	 */
+	private detectShareClears(): void {
+		this.shareChimeThisCycle = false;
+		const entries: ShareClearEntry[] = [];
+		for (const p of this.planProgress) {
+			for (const g of this.computeBookView(p.plan).scheduled) {
+				entries.push({ key: `${p.plan}||${g.name}`, name: g.name, cleared: g.pending.length === 0 });
+			}
+		}
+		const { next, cleared } = diffShareClear(this.shareClearSnapshot, entries);
+		this.shareClearSnapshot = next;
+		if (cleared.length === 0) return;
+		this.shareChimeThisCycle = true;
+		if (!this.plugin.settings.shareChime) return;
+		playShareClearSound();
+		const copy = cleared.length === 1
+			? `📖《${cleared[0]}》今日阅读计划已完成 ✅`
+			: `📖 ${cleared.length} 本书的今日计划已完成：${cleared.map((n) => `《${n}》`).join("")}`;
+		new Notice(copy, 4000);
+	}
+
 	private updateChecklist(): void {
 		if (!this.dailyData || !this.checklistEl) return;
 		this.checklistEl.empty();
 		// ADR-0006: 模式行嵌套——同计划有父打卡项（非模式行）时，模式行渲染为其子项；
 		// 无父行（计划 daily=false / 默认行被删）时保持顶层原样。
-		const modeChildren = new Set<CheckItem>();
-		const childrenOf = new Map<CheckItem, CheckItem[]>();
-		for (const item of this.dailyData.checkItems) {
-			if (!this.modeLineMatch(item)) continue;
-			const parent = this.modeParentOf(item);
-			if (!parent || parent === item) continue;
-			modeChildren.add(item);
-			let arr = childrenOf.get(parent);
-			if (!arr) {
-				arr = [];
-				childrenOf.set(parent, arr);
-			}
-			arr.push(item);
-		}
-		for (const item of this.dailyData.checkItems) {
-			if (modeChildren.has(item)) continue;
-			this.checklistEl.appendChild(this.renderCheckItem(item, childrenOf.get(item) ?? []));
+		// ADR-0012: 嵌套规则收敛到 topLevelCheckRows（与进度计数同一实现，防两把尺漂移）。
+		for (const row of topLevelCheckRows(this.dailyData.checkItems, (it) => this.modeLineMatch(it) !== null)) {
+			this.checklistEl.appendChild(this.renderCheckItem(row.item, row.modeChildren));
 		}
 	}
 
@@ -1672,12 +1952,41 @@ export class PlanBoardView extends ItemView {
 			const frac = label.createSpan({ cls: "planboard-book-fraction", text: `${done}/${bookView.scheduled.length} 本` });
 			frac.setAttribute("title", `今日书进度：${done}/${bookView.scheduled.length} 本已完成今日份额（逾期欠账清完才算完成）`);
 		}
+		// ADR-0016: 生活计划父行的今日事项分数（已勾事项 ÷ 今日文件中的事项行，含挂账）
+		if (item.plan && this.isChorePlan(item.plan) && modeChildren.length > 0) {
+			const done = modeChildren.filter((c) => c.checked).length;
+			const frac = label.createSpan({ cls: "planboard-book-fraction", text: `${done}/${modeChildren.length}` });
+			frac.setAttribute("title", `今日生活事项：${done}/${modeChildren.length} 已完成`);
+		}
 
 		const actions = li.createDiv({ cls: "planboard-item-actions" });
+		// ADR-0016: 生活计划父行——「＋」新增事项 /「☰」管理事项（增改删走小弹窗，年度计划.md 为事实源）
+		if (item.plan && this.isChorePlan(item.plan)) {
+			const addBtn = actions.createEl("button", {
+				cls: "planboard-icon-btn planboard-chore-add-btn",
+				attr: { "aria-label": "新增生活事项", title: "新增生活事项" },
+			});
+			addBtn.setText("＋");
+			addBtn.addEventListener("click", (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				this.openChoreItemModal(item.plan!, null);
+			});
+			const manageBtn = actions.createEl("button", {
+				cls: "planboard-icon-btn planboard-chore-manage-btn",
+				attr: { "aria-label": "管理生活事项", title: "管理生活事项（改周期/改名/删除）" },
+			});
+			manageBtn.setText("☰");
+			manageBtn.addEventListener("click", (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				this.openChoreManageModal(item.plan!);
+			});
+		}
 		// ADR-0001: quota 行追加「实际量」录入按钮（勾选 = 记满配额；填数 = 按实际累计）
-		// ADR-0006: 复习/运动模式行同样提供「实」按钮（复习下限/运动每日量语境）
+		// ADR-0006: 复习/运动模式行同样提供「实」按钮（复习下限/运动每日量语境）；生活事项无量无「实」
 		const modeHit = this.modeLineMatch(item);
-		if (item.plan && (this.quotaPlanSet.has(item.plan) || (modeHit && modeHit.goal.mode !== "diary"))) {
+		if (item.plan && (this.quotaPlanSet.has(item.plan) || (modeHit && modeHit.goal.mode !== "diary" && modeHit.goal.mode !== "chore"))) {
 			const actBtn = actions.createEl("button", {
 				cls: "planboard-icon-btn planboard-quota-actual-btn",
 				attr: { "aria-label": "记录实际量", title: "记录实际量" },
@@ -1748,7 +2057,14 @@ export class PlanBoardView extends ItemView {
 		cb.checked = item.checked;
 		cb.addEventListener("change", () => void this.toggleCheckItem(item, cb.checked));
 		label.createSpan({ cls: "planboard-check-text", text: item.text });
-		if (mg && mg.goal.mode !== "diary") {
+		// ADR-0016: 生活事项子行——逾期挂账徽标（ensureChoreTracking 回扫出的挂账事实，
+		// 该做日恰逢旧挂账、每天周期漏了也能亮标）+ 勾一次清账提示
+		if (mg?.goal.mode === "chore" && this.choreDebtMap.get(`${item.plan}|${mg.goal.name}`)) {
+			const cycle: GoalCycle = mg.goal.cycle ?? { unit: "day", days: [] };
+			const badge = label.createSpan({ cls: "planboard-chore-overdue", text: "逾期" });
+			badge.setAttribute("title", `${choreCycleLabel(cycle, mg.goal.overdue)}：有该做未做的挂账，勾一次即清账`);
+		}
+		if (mg && mg.goal.mode !== "diary" && mg.goal.mode !== "chore") {
 			const actions = li.createDiv({ cls: "planboard-item-actions" });
 			const actBtn = actions.createEl("button", {
 				cls: "planboard-icon-btn planboard-quota-actual-btn",
@@ -1930,17 +2246,12 @@ export class PlanBoardView extends ItemView {
 
 	private async toggleCheckItem(item: CheckItem, checked: boolean): Promise<void> {
 		if (!this.dailyData) return;
-		// ADR-0006/0007: 模式行手动勾/退勾 → 打 `✋` 标记（此后自动逻辑不再覆盖）
 		const modeHit = this.modeLineMatch(item);
 		const modeParent = modeHit ? this.modeParentOf(item) : null;
 		this.selfWrite = true;
 		try {
-			if (modeHit) {
-				await this.app.vault.process(item.file, (data) =>
-					markTaskLineManual(toggleTaskLine(data, item.line, checked, item.raw), item.line, undefined));
-			} else {
-				await this.app.vault.process(item.file, (data) => toggleTaskLine(data, item.line, checked, item.raw));
-			}
+			// ADR-0011: 模式行手动勾/退勾不再落 ✋——勾选是完成事实的镜像，刷新即按事实回填
+			await this.app.vault.process(item.file, (data) => toggleTaskLine(data, item.line, checked, item.raw));
 			// ADR-0006: 勾计划父行 → 级联勾掉该计划全部模式子行（不打 ✋——复习行的 BZG
 			// 自动实量随后照常写入）；取消父行不回退子行（与任务池子任务同语义）。
 			if (checked && !modeHit && item.plan) {
@@ -2035,7 +2346,7 @@ export class PlanBoardView extends ItemView {
 	}
 
 	/**
-	 * ADR-0006: 模式行实际量写回（手动 → 打 `✋`，此后自动逻辑不再覆盖该行）。
+	 * ADR-0006: 模式行实际量手动写回（BZG 缺席时的手动记录路径；ADR-0011 起不再落 `✋`）。
 	 * actual=0 = 记满当日下限并勾选；actual ≥ 下限自动勾选，未达下限照实记录不勾。
 	 */
 	private async applyModeGoalActual(
@@ -2051,7 +2362,7 @@ export class PlanBoardView extends ItemView {
 		let newContent: string;
 		try {
 			newContent = await this.app.vault.process(item.file, (data) =>
-				setQuotaActual(data, item.line, actual, unit, checked, item.raw, true));
+				setQuotaActual(data, item.line, actual, unit, checked, item.raw));
 		} finally {
 			this.selfWrite = false;
 		}
@@ -2138,21 +2449,22 @@ export class PlanBoardView extends ItemView {
 	/** v1.4: 打卡自动生成三行（✅完成数量 / ⬜未完成数量 / 💪鼓励语），只读展示不写文件。 */
 	private updateSummaryAuto(): void {
 		if (!this.summaryAutoEl || !this.dailyData) return;
-		const checks = this.dailyData.checkItems;
-		const done = checks.filter((c) => c.checked);
-		const pending = checks.filter((c) => !c.checked);
+		// ADR-0012 大项口径：与打卡卡进度同一把尺（并排两卡不得出现两个完成度）
+		const rows = topLevelCheckRows(this.dailyData.checkItems, (it) => this.modeLineMatch(it) !== null);
+		const done = rows.filter((r) => r.done).length;
+		const pending = rows.length - done;
 		this.summaryAutoEl.empty();
 
-		const total = checks.length;
+		const total = rows.length;
 		const doneLine = this.summaryAutoEl.createDiv({ cls: "planboard-summary-auto-line is-done" });
 		doneLine.createSpan({ cls: "planboard-summary-auto-label", text: "✅ 已完成" });
-		doneLine.createSpan({ cls: "planboard-summary-auto-text", text: `${done.length}/${total}` });
+		doneLine.createSpan({ cls: "planboard-summary-auto-text", text: `${done}/${total}` });
 
 		const pendLine = this.summaryAutoEl.createDiv({ cls: "planboard-summary-auto-line is-pending" });
 		pendLine.createSpan({ cls: "planboard-summary-auto-label", text: "⬜ 未完成" });
-		pendLine.createSpan({ cls: "planboard-summary-auto-text", text: `${pending.length}/${total}` });
+		pendLine.createSpan({ cls: "planboard-summary-auto-text", text: `${pending}/${total}` });
 
-		const pct = total === 0 ? 0 : Math.round((done.length / total) * 100);
+		const pct = total === 0 ? 0 : Math.round((done / total) * 100);
 		let cheer: string;
 		if (total === 0) cheer = "今天还没有打卡项，去添加一个吧";
 		else if (pct === 100) cheer = "全勤达成！今天的你闪闪发光";
@@ -2163,6 +2475,37 @@ export class PlanBoardView extends ItemView {
 		const cheerLine = this.summaryAutoEl.createDiv({ cls: "planboard-summary-auto-line is-cheer" });
 		cheerLine.createSpan({ cls: "planboard-summary-auto-label", text: "💪" });
 		cheerLine.createSpan({ cls: "planboard-summary-auto-text", text: cheer });
+	}
+
+	/**
+	 * ADR-0014: 「昨日留的计划」只读块——实时侧读昨日日记「# 次日计划」小节。
+	 * 零复制零同步：昨晚改了日记，今天看到的就是最新的（文件事实为准）。
+	 * 昨日日记不存在 / 无该节 / 内容空白 → 整块隐藏；严格只看昨日一天，不向前回溯。
+	 */
+	private async updateYesterdayPlan(): Promise<void> {
+		const el = this.yesterdayPlanEl;
+		if (!el) return;
+		const dir = this.plugin.settings.diaryDir.replace(/\/+$/, "").trim();
+		const yesterday = formatDate(addDays(parseDateString(this.today), -1));
+		let text: string | null = null;
+		if (dir) {
+			const f = this.app.vault.getAbstractFileByPath(`${dir}/${yesterday}.md`);
+			if (f instanceof TFile) text = extractNextDayPlanSection(await this.app.vault.cachedRead(f));
+		}
+		el.empty();
+		if (text === null || text.trim() === "") {
+			el.addClass("planboard-hidden");
+			return;
+		}
+		el.removeClass("planboard-hidden");
+		const head = el.createDiv({ cls: "planboard-yesterday-plan-head" });
+		head.createSpan({ cls: "planboard-yesterday-plan-title", text: "📌 昨日留的计划" });
+		const editBtn = head.createEl("button", {
+			cls: "planboard-btn planboard-btn-outline planboard-yesterday-plan-edit",
+			text: "去修改",
+		});
+		editBtn.addEventListener("click", () => void this.openNextDayPlanModal(yesterday));
+		el.createDiv({ cls: "planboard-yesterday-plan-body", text });
 	}
 
 	private async saveSummary(): Promise<void> {
@@ -2259,15 +2602,58 @@ export class PlanBoardView extends ItemView {
 	 */
 	private async openReviewModal(): Promise<void> {
 		const prefill = await this.loadReviewPrefill();
-		new ReviewModal(this.app, prefill, async (text) => {
-			const r = await writeReviewToDiary(this.app, this.plugin.settings.diaryDir, text);
-			if (r === "no-diary") {
-				new Notice(`未找到今日日记：${this.plugin.settings.diaryDir}/${this.today}.md`);
-			} else if (r === "no-anchor") {
-				new Notice("日记中未找到「# 随笔」小节，无法定位写入位置");
-			} else {
-				new Notice("复盘已写入日记「# 当日复盘」");
+		new ReviewModal(this.app, {
+			prefill,
+			onSubmit: async (text) => {
+				const r = await writeReviewToDiary(this.app, this.plugin.settings.diaryDir, text);
+				if (r === "no-diary") {
+					new Notice(`未找到今日日记：${this.plugin.settings.diaryDir}/${this.today}.md`);
+				} else if (r === "no-anchor") {
+					new Notice("日记中未找到「# 随笔」小节，无法定位写入位置");
+				} else {
+					new Notice("复盘已写入日记「# 当日复盘」");
+					// ADR-0015: 复盘事实已落盘 → 立即对账，复盘行即时勾上（不等下一次刷新）
+					await this.refreshToday();
+				}
+			},
+		}).open();
+	}
+
+	/**
+	 * ADR-0014: 「次日计划」弹窗——与写复盘同构，写入目标 = `date` 那天日记的「# 次日计划」小节。
+	 * 主按钮恒指今天（给明天排的计划）；视图只读块的「去修改」指昨天（改昨晚留给今天的）。
+	 * 预填：该日记已有小节正文 → 预填（替换语义防丢字）；否则空白（次日计划无固定骨架，Q8）。
+	 */
+	private async openNextDayPlanModal(date: string): Promise<void> {
+		const dir = this.plugin.settings.diaryDir.replace(/\/+$/, "").trim();
+		let prefill = "";
+		if (dir) {
+			const f = this.app.vault.getAbstractFileByPath(`${dir}/${date}.md`);
+			if (f instanceof TFile) {
+				const existing = extractNextDayPlanSection(await this.app.vault.cachedRead(f));
+				if (existing !== null) prefill = existing;
 			}
+		}
+		const isToday = date === this.today;
+		new ReviewModal(this.app, {
+			prefill,
+			title: isToday ? "📆 次日计划" : `📆 修改昨日次日计划（${date}）`,
+			hint: isToday
+				? "内容将写入今天日记「# 次日计划」小节（当日复盘之后）；明天打开今日视图会在总结卡上方看到。再次写入会替换内容。"
+				: `内容将写入 ${date} 日记「# 次日计划」小节；再次写入会替换内容。`,
+			emptyNotice: "次日计划内容为空，先写点什么",
+			onSubmit: async (text) => {
+				const r = await writeNextDayPlanToDiary(this.app, this.plugin.settings.diaryDir, text, date);
+				if (r === "no-diary") {
+					new Notice(`未找到${isToday ? "今日" : "该日"}日记：${this.plugin.settings.diaryDir}/${date}.md`);
+				} else if (r === "no-anchor") {
+					new Notice("日记中未找到「# 当日复盘」或「# 随笔」小节，无法定位写入位置");
+				} else {
+					new Notice(`次日计划已写入${isToday ? "今日" : ""}日记「# 次日计划」`);
+					// 只读块侧读的是昨天日记——写昨天（去修改入口）才可能变块内容
+					if (!isToday) await this.updateYesterdayPlan();
+				}
+			},
 		}).open();
 	}
 
@@ -3306,15 +3692,24 @@ export class PlanBoardView extends ItemView {
 			row.createSpan({ cls: "planboard-goal-mode-badge", attr: { title: `${modeMeta.label}模式：${modeMeta.desc}` }, text: modeMeta.emoji });
 		}
 		row.createDiv({ cls: "planboard-goal-name", text: goal.name });
-		// ADR-0006: 模式目标的计数文本走专属口径；阅读/通用沿用任务池口径
+		// ADR-0006/0010: 模式目标的计数文本走专属口径；阅读/通用沿用任务池口径
 		let countText = `${goal.done}/${goal.total} ${goal.unit || "个"}`;
 		if (goal.modeStats) {
 			const s = goal.modeStats;
 			if (s.mode === "review") countText = `达标 ${s.hitDays}/${s.dueDays} 天`;
 			else if (s.mode === "diary") countText = `完成 ${s.hitDays}/${s.dueDays} 天`;
+			else if (s.mode === "writing")
+				countText = `累计 ${formatQuotaAmount(s.totalAmount ?? 0)}/${formatQuotaAmount(s.quotaTotal ?? 0)}${s.quotaUnit || "字"}${s.quotaBehind ? " · 落后" : ""}`;
 			else countText = `打卡 ${s.hitDays}/${s.dueDays} 天`;
 		}
-		row.createDiv({ cls: "planboard-goal-count", text: countText });
+		const countDiv = row.createDiv({ cls: "planboard-goal-count", text: countText });
+		const ws = goal.modeStats?.mode === "writing" ? goal.modeStats : null;
+		if (ws?.quotaDaily) {
+			countDiv.setAttribute(
+				"title",
+				`每日配额 ${formatQuotaAmount(ws.quotaDaily)}${ws.quotaUnit || "字"}；动笔 ${ws.hitDays}/${ws.dueDays} 天${ws.quotaInitial ? `（接续初始 ${formatQuotaAmount(ws.quotaInitial)}${ws.quotaUnit || "字"}）` : ""}${ws.quotaBehind ? "；进度落后，多写几笔追上" : ""}`
+			);
+		}
 		const bar = row.createDiv({ cls: "planboard-goal-bar" });
 		const fill = bar.createDiv({ cls: "planboard-progress-fill" });
 		fill.style.width = `${goal.percent}%`;
@@ -3659,6 +4054,9 @@ export class PlanBoardView extends ItemView {
 
 	/** Save a new/edited quantified goal back to its plan's goals array. Returns success. */
 	private async saveGoal(planName: string, existing: PlanGoal | null, input: GoalInput): Promise<boolean> {
+		// ADR-0016: 生活事项恒挂「日常生活」计划（从其他计划入口选了生活卡也归位）
+		if (input.mode === "chore" && planName !== CHORE_PLAN_NAME) planName = CHORE_PLAN_NAME;
+		if (input.mode === "chore" && !this.guardChoreName(input.name)) return false;
 		const file = await this.findAnnualPlanFile(true);
 		if (!file) {
 			new Notice("未找到年度计划文件");
@@ -3666,18 +4064,45 @@ export class PlanBoardView extends ItemView {
 		}
 		const content = await this.app.vault.cachedRead(file);
 		const defs = parsePlansFromFrontmatter(content);
-		const def = defs.find((d) => d.name === planName);
+		let def = defs.find((d) => d.name === planName);
 		if (!def) {
-			new Notice("未找到该计划");
-			return false;
+			// ADR-0016: 生活计划缺则自愈创建（label 🏠）并预填缺省事项
+			if (input.mode !== "chore") {
+				new Notice("未找到该计划");
+				return false;
+			}
+			def = this.ensureChorePlanDef(defs, input.name);
 		}
 		const goal: PlanGoal = { name: input.name, count: input.count, unit: input.unit || "个" };
 		if (input.start) goal.start = input.start;
 		if (input.end) goal.end = input.end;
-		// ADR-0006: 目标模式与每日量（review 下限必填；exercise 可选）
-		const isModeGoal = !!input.mode && input.mode !== "reading";
+		// ADR-0006/0010: 目标模式与每日量（review 下限必填；exercise 可选）。
+		// 写作按章节（无字数配额）是任务池口径，不算模式目标——走结构分解/重排/接续全套
+		const isModeGoal = !!input.mode && input.mode !== "reading" && !(input.mode === "writing" && !input.writingQuota);
 		if (input.mode) goal.mode = input.mode;
 		if (typeof input.floor === "number" && input.floor > 0) goal.floor = input.floor;
+		// ADR-0016 生活模式：周期 + 逾期策略落盘（无量无单位，count 0）
+		if (input.mode === "chore") {
+			goal.unit = "";
+			if (input.cycle) goal.cycle = input.cycle;
+			if (input.overdue) goal.overdue = input.overdue;
+		}
+		// ADR-0010 写作按字数：目标级字数配额落盘 + 每日配额冻结（(总量−初始) ÷ 窗口天数，创建时算死）。
+		// floor 冻结的配额数同时充当模式行识别记号（matchesModeLine「N字」）与「实」按钮记满语境。
+		if (input.writingQuota) {
+			const win = await this.resolveGoalWindow(input, this.plugin.settings.rootPath.replace(/\/+$/, ""), this.today.slice(0, 4));
+			goal.writingQuota = {
+				total: input.writingQuota.total,
+				unit: "字",
+				start: win.start,
+				end: win.end,
+				...(input.writingQuota.initial > 0 ? { initial: input.writingQuota.initial } : {}),
+			};
+			const daily = computeWritingDaily(input.writingQuota.total, input.writingQuota.initial, win.start, win.end);
+			if (daily > 0) goal.floor = daily;
+			goal.count = 0;
+			goal.unit = "字";
+		}
 		// ADR-0009: 阅读器联动 sid（新建来自选书；编辑走旧流程时保留既有绑定，避免联动丢失）
 		if (input.reader?.sid) goal.readerSid = input.reader.sid;
 		else if (existing?.readerSid) goal.readerSid = existing.readerSid;
@@ -3711,22 +4136,54 @@ export class PlanBoardView extends ItemView {
 				const root = this.plugin.settings.rootPath.replace(/\/+$/, "");
 				const year = this.today.slice(0, 4);
 				if (isModeGoal) {
-					// ADR-0006: 模式目标无任务池任务——改今日打卡行的目标名即可
-					const todayFile = this.getTodayFile();
-					if (todayFile) {
-						const oldName = existing.name;
-						const newName = input.name;
-						await this.app.vault.process(todayFile, (data) => {
-							if (!data.includes(oldName)) return data;
-							return data
-								.split("\n")
-								.map((l) => {
-									const m = TASK_LINE_RE.exec(l);
-									if (!m || m[3] !== planName || !m[2].includes(oldName)) return l;
-									return l.replace(oldName, newName);
-								})
-								.join("\n");
-						});
+					// ADR-0006: 模式目标无任务池任务——改打卡行的目标名即可
+					const oldName = existing.name;
+					const newName = input.name;
+					if (input.mode === "writing" && input.writingQuota) {
+						// ADR-0010: 写作字数进度 = 历史每日行累计——只改今天会丢历史账，须扫全部每日文件
+						const dailyDir = `${root}/${yearDirName(year)}/每日/`;
+						const dailyFiles = this.app.vault
+							.getFiles()
+							.filter((f) => f.path.startsWith(dailyDir) && /^\d{4}-\d{2}-\d{2}\.md$/.test(f.name));
+						this.selfWrite = true;
+						try {
+							for (const f of dailyFiles) {
+								await this.app.vault.process(f, (data) => {
+									if (!data.includes(oldName)) return data;
+									return data
+										.split("\n")
+										.map((l) => {
+											const m = TASK_LINE_RE.exec(l);
+											if (!m || m[3] !== planName || !m[2].includes(oldName)) return l;
+											return l.replace(oldName, newName);
+										})
+										.join("\n");
+								});
+							}
+						} finally {
+							this.selfWrite = false;
+						}
+					} else {
+						// 复习/日记/运动：进度 = 天数口径，历史行名称不影响累计——只改今日行。
+						// ADR-0016: 生活事项行名易互为子串（洗碗/洗碗机），用 matchesModeLine 精确匹配防误伤
+						const todayFile = this.getTodayFile();
+						if (todayFile) {
+							await this.app.vault.process(todayFile, (data) => {
+								if (!data.includes(oldName)) return data;
+								return data
+									.split("\n")
+									.map((l) => {
+										const m = TASK_LINE_RE.exec(l);
+										if (!m || m[3] !== planName) return l;
+										const hit = input.mode === "chore"
+											? matchesModeLine(m[2].trim(), oldName, 0, "")
+											: m[2].includes(oldName);
+										if (!hit) return l;
+										return l.replace(oldName, newName);
+									})
+									.join("\n");
+							});
+						}
 					}
 				} else {
 					const pool = this.app.vault.getAbstractFileByPath(`${root}/${yearDirName(year)}/任务.md`);
@@ -3838,9 +4295,9 @@ export class PlanBoardView extends ItemView {
 		} else {
 			// v1.0.4: 新建同名目标时清掉旧墓碑，避免分解被误跳过
 			this.clearAutoTombstones(`${input.name}（`);
-			// ADR-0009 接续阅读：先把已越过叶子以已勾态写入任务池（日期在窗口前一日，
+			// ADR-0009 接续阅读 / ADR-0010 接续写作：先把已越过叶子以已勾态写入任务池（日期在窗口前一日，
 			// 作进度记录、不占每日分配）；分解引擎幂等跳过已存在任务名，剩余叶子随后重摊
-			const resumeN = isStructured && leaves ? Math.min(input.reader?.resumeLeaves ?? 0, leaves.length - 1) : 0;
+			const resumeN = isStructured && leaves ? Math.min(input.reader?.resumeLeaves ?? input.resumeLeaves ?? 0, leaves.length - 1) : 0;
 			if (resumeN > 0 && leaves) {
 				const { start: gStart } = await this.resolveGoalWindow(input, root, year);
 				const anchor = formatDate(addDays(parseDateString(gStart), -1));
@@ -3858,8 +4315,190 @@ export class PlanBoardView extends ItemView {
 			if (resumeN > 0 && leaves) {
 				await this.rescheduleRemainingReading(planName, input.name, leaves, input, root, year);
 			}
-			new Notice(resumeN > 0 ? `目标已保存：已读 ${resumeN} 节记为完成，剩余叶子按新窗口重摊` : "目标已保存，分解任务已生成");
+			new Notice(
+				resumeN > 0
+					? input.mode === "writing"
+						? `目标已保存：已写完 ${resumeN} 章记为完成，剩余章节按新窗口重摊`
+						: `目标已保存：已读 ${resumeN} 节记为完成，剩余叶子按新窗口重摊`
+					: input.mode === "chore"
+						? "生活事项已保存，该做日会自动出现在当日清单"
+						: "目标已保存，分解任务已生成"
+			);
 		}
+		await this.refresh();
+		return true;
+	}
+
+	/** ADR-0016: 生活事项编辑弹窗入口（父行「＋」/ 管理弹窗共用）。 */
+	private openChoreItemModal(planName: string, existing: PlanGoal | null): void {
+		new ChoreItemModal(this.app, existing, (input) => this.saveChoreGoal(planName, existing, input)).open();
+	}
+
+	/** ADR-0016: 生活事项管理弹窗入口（父行「☰」）。 */
+	private openChoreManageModal(planName: string): void {
+		const goals = this.planProgress
+			.find((p) => p.plan === planName)
+			?.goals.filter((g) => g.mode === "chore") ?? [];
+		new ChoreManageModal(this.app, planName, goals, {
+			onEdit: (g) => this.openChoreItemModal(planName, g),
+			onDelete: (g) => this.deleteChoreGoal(planName, g.name),
+			onAdd: () => this.openChoreItemModal(planName, null),
+		}).open();
+	}
+
+	/**
+	 * ADR-0016: 生活事项 frontmatter 目标组装（无量无单位，count 0；postpone 才落盘）。
+	 * saveGoal（向导路径）与 saveChoreGoal（事项弹窗路径）共用一份口径。
+	 */
+	private makeChoreGoal(input: ChoreItemInput): PlanGoal {
+		const goal: PlanGoal = { name: input.name, count: 0, unit: "", mode: "chore", cycle: input.cycle };
+		if (input.overdue) goal.overdue = input.overdue;
+		return goal;
+	}
+
+	/**
+	 * ADR-0016: 找到或自愈创建「日常生活」计划 def（label 🏠），创建时预填缺省事项
+	 * （与 exceptName 同名跳过，可后续在管理弹窗改/删）。两处保存路径共用，防漂移。
+	 */
+	private ensureChorePlanDef(defs: PlanDef[], exceptName: string): PlanDef {
+		let def = defs.find((d) => d.name === CHORE_PLAN_NAME);
+		if (!def) {
+			def = {
+				name: CHORE_PLAN_NAME,
+				type: "check",
+				target: "日常生活事项循环打卡",
+				targetCount: 0,
+				goals: [],
+				quota: null,
+				action: "",
+				label: "🏠",
+				color: "",
+				tradingDay: false,
+				daily: true,
+			};
+			defs.push(def);
+			for (const item of CHORE_DEFAULT_ITEMS) {
+				if (item.name === exceptName || def.goals.some((g) => g.name === item.name)) continue;
+				def.goals.push({ name: item.name, count: 0, unit: "", mode: "chore", cycle: item.cycle });
+			}
+		}
+		return def;
+	}
+
+	/** ADR-0016: 事项名守卫——不得与承载计划名同名（剥 emoji 后父行文本恰为计划名，同名会让父行被误判成事项行）。 */
+	private guardChoreName(name: string): boolean {
+		if (name !== CHORE_PLAN_NAME) return true;
+		new Notice(`事项名不能叫「${CHORE_PLAN_NAME}」：会与大项行混淆，换一个名字`);
+		return false;
+	}
+
+	/**
+	 * ADR-0016: 保存生活事项（新增/编辑）——写入年度计划 frontmatter（唯一事实源）。
+	 * 改名只重写今日行（历史行文件事实为准，与复习/运动改名同口径）。
+	 */
+	private async saveChoreGoal(planName: string, existing: PlanGoal | null, input: ChoreItemInput): Promise<boolean> {
+		if (!this.guardChoreName(input.name)) return false;
+		const file = await this.findAnnualPlanFile(true);
+		if (!file) {
+			new Notice("未找到年度计划文件");
+			return false;
+		}
+		const content = await this.app.vault.cachedRead(file);
+		const defs = parsePlansFromFrontmatter(content);
+		const def = this.ensureChorePlanDef(defs, input.name);
+		const goal = this.makeChoreGoal(input);
+		if (existing) {
+			const idx = def.goals.findIndex((g) => g.mode === "chore" && g.name === existing.name);
+			if (idx === -1) {
+				new Notice("未找到该生活事项");
+				return false;
+			}
+			if (input.name !== existing.name && def.goals.some((g) => g.name === input.name)) {
+				new Notice(`已存在同名事项「${input.name}」`);
+				return false;
+			}
+			def.goals[idx] = goal;
+			// 改名联动：只改今日行（历史行不动，进度以文件事实为准）
+			if (input.name !== existing.name) {
+				const todayFile = this.getTodayFile();
+				if (todayFile) {
+					this.selfWrite = true;
+					try {
+						await this.app.vault.process(todayFile, (data) => {
+							if (!data.includes(existing.name)) return data;
+							return data
+								.split("\n")
+								.map((l) => {
+									const m = TASK_LINE_RE.exec(l);
+									if (!m || m[3] !== planName || !matchesModeLine(m[2].trim(), existing.name, 0, "")) return l;
+									return l.replace(existing.name, input.name);
+								})
+								.join("\n");
+						});
+					} finally {
+						this.selfWrite = false;
+					}
+				}
+			}
+		} else {
+			if (def.goals.some((g) => g.name === input.name)) {
+				new Notice(`已存在同名事项「${input.name}」`);
+				return false;
+			}
+			def.goals.push(goal);
+		}
+		this.selfWrite = true;
+		try {
+			await writePlansToFile(this.app, file, defs, this.readRawDailyMap(content));
+		} finally {
+			this.selfWrite = false;
+		}
+		new Notice("生活事项已保存");
+		await this.refresh();
+		return true;
+	}
+
+	/**
+	 * ADR-0016: 删除生活事项——从 frontmatter 移除 + 今日未勾行随之移除（挂账无主，留着会以
+	 * 孤儿行身份被误认成父行）；已勾行与历史文件原样保留（文件事实为准）。
+	 */
+	private async deleteChoreGoal(planName: string, goalName: string): Promise<boolean> {
+		const file = await this.findAnnualPlanFile(true);
+		if (!file) {
+			new Notice("未找到年度计划文件");
+			return false;
+		}
+		const content = await this.app.vault.cachedRead(file);
+		const defs = parsePlansFromFrontmatter(content);
+		const def = defs.find((d) => d.name === planName);
+		if (!def) {
+			new Notice("未找到该计划");
+			return false;
+		}
+		const before = def.goals.length;
+		def.goals = def.goals.filter((g) => !(g.mode === "chore" && g.name === goalName));
+		if (def.goals.length === before) {
+			new Notice("未找到该生活事项");
+			return false;
+		}
+		this.selfWrite = true;
+		try {
+			await writePlansToFile(this.app, file, defs, this.readRawDailyMap(content));
+			// 今日未勾行移除（已勾行 = 完成记录，保留）
+			const todayFile = this.getTodayFile();
+			if (todayFile) {
+				const todayContent = await this.app.vault.cachedRead(todayFile);
+				const { uncheckedItemLines } = this.choreLineShapes(todayContent, planName, [goalName]);
+				if (uncheckedItemLines.length > 0) {
+					await this.app.vault.process(todayFile, (data) =>
+						uncheckedItemLines.reduce((acc, l) => removeLine(acc, l.line, l.raw), data)
+					);
+				}
+			}
+		} finally {
+			this.selfWrite = false;
+		}
+		new Notice(`生活事项「${goalName}」已删除（已完成的打卡记录保留）`);
 		await this.refresh();
 		return true;
 	}
@@ -4105,6 +4744,279 @@ function sortTasksByDue(tasks: PoolTask[]): PoolTask[] {
 		const bd = b.due ?? "9999-12-31";
 		return ad < bd ? -1 : ad > bd ? 1 : 0;
 	});
+}
+
+/** ADR-0016: 生活事项表单提交值。 */
+interface ChoreItemInput {
+	name: string;
+	cycle: GoalCycle;
+	overdue?: ChoreOverdue;
+}
+
+const CHORE_WEEKDAY_LABELS = CHORE_WEEKDAY_SHORT;
+/** ADR-0016: 生活计划缺省事项（首次自动建计划时预填，名称撞车跳过，均可改/删）。 */
+const CHORE_DEFAULT_ITEMS: { name: string; cycle: GoalCycle }[] = [
+	{ name: "洗碗", cycle: { unit: "day", days: [] } },
+	{ name: "做卫生", cycle: { unit: "week", days: [0] } },
+	{ name: "买菜", cycle: { unit: "week", days: [1, 4] } },
+];
+
+/**
+ * ADR-0016: 生活事项编辑弹窗（新增/编辑）——名称 + 固定日子式周期（天/周/月/年）
+ * + 逾期策略（放弃/往后延）。周多选星期、月多号逗号分隔、年月+日两输入。
+ */
+class ChoreItemModal extends Modal {
+	private existing: PlanGoal | null;
+	private onSubmit: (input: ChoreItemInput) => Promise<boolean>;
+
+	private nameValue = "";
+	private unitValue: GoalCycle["unit"] = "day";
+	private weekDays: number[] = [0];
+	private monthDaysValue = "1";
+	private yearMonthValue = "1";
+	private yearDayValue = "1";
+	private overdueValue: ChoreOverdue = "skip";
+
+	constructor(app: App, existing: PlanGoal | null, onSubmit: (input: ChoreItemInput) => Promise<boolean>) {
+		super(app);
+		this.existing = existing;
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen(): void {
+		if (this.existing) {
+			this.nameValue = this.existing.name;
+			const c = this.existing.cycle;
+			if (c) {
+				this.unitValue = c.unit;
+				if (c.unit === "week") this.weekDays = c.days.length > 0 ? [...c.days] : [0];
+				else if (c.unit === "month") this.monthDaysValue = c.days.join(", ");
+				else if (c.unit === "year") {
+					this.yearMonthValue = String(c.days[0] ?? 1);
+					this.yearDayValue = String(c.days[1] ?? 1);
+				}
+			}
+			if (this.existing.overdue === "postpone") this.overdueValue = "postpone";
+		}
+		this.renderModal();
+	}
+
+	private renderModal(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass("planboard-modal");
+		contentEl.createEl("h2", { text: this.existing ? "编辑生活事项" : "新增生活事项" });
+
+		new Setting(contentEl).setName("事项名称").addText((text) => {
+			text.setValue(this.nameValue);
+			text.setPlaceholder("例如：洗碗 / 做卫生 / 买菜");
+			text.inputEl.addEventListener("input", () => {
+				this.nameValue = text.inputEl.value;
+			});
+		});
+
+		new Setting(contentEl).setName("重复周期").setDesc("只有轮到的日子，事项才出现在当日清单").addDropdown((drop) => {
+			drop.addOption("day", "每天");
+			drop.addOption("week", "每周…（选星期）");
+			drop.addOption("month", "每月…（选几号）");
+			drop.addOption("year", "每年…（选月日）");
+			drop.setValue(this.unitValue);
+			drop.onChange((v) => {
+				this.unitValue = (["day", "week", "month", "year"] as const).includes(v as GoalCycle["unit"])
+					? (v as GoalCycle["unit"])
+					: "day";
+				this.renderModal();
+			});
+		});
+
+		if (this.unitValue === "week") {
+			const wrap = new Setting(contentEl).setName("每周几（可多选）").controlEl;
+			const box = wrap.createDiv({ cls: "planboard-chore-weekdays" });
+			for (let d = 0; d < 7; d++) {
+				const b = box.createEl("button", {
+					cls: "planboard-chore-weekday" + (this.weekDays.includes(d) ? " is-active" : ""),
+					text: CHORE_WEEKDAY_LABELS[d],
+					attr: { type: "button", title: `星期${CHORE_WEEKDAY_LABELS[d]}` },
+				});
+				b.addEventListener("click", () => {
+					if (this.weekDays.includes(d)) this.weekDays = this.weekDays.filter((x) => x !== d);
+					else this.weekDays = [...this.weekDays, d].sort((a, c) => a - c);
+					b.toggleClass("is-active", this.weekDays.includes(d));
+				});
+			}
+		} else if (this.unitValue === "month") {
+			new Setting(contentEl).setName("每月几号（可多选，逗号分隔）").setDesc("当月没有的号（如 31 号遇小月）自动落到当月最后一天").addText((text) => {
+				text.setValue(this.monthDaysValue);
+				text.setPlaceholder("例如：1, 11, 21");
+				text.inputEl.addEventListener("input", () => {
+					this.monthDaysValue = text.inputEl.value;
+				});
+			});
+		} else if (this.unitValue === "year") {
+			new Setting(contentEl).setName("每年几月几日").addText((text) => {
+				text.setValue(this.yearMonthValue);
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "12";
+				text.setPlaceholder("月");
+				text.inputEl.addEventListener("input", () => {
+					this.yearMonthValue = text.inputEl.value;
+				});
+			}).addText((text) => {
+				text.setValue(this.yearDayValue);
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "31";
+				text.setPlaceholder("日");
+				text.inputEl.addEventListener("input", () => {
+					this.yearDayValue = text.inputEl.value;
+				});
+			});
+		}
+
+		new Setting(contentEl).setName("漏了怎么办").setDesc("放弃 = 当天没做该次就消失；往后延 = 每天挂出提醒，补做一次即清账").addDropdown((drop) => {
+			drop.addOption("skip", "放弃（漏了就漏了）");
+			drop.addOption("postpone", "往后延（挂账到补做）");
+			drop.setValue(this.overdueValue);
+			drop.onChange((v) => {
+				this.overdueValue = v === "postpone" ? "postpone" : "skip";
+			});
+		});
+
+		const buttons = contentEl.createDiv({ cls: "planboard-modal-buttons" });
+		const cancel = buttons.createEl("button", { cls: "planboard-btn", text: "取消" });
+		cancel.addEventListener("click", () => this.close());
+		const ok = buttons.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "保存" });
+		ok.addEventListener("click", () => void this.save());
+	}
+
+	private async save(): Promise<void> {
+		const name = this.nameValue.trim();
+		if (!name) {
+			new Notice("请输入事项名称");
+			return;
+		}
+		let cycle: GoalCycle;
+		if (this.unitValue === "day") {
+			cycle = { unit: "day", days: [] };
+		} else if (this.unitValue === "week") {
+			if (this.weekDays.length === 0) {
+				new Notice("每周至少选一天");
+				return;
+			}
+			cycle = { unit: "week", days: [...new Set(this.weekDays)].sort((a, b) => a - b) };
+		} else if (this.unitValue === "month") {
+			const days = [...new Set(
+				this.monthDaysValue
+					.replace(/[[\]]/g, "")
+					.split(/[,，\s]+/)
+					.map((s) => parseInt(s, 10))
+					.filter((n) => Number.isFinite(n) && n >= 1 && n <= 31)
+			)].sort((a, b) => a - b);
+			if (days.length === 0) {
+				new Notice("请填写有效日期（1~31，逗号分隔）");
+				return;
+			}
+			cycle = { unit: "month", days };
+		} else {
+			const mm = parseInt(this.yearMonthValue, 10);
+			const dd = parseInt(this.yearDayValue, 10);
+			if (!Number.isFinite(mm) || mm < 1 || mm > 12 || !Number.isFinite(dd) || dd < 1 || dd > 31) {
+				new Notice("请填写有效的月（1~12）与日（1~31）");
+				return;
+			}
+			cycle = { unit: "year", days: [mm, dd] };
+		}
+		const input: ChoreItemInput = { name, cycle };
+		if (this.overdueValue === "postpone") input.overdue = "postpone";
+		const saved = await this.onSubmit(input);
+		if (saved) this.close();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** ADR-0016: 生活事项管理弹窗——全部事项一览（周期文案 + 编辑/两步确认删除）+ 新增入口。 */
+class ChoreManageModal extends Modal {
+	private planName: string;
+	private goals: PlanGoal[];
+	private onEdit: (goal: PlanGoal) => void;
+	private onDelete: (goal: PlanGoal) => Promise<boolean>;
+	private onAdd: () => void;
+
+	constructor(
+		app: App,
+		planName: string,
+		goals: PlanGoal[],
+		handlers: { onEdit: (goal: PlanGoal) => void; onDelete: (goal: PlanGoal) => Promise<boolean>; onAdd: () => void }
+	) {
+		super(app);
+		this.planName = planName;
+		this.goals = goals.map((g) => g);
+		this.onEdit = handlers.onEdit;
+		this.onDelete = handlers.onDelete;
+		this.onAdd = handlers.onAdd;
+	}
+
+	onOpen(): void {
+		this.renderList();
+	}
+
+	private renderList(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass("planboard-modal");
+		contentEl.createEl("h2", { text: `管理生活事项（${this.planName}）` });
+		if (this.goals.length === 0) {
+			contentEl.createDiv({ cls: "planboard-goal-preview", text: "还没有生活事项，点下方「新增事项」添加" });
+		}
+		for (const g of this.goals) {
+			const row = contentEl.createDiv({ cls: "planboard-chore-row" });
+			const info = row.createDiv({ cls: "planboard-chore-row-info" });
+			info.createSpan({ cls: "planboard-chore-row-name", text: g.name });
+			info.createSpan({
+				cls: "planboard-goal-preview",
+				text: g.cycle ? choreCycleLabel(g.cycle, g.overdue) : "每天",
+			});
+			const ops = row.createDiv({ cls: "planboard-chore-row-ops" });
+			const editBtn = ops.createEl("button", { cls: "planboard-icon-btn", attr: { title: "编辑", "aria-label": "编辑" } });
+			editBtn.setText("✎");
+			editBtn.addEventListener("click", () => {
+				this.close();
+				this.onEdit(g);
+			});
+			const delBtn = ops.createEl("button", { cls: "planboard-icon-btn", attr: { title: "删除", "aria-label": "删除" } });
+			delBtn.setText("✕");
+			let armed = false;
+			delBtn.addEventListener("click", () => {
+				if (!armed) {
+					armed = true;
+					delBtn.setText("确认删除?");
+					delBtn.addClass("planboard-chore-del-armed");
+					return;
+				}
+				void this.onDelete(g).then((ok) => {
+					if (!ok) return;
+					this.goals = this.goals.filter((x) => x.name !== g.name);
+					this.renderList();
+				});
+			});
+		}
+		const buttons = contentEl.createDiv({ cls: "planboard-modal-buttons" });
+		const add = buttons.createEl("button", { cls: "planboard-btn", text: "＋ 新增事项" });
+		add.addEventListener("click", () => {
+			this.close();
+			this.onAdd();
+		});
+		const close = buttons.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "完成" });
+		close.addEventListener("click", () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
 }
 
 /** Modal for adding a check-in item (PRD §4). */
@@ -4527,24 +5439,35 @@ class QuotaActualModal extends Modal {
  * ADR-0004 扩展三: 写复盘弹窗——多行输入，确认后写入当天日记「# 当日复盘」。
  * 复盘一天一份，重复写入 = 替换（reviewTransform 语义）。
  * 扩展四：打开时预填（已有当日复盘正文或模板骨架），用户直接在模板里填内容。
+ * ADR-0014: 标题/提示/空文案参数化，「次日计划」弹窗复用同一体系（写入目标由回调决定）。
  */
 class ReviewModal extends Modal {
 	private onSubmit: (text: string) => Promise<void>;
 	private prefill: string;
+	/** ADR-0014: 标题/提示/空文案参数化——同一弹窗体系复用给「次日计划」入口。 */
+	private title: string;
+	private hint: string;
+	private emptyNotice: string;
 
-	constructor(app: App, prefill: string, onSubmit: (text: string) => Promise<void>) {
+	constructor(
+		app: App,
+		opts: { prefill: string; title?: string; hint?: string; emptyNotice?: string; onSubmit: (text: string) => Promise<void> }
+	) {
 		super(app);
-		this.prefill = prefill;
-		this.onSubmit = onSubmit;
+		this.prefill = opts.prefill;
+		this.onSubmit = opts.onSubmit;
+		this.title = opts.title ?? "📝 写复盘";
+		this.hint = opts.hint ?? "内容将写入当天日记「# 当日复盘」小节（「# 随笔」之后）；再次写入会替换当日复盘内容。";
+		this.emptyNotice = opts.emptyNotice ?? "复盘内容为空，先写点什么";
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.addClass("planboard-modal");
-		contentEl.createEl("h2", { text: "📝 写复盘" });
+		contentEl.createEl("h2", { text: this.title });
 		contentEl.createDiv({
 			cls: "planboard-quota-modal-hint",
-			text: "内容将写入当天日记「# 当日复盘」小节（「# 随笔」之后）；再次写入会替换当日复盘内容。",
+			text: this.hint,
 		});
 		const inputEl = contentEl.createEl("textarea", {
 			cls: "planboard-review-input",
@@ -4568,7 +5491,7 @@ class ReviewModal extends Modal {
 	private async submit(inputEl: HTMLTextAreaElement): Promise<void> {
 		const v = inputEl.value.trim();
 		if (v === "") {
-			new Notice("复盘内容为空，先写点什么");
+			new Notice(this.emptyNotice);
 			return;
 		}
 		await this.onSubmit(v);
@@ -4617,6 +5540,16 @@ class GoalEditModal extends Modal {
 	private formUnitValue = "";
 	private tocValue = "";
 	private tocResult: ReturnType<typeof parseToc> = null;
+	// ADR-0010 写作模式状态：量化方式（words/chapters）+ 两种口径的字段
+	private writingQuant: "words" | "chapters" = "words";
+	/** 编辑既有目标时锁死量化方式（跨口径切换 = 删除重建，Q9=A）。 */
+	private writingQuantLocked = false;
+	private writingTotalValue = "";
+	private writingInitialValue = "";
+	private writingChaptersValue = "";
+	private writingDoneChaptersValue = "";
+	/** 写作表单的每日配额预览行（renderModeForm 里赋值）。 */
+	private writingHintEl: HTMLElement | null = null;
 	// ADR-0009: weave 联动状态（选书步 / 接续阅读预勾）
 	private weave: WeaveBridgeApi | null;
 	private bookList: WeaveBookSummary[] | null = null;
@@ -4635,6 +5568,13 @@ class GoalEditModal extends Modal {
 	private readerAnchorList: { spine: number; href: string; progress?: number }[] = [];
 	/** ADR-0006: 运动单位选择自定义态（选「自定义…」后显示文本框）。 */
 	private customUnitMode = false;
+	// ADR-0016 生活模式表单状态
+	private choreUnitValue: GoalCycle["unit"] = "day";
+	private choreWeekDays: number[] = [0];
+	private choreMonthDaysValue = "1";
+	private choreYearMonthValue = "1";
+	private choreYearDayValue = "1";
+	private choreOverdueValue: ChoreOverdue = "skip";
 	/** BZG 联动状态提示（视图侧按当前设置生成，复习表单展示）。 */
 	private bzgHint: string;
 
@@ -4920,6 +5860,16 @@ class GoalEditModal extends Modal {
 				if (!this.nameValue.trim()) this.nameValue = "运动";
 				if (!this.formUnitValue) this.formUnitValue = "分钟";
 				this.customUnitMode = false;
+			} else if (mode === "writing") {
+				// ADR-0010: 默认按字数；量化方式在表单内下拉切换
+				this.writingQuant = "words";
+				this.writingQuantLocked = false;
+				this.formUnitValue = "字";
+			} else if (mode === "chore") {
+				// ADR-0016: 生活事项缺省（洗碗=每天），周期与策略在表单内改
+				if (!this.nameValue.trim()) this.nameValue = "洗碗";
+				this.formUnitValue = "";
+				this.floorValue = "";
 			}
 			// ADR-0009: 阅读模式且桥可用 → 选书步（选中即自动拉目录）；桥缺席/关闭静默走原流程（粘贴兜底）
 			if (mode === "reading" && this.weave) {
@@ -4929,7 +5879,7 @@ class GoalEditModal extends Modal {
 			}
 			this.goto(mode === "reading" || mode === "" ? STEP_INTRO : STEP_FORM);
 		};
-		for (const mode of ["reading", "review", "diary", "exercise"] as GoalMode[]) {
+		for (const mode of ["reading", "writing", "review", "diary", "exercise", "chore"] as GoalMode[]) {
 			const meta = GOAL_MODE_META[mode];
 			const b = grid.createEl("button", { cls: "planboard-mode-card", attr: { type: "button" } });
 			b.createDiv({ cls: "planboard-mode-card-emoji", text: meta.emoji });
@@ -5456,6 +6406,154 @@ class GoalEditModal extends Modal {
 					});
 				});
 			}
+		} else if (mode === "writing") {
+			// ADR-0010: 量化方式下拉（按字数/按章节）；编辑既有目标时锁死口径（换口径 = 删除重建）
+			new Setting(contentEl).setName("量化方式").setDesc(
+				this.writingQuantLocked ? "既有目标不可切换量化方式（两套账互不相通）；想换口径请删除目标重建" : "按字数 = 每日配额推进；按章节 = 逐章任务推进"
+			).addDropdown((drop) => {
+				drop.addOption("words", "按字数");
+				drop.addOption("chapters", "按章节");
+				drop.setValue(this.writingQuant);
+				drop.onChange((v) => {
+					this.writingQuant = v === "chapters" ? "chapters" : "words";
+					this.renderWizard();
+				});
+				if (this.writingQuantLocked) drop.selectEl.toggleAttribute("disabled", true);
+			});
+			if (this.writingQuant === "words") {
+				new Setting(contentEl)
+					.setName("总字数")
+					.setDesc("例如 100000（10 万字）")
+					.addText((text) => {
+						text.setValue(this.writingTotalValue);
+						text.inputEl.type = "number";
+						text.inputEl.min = "1";
+						text.setPlaceholder("例如：100000");
+						text.inputEl.addEventListener("input", () => {
+							this.writingTotalValue = text.inputEl.value;
+							this.refreshWritingHint();
+						});
+					});
+				if (!this.writingQuantLocked) {
+					// 接续写作：建目标时已累计的字数（编辑模式无此概念——历史行是文件事实，不追溯）
+					new Setting(contentEl)
+						.setName("已累计字数（可选）")
+						.setDesc("写到一半才建计划时填已写总量；进度从这里起步，每日配额按剩余量摊")
+						.addText((text) => {
+							text.setValue(this.writingInitialValue);
+							text.inputEl.type = "number";
+							text.inputEl.min = "0";
+							text.setPlaceholder("例如：20000");
+							text.inputEl.addEventListener("input", () => {
+								this.writingInitialValue = text.inputEl.value;
+								this.refreshWritingHint();
+							});
+						});
+				}
+			} else {
+				new Setting(contentEl)
+					.setName("总章数")
+					.setDesc("展开为「{书名}（第 1 章）…（第 N 章）」逐章任务，均匀分日、逐日勾选")
+					.addText((text) => {
+						text.setValue(this.writingChaptersValue);
+						text.inputEl.type = "number";
+						text.inputEl.min = "1";
+						text.setPlaceholder("例如：300");
+						text.inputEl.addEventListener("input", () => {
+							this.writingChaptersValue = text.inputEl.value;
+							this.refreshWritingHint();
+						});
+					});
+				if (!this.writingQuantLocked) {
+					new Setting(contentEl)
+						.setName("已完成章数（可选）")
+						.setDesc("接续写作：前 M 章直接记为完成，剩余章从今天起排")
+						.addText((text) => {
+							text.setValue(this.writingDoneChaptersValue);
+							text.inputEl.type = "number";
+							text.inputEl.min = "0";
+							text.setPlaceholder("例如：45");
+							text.inputEl.addEventListener("input", () => {
+								this.writingDoneChaptersValue = text.inputEl.value;
+								this.refreshWritingHint();
+							});
+						});
+				}
+			}
+			// 每日配额实时预览（字段/日期变化时刷新；日期输入变化走 renderWizard 重渲染）
+			this.writingHintEl = contentEl.createDiv({ cls: "planboard-goal-preview" });
+			this.refreshWritingHint();
+		} else if (mode === "chore") {
+			// ADR-0016: 生活事项——周期（天/周/月/年 + 日子选择）+ 逾期策略
+			new Setting(contentEl).setName("重复周期").setDesc("只有轮到的日子，事项才出现在当日清单").addDropdown((drop) => {
+				drop.addOption("day", "每天");
+				drop.addOption("week", "每周…（选星期）");
+				drop.addOption("month", "每月…（选几号）");
+				drop.addOption("year", "每年…（选月日）");
+				drop.setValue(this.choreUnitValue);
+				drop.onChange((v) => {
+					this.choreUnitValue = (["day", "week", "month", "year"] as const).includes(v as GoalCycle["unit"])
+						? (v as GoalCycle["unit"])
+						: "day";
+					this.renderWizard();
+				});
+			});
+			if (this.choreUnitValue === "week") {
+				const wrap = new Setting(contentEl).setName("每周几（可多选）").controlEl;
+				const box = wrap.createDiv({ cls: "planboard-chore-weekdays" });
+				for (let d = 0; d < 7; d++) {
+					const b = box.createEl("button", {
+						cls: "planboard-chore-weekday" + (this.choreWeekDays.includes(d) ? " is-active" : ""),
+						text: CHORE_WEEKDAY_LABELS[d],
+						attr: { type: "button", title: `星期${CHORE_WEEKDAY_LABELS[d]}` },
+					});
+					b.addEventListener("click", () => {
+						if (this.choreWeekDays.includes(d)) this.choreWeekDays = this.choreWeekDays.filter((x) => x !== d);
+						else this.choreWeekDays = [...this.choreWeekDays, d].sort((a, c) => a - c);
+						b.toggleClass("is-active", this.choreWeekDays.includes(d));
+					});
+				}
+			} else if (this.choreUnitValue === "month") {
+				new Setting(contentEl).setName("每月几号（可多选，逗号分隔）").setDesc("当月没有的号自动落到当月最后一天").addText((text) => {
+					text.setValue(this.choreMonthDaysValue);
+					text.setPlaceholder("例如：1, 11, 21");
+					text.inputEl.addEventListener("input", () => {
+						this.choreMonthDaysValue = text.inputEl.value;
+					});
+				});
+			} else if (this.choreUnitValue === "year") {
+				new Setting(contentEl).setName("每年几月几日").addText((text) => {
+					text.setValue(this.choreYearMonthValue);
+					text.inputEl.type = "number";
+					text.inputEl.min = "1";
+					text.inputEl.max = "12";
+					text.setPlaceholder("月");
+					text.inputEl.addEventListener("input", () => {
+						this.choreYearMonthValue = text.inputEl.value;
+					});
+				}).addText((text) => {
+					text.setValue(this.choreYearDayValue);
+					text.inputEl.type = "number";
+					text.inputEl.min = "1";
+					text.inputEl.max = "31";
+					text.setPlaceholder("日");
+					text.inputEl.addEventListener("input", () => {
+						this.choreYearDayValue = text.inputEl.value;
+					});
+				});
+			}
+			new Setting(contentEl).setName("漏了怎么办").setDesc("放弃 = 当天没做该次就消失；往后延 = 每天挂出提醒，补做一次即清账").addDropdown((drop) => {
+				drop.addOption("skip", "放弃（漏了就漏了）");
+				drop.addOption("postpone", "往后延（挂账到补做）");
+				drop.setValue(this.choreOverdueValue);
+				drop.onChange((v) => {
+					this.choreOverdueValue = v === "postpone" ? "postpone" : "skip";
+				});
+			});
+			contentEl.createDiv({
+				cls: "planboard-goal-preview",
+				text: "保存后挂到「日常生活」计划下（不存在会自动创建）；之后在该计划大项行上「＋ / ☰」增删改",
+			});
 		} else if (mode === "diary") {
 			contentEl.createDiv({
 				cls: "planboard-goal-preview",
@@ -5468,6 +6566,8 @@ class GoalEditModal extends Modal {
 			text.inputEl.addClass("planboard-date-btn");
 			text.inputEl.addEventListener("change", () => {
 				this.startValue = text.inputEl.value;
+				// ADR-0010: 写作表单的配额预览依赖时间窗——重渲染让预览行即时重算
+				if (this.modeValue === "writing") this.renderWizard();
 			});
 		});
 		new Setting(contentEl).setName("结束日期").setDesc("留空 = 沿用计划周期终点（复习模式无截止概念，此日期仅作统计窗口）").addText((text) => {
@@ -5476,6 +6576,7 @@ class GoalEditModal extends Modal {
 			text.inputEl.addClass("planboard-date-btn");
 			text.inputEl.addEventListener("change", () => {
 				this.endValue = text.inputEl.value;
+				if (this.modeValue === "writing") this.renderWizard();
 			});
 		});
 		const actions = contentEl.createDiv({ cls: "planboard-struct-actions" });
@@ -5484,6 +6585,44 @@ class GoalEditModal extends Modal {
 		const ok = actions.createEl("button", { cls: "planboard-btn planboard-btn-primary", text: "保存", attr: { type: "button" } });
 		ok.addEventListener("click", () => void this.saveFromModeForm());
 		this.addCancelButton(actions);
+	}
+
+	/** ADR-0010: 写作表单每日配额预览（按字数 = (总量−已写)÷天数；按章节 = 每日约 N 章）。 */
+	private refreshWritingHint(): void {
+		const el = this.writingHintEl;
+		if (!el || !el.isConnected) return;
+		if (this.writingQuant === "chapters") {
+			const n = parseInt(this.writingChaptersValue, 10) || 0;
+			if (n <= 0 || !this.startValue || !this.endValue) {
+				el.setText("填总章数与起止日期后，预览每日推进节奏");
+				return;
+			}
+			const days = Math.max(1, dayCount(this.startValue, this.endValue));
+			const done = parseInt(this.writingDoneChaptersValue, 10) || 0;
+			const remain = Math.max(0, n - done);
+			el.setText(`共 ${n} 章（剩余 ${remain} 章）÷ ${days} 天 ≈ 每日 ${(remain / days).toFixed(1)} 章，未写完自然顺延`);
+			return;
+		}
+		const total = parseInt(this.writingTotalValue, 10) || 0;
+		if (total <= 0) {
+			el.setText("填总字数与起止日期后，这里预览每日配额");
+			return;
+		}
+		const initial = parseInt(this.writingInitialValue, 10) || 0;
+		if (!this.startValue || !this.endValue) {
+			el.setText(`截止留空 = 沿用计划周期；每日配额 = (总量 − 已写) ÷ 天数（创建时一次算死，落后不自动追赶）`);
+			return;
+		}
+		const days = dayCount(this.startValue, this.endValue);
+		if (days <= 0) {
+			el.setText("结束日期需晚于开始日期");
+			return;
+		}
+		if (initial >= total) {
+			el.setText("已累计字数需小于总字数");
+			return;
+		}
+		el.setText(`(${formatQuotaAmount(total)} − ${formatQuotaAmount(initial)}) ÷ ${days} 天 = 每日约 ${formatQuotaAmount((total - initial) / days)} 字（创建时一次算死，落后不自动追赶）`);
 	}
 
 	/** ADR-0006: 模式表单保存。 */
@@ -5507,6 +6646,75 @@ class GoalEditModal extends Modal {
 		if (Number.isFinite(floor) && floor > 0) input.floor = floor;
 		if (this.startValue) input.start = this.startValue;
 		if (this.endValue) input.end = this.endValue;
+		// ADR-0010 写作模式：两种量化口径组装（floor 不在此算——保存链按解析后的窗口一次冻结）
+		if (mode === "writing") {
+			if (this.writingQuant === "words") {
+				const total = parseInt(this.writingTotalValue, 10) || 0;
+				const initial = parseInt(this.writingInitialValue, 10) || 0;
+				if (total <= 0) {
+					new Notice("请输入总字数");
+					return;
+				}
+				if (initial < 0 || initial >= total) {
+					new Notice("已累计字数需小于总字数");
+					return;
+				}
+				input.writingQuota = { total, initial };
+				input.unit = "字";
+			} else {
+				const chapters = parseInt(this.writingChaptersValue, 10) || 0;
+				const done = parseInt(this.writingDoneChaptersValue, 10) || 0;
+				if (chapters <= 0) {
+					new Notice("请输入总章数");
+					return;
+				}
+				if (done < 0 || done >= chapters) {
+					new Notice("已完成章数需小于总章数（填已完成时另建一本已读完的书亦可）");
+					return;
+				}
+				input.structure = [{ unit: "章", counts: [chapters] }];
+				input.count = chapters;
+				input.unit = "章";
+				if (done > 0) input.resumeLeaves = done;
+			}
+		}
+		// ADR-0016 生活模式：周期 + 逾期策略组装（无总量无单位，count 0）
+		if (mode === "chore") {
+			let cycle: GoalCycle;
+			if (this.choreUnitValue === "day") {
+				cycle = { unit: "day", days: [] };
+			} else if (this.choreUnitValue === "week") {
+				if (this.choreWeekDays.length === 0) {
+					new Notice("每周至少选一天");
+					return;
+				}
+				cycle = { unit: "week", days: [...new Set(this.choreWeekDays)].sort((a, b) => a - b) };
+			} else if (this.choreUnitValue === "month") {
+				const days = [...new Set(
+					this.choreMonthDaysValue
+						.replace(/[[\]]/g, "")
+						.split(/[,，\s]+/)
+						.map((s) => parseInt(s, 10))
+						.filter((n) => Number.isFinite(n) && n >= 1 && n <= 31)
+				)].sort((a, b) => a - b);
+				if (days.length === 0) {
+					new Notice("请填写有效日期（1~31，逗号分隔）");
+					return;
+				}
+				cycle = { unit: "month", days };
+			} else {
+				const mm = parseInt(this.choreYearMonthValue, 10);
+				const dd = parseInt(this.choreYearDayValue, 10);
+				if (!Number.isFinite(mm) || mm < 1 || mm > 12 || !Number.isFinite(dd) || dd < 1 || dd > 31) {
+					new Notice("请填写有效的月（1~12）与日（1~31）");
+					return;
+				}
+				cycle = { unit: "year", days: [mm, dd] };
+			}
+			input.cycle = cycle;
+			if (this.choreOverdueValue === "postpone") input.overdue = "postpone";
+			input.unit = "";
+		}
 		const saved = await this.onSubmit(input);
 		if (saved) this.close();
 	}
@@ -5794,6 +7002,33 @@ class GoalEditModal extends Modal {
 			this.modeValue = this.existing.mode;
 			this.floorValue = this.existing.floor ? String(this.existing.floor) : "";
 			this.formUnitValue = this.existing.unit ?? "";
+			// ADR-0016: 生活事项编辑——周期与策略回填
+			if (this.existing.mode === "chore") {
+				const c = this.existing.cycle;
+				if (c) {
+					this.choreUnitValue = c.unit;
+					if (c.unit === "week") this.choreWeekDays = c.days.length > 0 ? [...c.days] : [0];
+					else if (c.unit === "month") this.choreMonthDaysValue = c.days.join(", ");
+					else if (c.unit === "year") {
+						this.choreYearMonthValue = String(c.days[0] ?? 1);
+						this.choreYearDayValue = String(c.days[1] ?? 1);
+					}
+				}
+				this.choreOverdueValue = this.existing.overdue === "postpone" ? "postpone" : "skip";
+			}
+			// ADR-0010: 写作模式编辑——量化方式按既有账本推导并锁死（跨口径切换 = 删除重建）
+			if (this.existing.mode === "writing") {
+				this.writingQuantLocked = true;
+				if (this.existing.writingQuota) {
+					this.writingQuant = "words";
+					this.writingTotalValue = String(this.existing.writingQuota.total);
+					this.writingInitialValue = this.existing.writingQuota.initial ? String(this.existing.writingQuota.initial) : "";
+				} else {
+					this.writingQuant = "chapters";
+					const n = this.existing.structure?.[0]?.counts?.[0] ?? this.existing.count ?? 0;
+					this.writingChaptersValue = n > 0 ? String(n) : "";
+				}
+			}
 			this.step = STEP_FORM;
 			this.renderWizard();
 			return;
@@ -5932,6 +7167,22 @@ function serializePlans(plans: PlanDef[], dailyByPlan?: Record<string, boolean>)
 				// ADR-0006: 目标模式与每日量原样写回
 				if (g.mode) lines.push(`        mode: ${g.mode}`);
 				if (g.floor != null) lines.push(`        floor: ${g.floor}`);
+				// ADR-0016 生活模式：固定日子式周期 + 逾期策略原样写回（skip 缺省不落盘）
+				if (g.cycle) {
+					lines.push("        cycle:");
+					lines.push(`          unit: ${g.cycle.unit}`);
+					lines.push(`          days: [${g.cycle.days.join(", ")}]`);
+				}
+				if (g.overdue) lines.push(`        overdue: ${g.overdue}`);
+				// ADR-0010 写作按字数：目标级字数配额原样写回
+				if (g.writingQuota) {
+					lines.push("        writingQuota:");
+					lines.push(`          total: ${g.writingQuota.total}`);
+					if (g.writingQuota.unit) lines.push(`          unit: ${yamlScalar(g.writingQuota.unit)}`);
+					if (g.writingQuota.start) lines.push(`          start: ${yamlScalar(g.writingQuota.start)}`);
+					if (g.writingQuota.end) lines.push(`          end: ${yamlScalar(g.writingQuota.end)}`);
+					if (g.writingQuota.initial != null && g.writingQuota.initial > 0) lines.push(`          initial: ${g.writingQuota.initial}`);
+				}
 				// ADR-0005：章节 chapters 与多级 structure 原样写回（flow 序列 / 块序列，yamlScalar 只管标量）
 				if (g.chapters && g.chapters.length > 0) lines.push(`        chapters: [${g.chapters.join(", ")}]`);
 				// ADR-0009：阅读器来源书稳定标识 + 每叶锚点快照（"spine|href" 紧凑序列）原样写回
@@ -6003,7 +7254,7 @@ function toPlanDef(prog: PlanProgress): PlanDef {
 		type: prog.isQuota ? "quota" : prog.isNumeric ? "numeric" : "check",
 		target: prog.target,
 		targetCount: prog.targetCount,
-		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor, readerSid: g.readerSid, readerAnchors: g.readerAnchors })),
+		goals: prog.goals.map((g) => ({ name: g.name, count: g.count, unit: g.unit, start: g.start, end: g.end, chapters: g.chapters, structure: g.structure, mode: g.mode, floor: g.floor, readerSid: g.readerSid, readerAnchors: g.readerAnchors, cycle: g.cycle, overdue: g.overdue })),
 		quota: prog.quota ? { total: prog.quota.total, unit: prog.quota.unit, start: prog.quota.start, end: prog.quota.end } : null,
 		action: prog.action,
 		label: prog.label,

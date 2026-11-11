@@ -896,6 +896,46 @@
 	margin-top: 0;
 }
 
+/* ADR-0014: 总结卡「昨日留的计划」只读块——实时侧读昨日日记「# 次日计划」，无内容整块隐藏 */
+.planboard-yesterday-plan {
+	margin-top: 10px;
+	padding: 8px 10px;
+	border: 1px dashed var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-secondary);
+	overflow: hidden;
+}
+
+.planboard-yesterday-plan-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	margin-bottom: 4px;
+}
+
+.planboard-yesterday-plan-title {
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text-muted);
+}
+
+.planboard-yesterday-plan-edit {
+	font-size: 12px;
+	padding: 2px 10px;
+	min-height: 0;
+	height: auto;
+}
+
+.planboard-yesterday-plan-body {
+	font-size: 13px;
+	line-height: 1.6;
+	color: var(--text-normal);
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 140px;
+	overflow-y: auto;
+}
+
 /* ADR-0004 扩展三: 写复盘弹窗多行输入 */
 .planboard-review-input {
 	width: 100%;
@@ -1004,6 +1044,50 @@
 	flex: 1 1 auto;
 	min-height: 0;
 	overflow-y: auto;
+}
+
+/* v2.x: 拖过卡高的卡——量化目标框不参与压缩（保持自然高度，书墙已 320 封顶），
+   高度不足全由任务区滚动吸收；要压缩框请拖「框⇆任务」分隔条（.planboard-goals-divider） */
+.planboard-plan-card.is-height-fixed .planboard-goals-box {
+	flex-shrink: 0;
+}
+
+/* v2.x: 拖过框高（分隔条）——框固定高度、内部滚动，任务区吃剩余空间 */
+.planboard-goals-box.is-height-fixed {
+	flex: 0 0 auto;
+	overflow-y: auto;
+	scrollbar-width: thin;
+}
+
+/* v2.x: 「框⇆任务区」拖拽分隔条——仅拖过卡高的卡显示（未拖卡高时框/任务各按自然高，无需分配） */
+.planboard-goals-divider {
+	display: none;
+	position: relative;
+	height: 10px;
+	margin: 0;
+	cursor: ns-resize;
+	flex-shrink: 0;
+}
+
+.planboard-goals-divider::before {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 12px;
+	right: 12px;
+	height: 3px;
+	transform: translateY(-50%);
+	border-radius: 2px;
+	background: var(--background-modifier-border);
+}
+
+.planboard-goals-divider:hover::before,
+.planboard-goals-divider:active::before {
+	background: var(--interactive-accent);
+}
+
+.planboard-plan-card.is-height-fixed .planboard-goals-divider {
+	display: block;
 }
 
 /* v1.7.4: 底部收紧——home 卡把手以下只留 4px（原 padding 14px 显得下边框过宽）；
@@ -1729,6 +1813,11 @@
 	flex-direction: column;
 	gap: 2px;
 	padding: 2px 2px 6px;
+	/* v2.x: 一本书的目录墙封顶内滚——书行（名称/总进度/按钮）常驻，下方目标与同列卡片不再被顶没 */
+	/* 大目录（compact 文本墙同样生效）；≤12 组的逐行模式通常够高不触发 */
+	max-height: 320px;
+	overflow-y: auto;
+	scrollbar-width: thin;
 }
 
 .planboard-goal-chapter {
@@ -2867,4 +2956,69 @@
 .planboard-mode-child.is-checked .planboard-check-text {
 	text-decoration: line-through;
 	color: var(--text-faint);
+}
+
+/* ADR-0016: 生活事项——逾期挂账徽标（非该做日出现的补做行） */
+.planboard-chore-overdue {
+	flex-shrink: 0;
+	font-size: 10px;
+	font-weight: 600;
+	padding: 1px 6px;
+	border-radius: 999px;
+	color: var(--text-on-accent);
+	background: var(--background-modifier-error);
+	opacity: 0.85;
+}
+
+/* ADR-0016: 周期「每周几」多选按钮排 */
+.planboard-chore-weekdays {
+	display: flex;
+	gap: 4px;
+}
+.planboard-chore-weekday {
+	min-width: 26px;
+	height: 24px;
+	padding: 0 6px;
+	font-size: 12px;
+	border-radius: 6px;
+	cursor: pointer;
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	border: 1px solid var(--background-modifier-border);
+}
+.planboard-chore-weekday.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	border-color: var(--interactive-accent);
+}
+
+/* ADR-0016: 生活事项管理弹窗行 */
+.planboard-chore-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 6px 4px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+.planboard-chore-row-info {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+}
+.planboard-chore-row-name {
+	font-weight: 600;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.planboard-chore-row-ops {
+	display: flex;
+	gap: 4px;
+	flex-shrink: 0;
+}
+.planboard-chore-del-armed {
+	color: var(--text-on-accent) !important;
+	background: var(--background-modifier-error) !important;
 }

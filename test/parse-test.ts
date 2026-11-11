@@ -4,11 +4,12 @@
  * - task pool line round-trip
  * - date-window filtering for week/month
  */
-import { parsePlansFromFrontmatter, filterTasksInRange, summarizeTasks, computeQuotaDaily, quotaExpected } from "../src/stats";
-import { parseTaskPool, buildPoolLine, autoWeekContext, autoQuota, autoTaskNumbers, planCounterUnit, isAutoTask, extractGoalName, groupPoolTasksByGoal, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, suggestNextUnit, isRestartUnit, type GoalLevel } from "../src/tasks";
-import { parseQuotaActual, parseQuotaAmount, buildQuotaCheckLine, missingQuotaLines, setQuotaActual, formatQuotaAmount, buildModeCheckLine, missingModeLines, markTaskLineManual, matchesModeLine, MANUAL_MARK, toggleTaskLine } from "../src/daily";
+import { parsePlansFromFrontmatter, filterTasksInRange, summarizeTasks, computeQuotaDaily, computeWritingDaily, quotaExpected } from "../src/stats";
+import { parseTaskPool, buildPoolLine, autoWeekContext, autoQuota, autoTaskNumbers, planCounterUnit, isAutoTask, extractGoalName, groupPoolTasksByGoal, diffShareClear, expandGoalStructure, expandGoalLeaves, chaptersToStructure, rescheduleChapterLine, suggestNextUnit, isRestartUnit, type GoalLevel } from "../src/tasks";
+import { parseQuotaActual, parseQuotaAmount, buildQuotaCheckLine, missingQuotaLines, setQuotaActual, formatQuotaAmount, buildModeCheckLine, missingModeLines, markTaskLineManual, clearManualMark, matchesModeLine, matchesWritingLine, MANUAL_MARK, toggleTaskLine, parseChoreCycle, parseChoreOverdue, choreCycleLabel, isChoreDueOn, prevChoreOccurrence, nextChoreOccurrence, choreOccurrences, missingChoreLines, scanChoreHit, CHECK_HEADING, type GoalCycle } from "../src/daily";
 import { parseToc, parseTocLine, tocSummary } from "../src/toc";
 import { parseReviewItems, buildBzgSnapshot, reviewedOn, distinctReviewedInRange, diaryDayWritten, utcToLocalDay } from "../src/bzg";
+import { nextDayPlanTransform, extractNextDayPlanSection } from "../src/diary-sync";
 import { TFile } from "obsidian";
 
 let failed = 0;
@@ -636,16 +637,20 @@ const withModeLine = existingDaily + "- [ ] 🗣️ 文献复习 5篇 #计划/�
 check("missing mode lines: review exists", missingModeLines(withModeLine, [spec], "2026-11-08").length === 0, undefined);
 check("missing mode lines: label prefix tolerated", missingModeLines(existingDaily + "- [ ] 🗣️ 文献复习 5篇（实 3篇）✋ #计划/学习 🛫 2026-11-08 📅 2026-11-08\n", [spec], "2026-11-08").length === 0, undefined);
 
-// 手动标记：勾选 + ✋，重复打标幂等
+// 手动标记：勾选 + ✋，重复打标幂等（阅读联动专用——模式行已无 ✋ 豁免，ADR-0011）
 const toggled = toggleTaskLine(modeLine, 0, true);
 const marked = markTaskLineManual(toggled, 0);
 check("manual mark applied", marked.includes(MANUAL_MARK) && marked.startsWith("- [x]"), marked);
 check("manual mark idempotent", markTaskLineManual(marked, 0) === marked, undefined);
 check("manual actual parsed with ✋", parseQuotaActual(`🗣️ 文献复习 5篇（实 10篇）${MANUAL_MARK}`) === 10, undefined);
-const rewritten = setQuotaActual(marked, 0, 10, "篇", true, undefined, true);
-check("setQuotaActual keeps manual mark", rewritten.includes(MANUAL_MARK) && rewritten.includes("（实 10篇）"), rewritten);
-const autoRewrite = setQuotaActual(marked, 0, 3, "篇", false, undefined, false);
+const rewritten = setQuotaActual(marked, 0, 10, "篇", true);
+check("setQuotaActual drops manual mark (ADR-0011)", !rewritten.includes(MANUAL_MARK) && rewritten.includes("（实 10篇）"), rewritten);
+const autoRewrite = setQuotaActual(marked, 0, 3, "篇", false);
 check("auto rewrite strips manual mark", !autoRewrite.includes(MANUAL_MARK) && autoRewrite.startsWith("- [ ]"), autoRewrite);
+const cleared = clearManualMark(marked, 0);
+check("clearManualMark strips ✋ keeps state", !cleared.includes(MANUAL_MARK) && cleared.startsWith("- [x]") && cleared.includes("5篇"), cleared);
+check("clearManualMark idempotent", clearManualMark(cleared, 0) === cleared, undefined);
+check("clearManualMark no-mark no-op", clearManualMark(toggled, 0) === toggled, undefined);
 
 // --- N+1. ADR-0008 书组：目标名提取 + 今日级联按书分组 -----------------------
 check("goal name: multi-level leaf", extractGoalName("认知觉醒（第 5 章第 2 节）") === "认知觉醒");
@@ -834,6 +839,116 @@ check("modeLine: parent default line NOT matched (floor=0)", !matchesModeLine("�
 check("modeLine: wrong floor amount not matched", !matchesModeLine("🗣️ 文献复习 5篇", "文献复习", 10, "篇"), undefined);
 
 
+// --- 今日打卡大项口径（topLevelCheckRows：模式子行折叠进父行，ADR-0012） ------
+import { topLevelCheckRows, parseDailyContent } from "../src/daily";
+import type { CheckItem } from "../src/daily";
+// 用户截图场景：6/9（按行）应聚合为 3/5（按大项）
+const dailyMd = [
+	"# 2026-11-10",
+	"## ✅ 今日打卡",
+	"- [ ] 📈 复盘 复盘+次日计划 #计划/复盘",
+	"- [x] 📖 阅读 #计划/阅读",
+	"- [x] 🧠 笔记复习 #计划/笔记复习",
+	"- [x] 🗣️ 文献复习 5篇（实 9篇） #计划/笔记复习",
+	"- [x] 📝 日记 #计划/日记",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [x] 🏃 拉升 1次 #计划/运动",
+	"- [ ] 🏃 八段锦 1次 #计划/运动",
+	"- [x] 🏃 平板撑 3组 #计划/运动",
+].join("\n");
+const dailyFile = new TFile() as any;
+dailyFile.path = "2025/每日/2026-11-10.md";
+dailyFile.name = "2026-11-10.md";
+const parsed = parseDailyContent(dailyFile, dailyMd, "2026-11-10");
+check("topRows: 解析出 9 行带计划标签行", parsed.checkItems.length === 9, parsed.checkItems.length);
+// 模式行谓词：与视图 modeLineMatch 同构（matchesModeLine 逐目标判定）
+const modeGoals = [
+	{ plan: "笔记复习", name: "文献复习", floor: 5, unit: "篇" },
+	{ plan: "运动", name: "拉升", floor: 1, unit: "次" },
+	{ plan: "运动", name: "八段锦", floor: 1, unit: "次" },
+	{ plan: "运动", name: "平板撑", floor: 3, unit: "组" },
+];
+const isModeLine = (it: CheckItem) =>
+	modeGoals.some((g) => g.plan === it.plan && matchesModeLine(it.text, g.name, g.floor, g.unit));
+const rows = topLevelCheckRows(parsed.checkItems, isModeLine);
+check("topRows: 大项总数 = 5（4 个模式子行折叠）", rows.length === 5, rows.length);
+check("topRows: 完成大项 = 3", rows.filter((r) => r.done).length === 3, rows.filter((r) => r.done).length);
+check("topRows: 父行勾选即完成（笔记复习）", rows.find((r) => r.item.plan === "笔记复习")?.done === true);
+check("topRows: 子行未全勾父行不算完成（运动）", rows.find((r) => r.item.plan === "运动")?.done === false);
+check("topRows: 父行挂到全部模式子行（运动 3 子）", rows.find((r) => r.item.plan === "运动")?.modeChildren.length === 3);
+// 回填间隙：父行未勾、子行全勾 → 大项视为完成（与「勾满子 → 父自动勾」同一把尺）
+const gapMd = dailyMd
+	.replace("- [x] 🧠 笔记复习", "- [ ] 🧠 笔记复习")
+	.replace("- [ ] 🏃 运动 每天半小时 #计划/运动", "- [x] 🏃 运动 每天半小时 #计划/运动");
+const gapRows = topLevelCheckRows(parseDailyContent(dailyFile, gapMd, "2026-11-10").checkItems, isModeLine);
+check("topRows: 父未勾子全勾 = 完成（回填间隙不吞完成度）", gapRows.find((r) => r.item.plan === "笔记复习")?.done === true);
+check("topRows: 父勾子未全勾 = 完成（父勾优先）", gapRows.find((r) => r.item.plan === "运动")?.done === true);
+// 无父行的模式行保持顶层（渲染同款兜底）
+const orphanMd = [
+	"## ✅ 今日打卡",
+	"- [x] 🗣️ 文献复习 5篇（实 9篇） #计划/笔记复习",
+].join("\n");
+const orphanRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanMd, "2026-11-10").checkItems, isModeLine);
+check("topRows: 无父行模式行保持顶层且计入", orphanRows.length === 1 && orphanRows[0].modeChildren.length === 0 && orphanRows[0].done, JSON.stringify(orphanRows));
+// 无模式行时全部平铺（老口径兼容：谓词恒 false）
+check("topRows: 无模式行 = 全部独立大项", topLevelCheckRows(parsed.checkItems, () => false).length === 9);
+
+
+// --- 刷新期父行对账（parentCheckTargets：待办清空 → 勾父，ADR-0013） ----------
+import { parentCheckTargets, type ParentRollupFact } from "../src/daily";
+// 用户截图场景：阅读 3/3 本叶子勾满（weave 自动勾），父行未勾 → 对账入账
+const rollupMd = [
+	"# 2026-11-11",
+	"## ✅ 今日打卡",
+	"- [ ] 📖 阅读 #计划/阅读",
+	"- [x] 🗣️ 文献复习 5篇（实 9篇） #计划/笔记复习",
+	"- [ ] 🧠 笔记复习 #计划/笔记复习",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [x] 🏃 拉升 1次 #计划/运动",
+	"- [x] 🏃 平板撑 3组 #计划/运动",
+	"- [ ] 🧘 冥想 #计划/冥想",
+].join("\n");
+const rollupFacts: ParentRollupFact[] = [
+	{ plan: "阅读", live: true, pendingEmpty: true },
+	{ plan: "笔记复习", live: true, pendingEmpty: true },
+	{ plan: "运动", live: true, pendingEmpty: true },
+	{ plan: "冥想", live: false, pendingEmpty: true }, // 纯打卡计划：无目标恒不自动勾
+];
+const rollupModePredicate = (plan: string, text: string): boolean =>
+	modeGoals.some((g) => g.plan === plan && matchesModeLine(text, g.name, g.floor, g.unit));
+const rollupTargets = parentCheckTargets(rollupMd, rollupFacts, rollupModePredicate);
+check("rollup: 待办清空 → 阅读父行入账", rollupTargets.some((t) => t.plan === "阅读"), rollupTargets);
+check("rollup: 模式行全勾 → 笔记复习父行入账（模式行在前不挡父行识别）", rollupTargets.some((t) => t.plan === "笔记复习"));
+check("rollup: 模式行全勾 → 运动父行入账", rollupTargets.some((t) => t.plan === "运动"));
+check("rollup: 纯打卡行（无目标）不自动勾", !rollupTargets.some((t) => t.plan === "冥想"));
+check("rollup: 目标带行号与原文（可直落 toggleTaskLine）", rollupTargets.find((t) => t.plan === "阅读")?.line === 2);
+const applied = rollupTargets.reduce((acc, t) => toggleTaskLine(acc, t.line, true, t.raw), rollupMd);
+check("rollup: 落勾后父行为 [x]", applied.includes("- [x] 📖 阅读 #计划/阅读"), applied.split("\n")[2]);
+check("rollup: 待办未清不勾", !parentCheckTargets(rollupMd, rollupFacts.map((f) => (f.plan === "阅读" ? { ...f, pendingEmpty: false } : f)), rollupModePredicate).some((t) => t.plan === "阅读"));
+check("rollup: 窗口外计划不勾", !parentCheckTargets(rollupMd, rollupFacts.map((f) => (f.plan === "阅读" ? { ...f, live: false } : f)), rollupModePredicate).some((t) => t.plan === "阅读"));
+check("rollup: 父行 ✋ 豁免", !parentCheckTargets(rollupMd.replace("- [ ] 📖 阅读 #计划/阅读", "- [ ] 📖 阅读 ✋ #计划/阅读"), rollupFacts, rollupModePredicate).some((t) => t.plan === "阅读"));
+check("rollup: 已勾父行不再入账（幂等）", !parentCheckTargets(rollupMd.replace("- [ ] 📖 阅读 #计划/阅读", "- [x] 📖 阅读 #计划/阅读"), rollupFacts, rollupModePredicate).some((t) => t.plan === "阅读"));
+check("rollup: 模式子行未全勾不勾父行", !parentCheckTargets(rollupMd.replace("- [x] 🏃 拉升 1次 #计划/运动", "- [ ] 🏃 拉升 1次 #计划/运动"), rollupFacts, rollupModePredicate).some((t) => t.plan === "运动"));
+const twiceTargets = parentCheckTargets(rollupMd + "\n- [ ] 📖 又一行 #计划/阅读", rollupFacts, rollupModePredicate);
+check("rollup: 同计划只认第一个非模式行", twiceTargets.filter((t) => t.plan === "阅读").length === 1);
+check("rollup: 只扫今日打卡区", parentCheckTargets("## 📌 其他\n- [ ] 📖 阅读 #计划/阅读\n", [{ plan: "阅读", live: true, pendingEmpty: true }], () => false).length === 0);
+
+// --- ADR-0015 独立完成事实（复盘 = 日记当日复盘小节非空 → factDone 直通勾父行） ----------
+const factMd = [
+	"# 2026-11-11",
+	"## ✅ 今日打卡",
+	"- [ ] 📈 复盘 #计划/复盘",
+].join("\n");
+const factFacts: ParentRollupFact[] = [{ plan: "复盘", live: false, pendingEmpty: true, factDone: true }];
+const factTargets = parentCheckTargets(factMd, factFacts, () => false);
+check("fact: 事实为真 → 无窗口/无待办也勾父行", factTargets.length === 1 && factTargets[0].plan === "复盘", factTargets);
+check("fact: 事实为假 → 纯打卡行仍不勾", parentCheckTargets(factMd, [{ plan: "复盘", live: false, pendingEmpty: true }], () => false).length === 0);
+check("fact: factDone:false 同不勾", parentCheckTargets(factMd, [{ plan: "复盘", live: false, pendingEmpty: true, factDone: false }], () => false).length === 0);
+check("fact: ✋ 豁免对事实勾同样生效", parentCheckTargets(factMd.replace("- [ ] 📈 复盘 #计划/复盘", "- [ ] 📈 复盘 ✋ #计划/复盘"), factFacts, () => false).length === 0);
+check("fact: 已勾幂等不再入账", parentCheckTargets(factMd.replace("- [ ] 📈 复盘 #计划/复盘", "- [x] 📈 复盘 #计划/复盘"), factFacts, () => false).length === 0);
+check("fact: 事实勾可直落 toggleTaskLine", toggleTaskLine(factMd, factTargets[0].line, true, factTargets[0].raw).includes("- [x] 📈 复盘 #计划/复盘"));
+
+
 // --- 手工补录条目的锚点回填（ADR-0009 补遗） --------------------------------
 import { normalizeTocLabel, resolveMissingAnchors, inferNeighborSpines } from "../src/weave-bridge";
 check("norm: 标题归一化", normalizeTocLabel("6.27 高位窄幅震荡、放量（二）") === "627高位窄幅震荡放量二", normalizeTocLabel("6.27 高位窄幅震荡、放量（二）"));
@@ -902,5 +1017,285 @@ check("paste labels: 附带每层标题", pt?.levels[0].labels?.[0] === "第1章
 const ptLeaves = expandGoalStructure("书", pt!.levels);
 check("paste labels: 叶名带真实标题", ptLeaves[0]?.name === "书（第1章 初见·1.1 相遇）", ptLeaves[0]?.name);
 
-console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
-process.exit(failed === 0 ? 0 : 1);
+// --- ADR-0010 写作模式：按字数配额 / 按章节平铺 ------------------------------
+const fmWriting = `---
+plans:
+  - name: 小说
+    label: "✍️"
+    goals:
+      - name: 《三体》
+        count: 0
+        unit: 字
+        mode: writing
+        floor: 1166.7
+        writingQuota:
+          total: 100000
+          unit: 字
+          start: 2026-01-01
+          end: 2026-12-31
+          initial: 20000
+      - name: 《黑暗森林》
+        count: 3
+        unit: 章
+        mode: writing
+        structure:
+          - unit: 章
+            counts: [3]
+---
+`;
+const defsW = parsePlansFromFrontmatter(fmWriting);
+const wPlan = defsW[0];
+check("writing: 计划为数量型", wPlan?.type === "numeric");
+const wq = wPlan?.goals[0];
+check("writing: mode=writing 解析", wq?.mode === "writing");
+check("writing: 目标级字数配额解析", wq?.writingQuota?.total === 100000 && wq?.writingQuota?.end === "2026-12-31", JSON.stringify(wq?.writingQuota));
+check("writing: 接续初始量解析", wq?.writingQuota?.initial === 20000);
+check("writing: floor 冻结配额原样保留", wq?.floor === 1166.7);
+const wc = wPlan?.goals[1];
+check("writing: 按章节 = 1 级章结构平铺", wc?.mode === "writing" && wc?.structure?.[0]?.counts?.[0] === 3 && !wc?.writingQuota);
+const wLeaves = expandGoalLeaves("《黑暗森林》", wc!);
+check("writing: 章叶命名「第 N 章」全书连续", wLeaves?.[0]?.name === "《黑暗森林》（第 1 章）" && wLeaves?.[2]?.name === "《黑暗森林》（第 3 章）", JSON.stringify(wLeaves?.map((l) => l.name)));
+
+// 每日配额：(总量 − 接续初始量) ÷ 天数，1 位小数（创建时一次算死）
+check("writing daily: 8 万字 ÷ 365 天", computeWritingDaily(100000, 20000, "2026-01-01", "2026-12-31") === Math.round((80000 / 365) * 10) / 10, computeWritingDaily(100000, 20000, "2026-01-01", "2026-12-31"));
+check("writing daily: initial=0 与 quota 同口径", computeWritingDaily(100000, 0, "2026-01-01", "2026-01-31") === computeQuotaDaily(100000, "2026-01-01", "2026-01-31"));
+
+// 写作行识别：放宽匹配（目标名开头 + 名后带数字），配额编辑后旧行数字过期仍认（跨变更累计）
+check("writing line: 识别配额行含实量", matchesWritingLine("✍️ 《三体》 1166.7字（实 800字）", "《三体》"));
+check("writing line: 识别历史旧配额行", matchesWritingLine("✍️ 《三体》 999字", "《三体》"));
+check("writing line: 无数字不认（计划默认行防误判）", !matchesWritingLine("✍️ 《三体》 每天写", "《三体》"));
+check("writing line: 他人名字不认", !matchesWritingLine("✍️ 《球状闪电》 500字", "《三体》"));
+
+// --- 份额清空提醒 diffShareClear：只认 false → true 跃迁 ---------------------
+{
+	const r = diffShareClear(null, [{ key: "阅读||三体", name: "三体", cleared: true }]);
+	check("shareClear: 首轮基线不提醒", r.cleared.length === 0, r.cleared);
+	check("shareClear: 首轮快照落位", r.next.get("阅读||三体") === true);
+}
+{
+	const prev = new Map([["阅读||三体", false]]);
+	const r = diffShareClear(prev, [{ key: "阅读||三体", name: "三体", cleared: true }]);
+	check("shareClear: false→true 跃迁提醒", r.cleared.length === 1 && r.cleared[0] === "三体", r.cleared);
+}
+{
+	const prev = new Map([["阅读||三体", true]]);
+	const r = diffShareClear(prev, [{ key: "阅读||三体", name: "三体", cleared: true }]);
+	check("shareClear: 已清空保持静默", r.cleared.length === 0, r.cleared);
+}
+{
+	const prev = new Map([["阅读||三体", false]]);
+	const r = diffShareClear(prev, [{ key: "阅读||三体", name: "三体", cleared: false }]);
+	check("shareClear: 未清空静默且快照跟随", r.cleared.length === 0 && r.next.get("阅读||三体") === false);
+}
+{
+	const prev = new Map([["阅读||三体", false], ["阅读||红楼梦", false]]);
+	const r = diffShareClear(prev, [
+		{ key: "阅读||三体", name: "三体", cleared: true },
+		{ key: "阅读||红楼梦", name: "红楼梦", cleared: true },
+	]);
+	check("shareClear: 同批多书齐跃迁（合并一条）", r.cleared.length === 2 && r.next.size === 2, r.cleared);
+}
+{
+	// 新进分母的书（首见即 cleared，如打开视图时早已勾完）按基线处理，不触发
+	const prev = new Map([["阅读||旧书", false]]);
+	const r = diffShareClear(prev, [
+		{ key: "阅读||旧书", name: "旧书", cleared: false },
+		{ key: "阅读||新书", name: "新书", cleared: true },
+	]);
+	check("shareClear: 首见即清空按基线不提醒", r.cleared.length === 0 && r.next.size === 2, r.cleared);
+}
+{
+	// 退勾再勾满：true→false→true 每次跃迁都提醒（不做当日去重）
+	const afterUncheck = diffShareClear(new Map([["阅读||三体", true]]), [{ key: "阅读||三体", name: "三体", cleared: false }]);
+	check("shareClear: 退勾回落静默", afterUncheck.cleared.length === 0 && afterUncheck.next.get("阅读||三体") === false);
+	const afterRecheck = diffShareClear(afterUncheck.next, [{ key: "阅读||三体", name: "三体", cleared: true }]);
+	check("shareClear: 重勾再跃迁再提醒", afterRecheck.cleared.length === 1, afterRecheck.cleared);
+}
+
+// --- ADR-0014: 次日计划（日记「# 次日计划」）写入/提取 ---------------------------------------
+{
+	// 首写・无当日复盘：插在「# 随笔」小节结束处（与复盘同一套锚点规则；标题后空行同构）
+	const diary = ["# 睡眠相关", "23:30-07:00", "", "# 随笔", "想到什么写什么。", "", "# 新闻联播", ""].join("\n");
+	const out = nextDayPlanTransform(diary, "明日待办一");
+	const expected = ["# 睡眠相关", "23:30-07:00", "", "# 随笔", "想到什么写什么。", "", "# 次日计划", "", "明日待办一", "", "# 新闻联播", ""].join("\n");
+	check("nextDay: 首写插在随笔节尾", out === expected, out);
+}
+{
+	// 首写・有当日复盘：插在「# 当日复盘」节尾（旧「## 明日计划」子节是复盘正文，不截断不挪动）
+	const diary = ["# 随笔", "随笔内容", "", "# 当日复盘", "复盘内容", "", "## 明日计划", "- 旧内容", "", "# 新闻联播", ""].join("\n");
+	const out = nextDayPlanTransform(diary, "新计划");
+	const expected = ["# 随笔", "随笔内容", "", "# 当日复盘", "复盘内容", "", "## 明日计划", "- 旧内容", "", "# 次日计划", "", "新计划", "", "# 新闻联播", ""].join("\n");
+	check("nextDay: 锚点当日复盘节尾，## 子节不被截断", out === expected, out);
+}
+{
+	// 幂等：同一内容重复写入，全文不变且标题唯一
+	const diary = ["# 随笔", "", "# 新闻联播", ""].join("\n");
+	const once = nextDayPlanTransform(diary, "计划内容")!;
+	const twice = nextDayPlanTransform(once, "计划内容")!;
+	check("nextDay: 重复写入幂等", twice === once, twice);
+	check("nextDay: 标题唯一", once.split("# 次日计划").length === 2, once);
+}
+{
+	// 首尾空行掐掉、正文中间空行与 ## 子标题原样保留
+	const diary = ["# 随笔", "内容", "", "# 新闻联播", ""].join("\n");
+	const out = nextDayPlanTransform(diary, "\n第一行\n\n## 分节\n第二行\n\n")!;
+	const expected = ["# 随笔", "内容", "", "# 次日计划", "", "第一行", "", "## 分节", "第二行", "", "# 新闻联播", ""].join("\n");
+	check("nextDay: 正文空行/子标题原样，首尾空行规整", out === expected, out);
+}
+{
+	// 无「# 当日复盘」也无「# 随笔」→ 无锚点返回 null
+	check("nextDay: 双锚点缺失返回 null", nextDayPlanTransform("# 日记\n正文\n", "x") === null, undefined);
+	// 已有小节但位置任意（用户手动挪过）→ 原位替换，不搬回锚点处
+	const moved = ["# 次日计划", "", "旧计划", "", "# 随笔", "内容", ""].join("\n");
+	const out = nextDayPlanTransform(moved, "新计划");
+	const expectedMoved = ["# 次日计划", "", "新计划", "", "# 随笔", "内容", ""].join("\n");
+	check("nextDay: 已有小节原位替换不搬家", out === expectedMoved, out);
+}
+{
+	// 提取：掐首尾空行，## 子标题属本小节；无小节返回 null
+	const diary = ["# 随笔", "内容", "", "# 次日计划", "", "第一行", "", "## 分节", "第二行", "", "# 新闻联播", ""].join("\n");
+	check("extract nextDay: 正文含子标题", extractNextDayPlanSection(diary) === ["第一行", "", "## 分节", "第二行"].join("\n"), extractNextDayPlanSection(diary));
+	check("extract nextDay: 无小节返回 null", extractNextDayPlanSection("# 随笔\n内容\n") === null, undefined);
+}
+
+// --- ADR-0016: 生活事项固定日子式周期——解析与文案 --------------------------------------------
+{
+	const c = parseChoreCycle({ unit: "week", days: [0] });
+	check("cycle: week 单位直认", c?.unit === "week" && c.days.length === 1 && c.days[0] === 0, c);
+	const d = parseChoreCycle({ unit: "每天", days: [1, 2] });
+	check("cycle: 中文单位每天（days 忽略归空）", d?.unit === "day" && d.days.length === 0, d);
+	const m = parseChoreCycle({ unit: "month", days: "21, 1, 11" });
+	check("cycle: 字符串 days 解析并排序去重", !!m && m.unit === "month" && m.days.join(",") === "1,11,21", m);
+	const y = parseChoreCycle({ unit: "year", days: [3, 1] });
+	check("cycle: year 二元组 [月, 日]", y?.unit === "year" && y.days[0] === 3 && y.days[1] === 1, y);
+	check("cycle: 非对象 → undefined", parseChoreCycle("week") === undefined, undefined);
+	check("cycle: week 空 days → undefined", parseChoreCycle({ unit: "week", days: [] }) === undefined, undefined);
+	check("cycle: week 越界 → undefined", parseChoreCycle({ unit: "week", days: [7] }) === undefined, undefined);
+	check("cycle: month 越界 → undefined", parseChoreCycle({ unit: "month", days: [0, 32] }) === undefined, undefined);
+	check("cycle: year 缺日子 → undefined", parseChoreCycle({ unit: "year", days: [3] }) === undefined, undefined);
+	check("cycle: 未知单位 → undefined", parseChoreCycle({ unit: "hour", days: [1] }) === undefined, undefined);
+	check("overdue: postpone 直认", parseChoreOverdue("postpone") === "postpone", undefined);
+	check("overdue: 中文往后延", parseChoreOverdue("往后延") === "postpone", undefined);
+	check("overdue: 放弃/skip → undefined（缺省即放弃，不落盘）", parseChoreOverdue("放弃") === undefined && parseChoreOverdue("skip") === undefined, undefined);
+	check("label: 每天", choreCycleLabel({ unit: "day", days: [] }) === "每天", undefined);
+	check("label: 每周单日", choreCycleLabel({ unit: "week", days: [0] }) === "每周日", undefined);
+	check("label: 每周多日", choreCycleLabel({ unit: "week", days: [4, 1] }) === "每周一、周四", undefined);
+	check("label: 每月多号", choreCycleLabel({ unit: "month", days: [21, 1, 11] }) === "每月 1、11、21 号", undefined);
+	check("label: 每年", choreCycleLabel({ unit: "year", days: [3, 1] }) === "每年 3 月 1 日", undefined);
+	check("label: 顺延后缀", choreCycleLabel({ unit: "day", days: [] }, "postpone") === "每天 · 漏了往后延", undefined);
+}
+
+// --- ADR-0016: 该做日判定 / 相邻该做日 / 窗口枚举 --------------------------------------------
+{
+	const daily: GoalCycle = { unit: "day", days: [] };
+	check("due: 每天恒真", isChoreDueOn(daily, "2026-11-11") && isChoreDueOn(daily, "2027-01-01"), undefined);
+	const sunday: GoalCycle = { unit: "week", days: [0] };
+	// 2026-11-15 = 周日、11-16 = 周一（已核对日历）
+	check("due: 每周日——周日真周一假", isChoreDueOn(sunday, "2026-11-15") && !isChoreDueOn(sunday, "2026-11-16"), undefined);
+	const monThu: GoalCycle = { unit: "week", days: [1, 4] };
+	check("due: 每周一/四——两天真其余假", isChoreDueOn(monThu, "2026-11-09") && isChoreDueOn(monThu, "2026-11-12") && !isChoreDueOn(monThu, "2026-11-10"), undefined);
+	const month31: GoalCycle = { unit: "month", days: [31] };
+	check("due: 每月31号——大月真小月落月末", isChoreDueOn(month31, "2026-01-31") && !isChoreDueOn(month31, "2026-04-29") && isChoreDueOn(month31, "2026-04-30"), undefined);
+	const year229: GoalCycle = { unit: "year", days: [2, 29] };
+	check("due: 每年2/29——闰年真平年落2/28", isChoreDueOn(year229, "2024-02-29") && isChoreDueOn(year229, "2023-02-28") && !isChoreDueOn(year229, "2023-03-01"), undefined);
+	check("prev: 周一往回找上周日", prevChoreOccurrence(sunday, "2026-11-16") === "2026-11-15", prevChoreOccurrence(sunday, "2026-11-16"));
+	check("prev: 该做日当天返回当天", prevChoreOccurrence(sunday, "2026-11-15") === "2026-11-15", undefined);
+	check("prev: 每月31号从4/10回退到3/31", prevChoreOccurrence(month31, "2026-04-10") === "2026-03-31", prevChoreOccurrence(month31, "2026-04-10"));
+	check("prev: 年度从2/20回退到去年3/1", prevChoreOccurrence({ unit: "year", days: [3, 1] }, "2026-02-20") === "2025-03-01", undefined);
+	check("next: 周日的下一个是下周日", nextChoreOccurrence(sunday, "2026-11-15") === "2026-11-22", undefined);
+	check("next: 4/30（月末回落）的下一个是5/31", nextChoreOccurrence(month31, "2026-04-30") === "2026-05-31", nextChoreOccurrence(month31, "2026-04-30"));
+	check("next: 年度3/2的下一个是明年3/1", nextChoreOccurrence({ unit: "year", days: [3, 1] }, "2026-03-02") === "2027-03-01", undefined);
+	const occ = choreOccurrences(monThu, "2026-11-09", "2026-11-22");
+	check("occ: 每周一/四两周枚举 4 次", occ.join(",") === "2026-11-09,2026-11-12,2026-11-16,2026-11-19", occ);
+	check("occ: 起点=该做日含首不含尾后", choreOccurrences(sunday, "2026-11-15", "2026-11-15").join(",") === "2026-11-15", undefined);
+	check("occ: 起点晚于终点 → 空", choreOccurrences(sunday, "2026-11-20", "2026-11-15").length === 0, undefined);
+	check("occ: cap 截断", choreOccurrences(daily, "2026-01-01", "2026-12-31", 10).length === 10, undefined);
+	check("occ: 每年窗口内至多一次", choreOccurrences({ unit: "year", days: [3, 1] }, "2026-01-01", "2026-12-31").join(",") === "2026-03-01", undefined);
+}
+
+// --- ADR-0016: 生活事项行惰性补写（精确匹配幂等） --------------------------------------------
+{
+	const content = [
+		"---", "date: 2026-11-11", "---",
+		"# 📅 2026-11-11 星期三", "",
+		CHECK_HEADING,
+		"- [ ] 🏠 日常生活 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11",
+		"- [x] 洗碗 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11",
+		"", "## 📝 今日总结", "",
+	].join("\n");
+	const out = missingChoreLines(content, [
+		{ plan: "日常生活", name: "洗碗" },
+		{ plan: "日常生活", name: "做卫生" },
+	], "2026-11-11");
+	check(
+		"choreLines: 已存在（含已勾）不重建，缺失补一行",
+		out.length === 1 && out[0] === "- [ ] 做卫生 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11",
+		out
+	);
+}
+{
+	// 精确匹配：近名不顶替、异计划不算数、带后缀的行不算数
+	const content = [
+		CHECK_HEADING,
+		"- [ ] 洗碗机 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11",
+		"- [ ] 洗碗 #计划/家务 🛫 2026-11-11 📅 2026-11-11",
+		"- [ ] 买菜（第 2 次） #计划/日常生活 🛫 2026-11-11 📅 2026-11-11",
+	].join("\n");
+	const out = missingChoreLines(content, [
+		{ plan: "日常生活", name: "洗碗" },
+		{ plan: "日常生活", name: "买菜" },
+	], "2026-11-11");
+	check("choreLines: 精确匹配——近名/异计划/带后缀都不顶替", out.length === 2, out);
+}
+
+// --- ADR-0016: scanChoreHit——挂账清账的文件事实回扫 --------------------------------------------
+void (async () => {
+	// 最小 app stub：vault.getAbstractFileByPath + cachedRead（文件须是 mock TFile 实例——实现里有 instanceof 守卫）
+	const day = (name: string, lines: string[]): TFile => {
+		const f = new TFile();
+		f.path = `计划2026/每日/${name}.md`;
+		contents.set(f.path, [CHECK_HEADING, ...lines].join("\n"));
+		return f;
+	};
+	const contents = new Map<string, string>();
+	const files = [
+		day("2026-11-09", ["- [x] 洗碗 #计划/日常生活 🛫 2026-11-09 📅 2026-11-09"]),
+		day("2026-11-10", ["- [ ] 洗碗 #计划/日常生活 🛫 2026-11-10 📅 2026-11-10"]),
+		day("2026-11-11", ["- [x] 洗碗机 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11", "- [ ] 洗碗 #计划/家务 🛫 2026-11-11 📅 2026-11-11"]),
+	];
+	const app = {
+		vault: {
+			getAbstractFileByPath: (p: string) => files.find((f) => f.path === p) ?? null,
+			cachedRead: async (f: { path: string }) => contents.get(f.path) ?? "",
+		},
+	};
+	const prefix = "计划2026/每日/";
+	check(
+		"scanHit: 命中已勾行（正向）",
+		await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-09", "2026-11-09"),
+		undefined
+	);
+	check(
+		"scanHit: 未勾不算命中",
+		!(await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-10", "2026-11-10")),
+		undefined
+	);
+	check(
+		"scanHit: 近名/异计划不顶替（洗碗机/家务行不算）",
+		!(await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-11", "2026-11-11")),
+		undefined
+	);
+	check(
+		"scanHit: 窗口内任一天命中即真（11-09 已勾）",
+		await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-09", "2026-11-10"),
+		undefined
+	);
+	check(
+		"scanHit: backward 从 to 端回扫命中（越过 11-10 未勾，命中 11-09）",
+		await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-09", "2026-11-10", true),
+		undefined
+	);
+
+	console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
+	process.exit(failed === 0 ? 0 : 1);
+})();

@@ -386,7 +386,7 @@ export function buildQuotaCheckLine({ label, plan, quota, unit, date }: BuildQuo
  * Record the actual amount on a quota line (replacing any previous `（实 …）`)
  * and set its checkbox. `actual <= 0` clears the suffix. Other line parts
  * (plan tag / 🛫 / 📅) are preserved from the parsed groups.
- * `manual = true` 时追加 `✋` 手动标记（ADR-0007：标记后自动逻辑不再碰该行）。
+ * 残留的 `✋` 一并剥除（ADR-0011：模式行取消手动豁免，勾选/实数一律镜像完成事实）。
  */
 export function setQuotaActual(
 	content: string,
@@ -394,8 +394,7 @@ export function setQuotaActual(
 	actual: number,
 	unit: string,
 	checked: boolean,
-	expectedRaw?: string,
-	manual = false
+	expectedRaw?: string
 ): string {
 	const lines = content.split("\n");
 	let idx = lineIndex;
@@ -409,7 +408,7 @@ export function setQuotaActual(
 	if (!m) return content;
 	const text = m[2].trim().replace(/（实[^）]*）\s*(?:✋\s*)?$/, "").replace(MANUAL_MARK, "").trimEnd();
 	const actualPart = actual > 0 ? `（实 ${formatQuotaAmount(actual)}${unit}）` : "";
-	let rebuilt = `- [${checked ? "x" : " "}] ${text}${actualPart}${manual ? MANUAL_MARK : ""}`;
+	let rebuilt = `- [${checked ? "x" : " "}] ${text}${actualPart}`;
 	if (m[3]) rebuilt += ` #计划/${m[3]}`;
 	if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
 	if (m[5]) rebuilt += ` 📅 ${m[5]}`;
@@ -418,8 +417,9 @@ export function setQuotaActual(
 }
 
 /**
- * 给任务行打 `✋` 手动标记（ADR-0007）。已有标记则原样返回（幂等）。
- * 用户在 UI 里手动勾/退勾的模式行会调用——之后自动逻辑不再碰该行。
+ * 给任务行打 `✋` 手动标记。已有标记则原样返回（幂等）。
+ * 仅阅读联动使用（ADR-0009：联动叶手动退勾/推进忽略落 ✋，此后自动逻辑不再勾该叶）；
+ * 模式行已无 ✋ 豁免（ADR-0011：事实优先）。
  */
 export function markTaskLineManual(content: string, lineIndex: number, expectedRaw?: string): string {
 	const lines = content.split("\n");
@@ -434,6 +434,30 @@ export function markTaskLineManual(content: string, lineIndex: number, expectedR
 	const m = TASK_LINE_RE.exec(line.trim());
 	if (!m) return content;
 	let rebuilt = `- [${m[1]}] ${m[2].trimEnd()}${MANUAL_MARK}`;
+	if (m[3]) rebuilt += ` #计划/${m[3]}`;
+	if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
+	if (m[5]) rebuilt += ` 📅 ${m[5]}`;
+	lines[idx] = rebuilt;
+	return lines.join("\n");
+}
+
+/**
+ * 清除任务行上的 `✋` 手动标记，勾选态/实数/标签/日期原样保留（幂等）。
+ * ADR-0011：模式行取消手动豁免后，存量行的残留标记由自动回填顺带清掉；
+ * 阅读联动的 ✋ 不走模式行回填，不受影响。
+ */
+export function clearManualMark(content: string, lineIndex: number, expectedRaw?: string): string {
+	const lines = content.split("\n");
+	let idx = lineIndex;
+	if (expectedRaw && lines[idx] !== expectedRaw) {
+		idx = lines.findIndex((l) => l === expectedRaw);
+		if (idx === -1) return content;
+	}
+	const line = lines[idx];
+	if (line === undefined || !line.includes(MANUAL_MARK)) return content;
+	const m = TASK_LINE_RE.exec(line.trim());
+	if (!m) return content;
+	let rebuilt = `- [${m[1]}] ${m[2].replace(MANUAL_MARK, "").trimEnd()}`;
 	if (m[3]) rebuilt += ` #计划/${m[3]}`;
 	if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
 	if (m[5]) rebuilt += ` 📅 ${m[5]}`;
@@ -485,6 +509,65 @@ export function matchesModeLine(text: string, name: string, floor: number, unit:
 		return stripped.startsWith(name) && stripped.includes(`${formatQuotaAmount(floor)}${unit || ""}`);
 	}
 	return stripped === name;
+}
+
+/** 大项口径下的一个顶层打卡行（今日打卡进度 / 连续打卡共用的计数单位）。 */
+export interface TopCheckRow {
+	/** 顶层行自身（非模式子行的打卡行）。 */
+	item: CheckItem;
+	/** 嵌套渲染在该父行下的模式子行（保持文件顺序）。 */
+	modeChildren: CheckItem[];
+	/** 聚合完成态：自身已勾，或模式子行全勾（与「勾满子 → 父自动勾」级联同一把尺）。 */
+	done: boolean;
+}
+
+/**
+ * 今日打卡大项口径（ADR-0012）：顶层行 = 非模式行；同计划首个非模式行是该计划的
+ * 父行，模式行嵌套其下（ADR-0006，与 updateChecklist 的渲染嵌套同一规则）。
+ * 父行聚合完成态含「子行全勾」——回填勾子与级联勾父的间隙不吞完成度。
+ * 无父行的模式行保持顶层（渲染同款兜底），任务池子任务不进此口径（书叶有自己的今日书进度）。
+ */
+export function topLevelCheckRows(
+	checkItems: CheckItem[],
+	isModeLine: (item: CheckItem) => boolean
+): TopCheckRow[] {
+	const childrenOf = new Map<CheckItem, CheckItem[]>();
+	const isChild = new Set<CheckItem>();
+	for (const item of checkItems) {
+		if (!item.plan || !isModeLine(item)) continue;
+		const parent = checkItems.find((it) => it.plan === item.plan && !isModeLine(it));
+		if (!parent) continue;
+		isChild.add(item);
+		const arr = childrenOf.get(parent) ?? [];
+		arr.push(item);
+		childrenOf.set(parent, arr);
+	}
+	return checkItems
+		.filter((it) => !isChild.has(it))
+		.map((item) => {
+			const modeChildren = childrenOf.get(item) ?? [];
+			return {
+				item,
+				modeChildren,
+				done: item.checked || (modeChildren.length > 0 && modeChildren.every((c) => c.checked)),
+			};
+		});
+}
+
+/**
+ * ADR-0010: 写作字数行识别（放宽版模式行匹配）——剥离行首 emoji 前缀后以目标名开头且名后带数字
+ * （行文本 = `{名} {配额}字（实 N字）`）。不校验配额数本身：历史行的配额冻结于创建时，
+ * 目标编辑总量/截止后旧行数字过期是常态，统计必须跨配额变更累计（与 matchesModeLine 的差异）。
+ * 剥离用 Extended_Pictographic 范围（不动 CJK 标点）——书名号《开头的目标名不能被吃掉。
+ */
+export function matchesWritingLine(text: string, name: string): boolean {
+	const stripped = text
+		.trim()
+		.replace(/^(?:[\p{Extended_Pictographic}\u{FE0F}\u{200D}\s])+/u, "")
+		.trim();
+	if (!stripped.startsWith(name)) return false;
+	const rest = stripped.slice(name.length);
+	return /\d/.test(rest);
 }
 
 /**
@@ -551,6 +634,302 @@ export function missingQuotaLines(content: string, quotas: QuotaLineSpec[], date
 		out.push(buildQuotaCheckLine({ label: q.label, plan: q.plan, quota: q.quota, unit: q.unit, date }));
 	}
 	return out;
+}
+
+/** ADR-0013 父行对账的按计划聚合事实（视图从任务池快照/目标窗口算好传入）。 */
+export interface ParentRollupFact {
+	/** 计划标签。 */
+	plan: string;
+	/** 今日在任一目标窗口内（纯打卡行/定额行无目标恒 false，窗口已过的计划也 false）。 */
+	live: boolean;
+	/** 任务池待办清空（pendingPoolChildren 为空）。 */
+	pendingEmpty: boolean;
+	/**
+	 * ADR-0015 独立完成事实（如复盘 = 日记「# 当日复盘」小节非空）：为真时无视窗口与
+	 * 待办直接勾父行——该计划的完成事实不由任务池/模式子行聚合，而由外部文件事实给定。
+	 */
+	factDone?: boolean;
+}
+
+/**
+ * ADR-0013 刷新期父行对账：返回应被自动勾上的父行（行号 + 原文，供 toggleTaskLine 定位）。
+ * 口径与渲染嵌套同一把尺（ADR-0006/0012）：同计划第一个非模式行 = 父行。
+ * 勾选条件：父行未勾且无 ✋ 豁免，且以下二者取其一——
+ *  - ADR-0013 聚合：计划今日在目标窗口内（fact.live），全部模式子行已勾（依内容事实判定，
+ *    无模式行视为真），任务池待办清空；
+ *  - ADR-0015 独立事实：fact.factDone 为真（如复盘 = 日记当日复盘小节非空），
+ *    无视窗口与待办——该计划的完成事实由外部文件事实给定，不由任务池聚合。
+ * 单向镜像：手动取消不落豁免，刷新即重勾（factDone 同样如此，✋ 是唯一长期豁免）。
+ */
+export function parentCheckTargets(
+	content: string,
+	facts: ParentRollupFact[],
+	isModeLineText: (plan: string, text: string) => boolean
+): { line: number; raw: string; plan: string }[] {
+	const factByPlan = new Map(facts.map((f) => [f.plan, f]));
+	const modesDone = new Map<string, boolean>();
+	const parentAt = new Map<string, { line: number; raw: string; checked: boolean }>();
+	const lines = content.split("\n");
+	let inCheck = false;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (!m || !m[3]) continue;
+		const plan = m[3];
+		const fact = factByPlan.get(plan);
+		if (!fact || (!fact.live && !fact.factDone)) continue;
+		const text = m[2].trim();
+		if (isModeLineText(plan, text)) {
+			const checked = m[1] === "x";
+			modesDone.set(plan, (modesDone.get(plan) ?? true) && checked);
+			continue;
+		}
+		if (!parentAt.has(plan)) parentAt.set(plan, { line: i, raw: line, checked: m[1] === "x" });
+	}
+	const out: { line: number; raw: string; plan: string }[] = [];
+	for (const [plan, at] of parentAt) {
+		const fact = factByPlan.get(plan)!;
+		if (at.checked || at.raw.includes(MANUAL_MARK)) continue;
+		if (fact.factDone) {
+			out.push({ line: at.line, raw: at.raw, plan });
+			continue;
+		}
+		if ((modesDone.get(plan) ?? true) && fact.pendingEmpty) out.push({ line: at.line, raw: at.raw, plan });
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// 日常生活计划（ADR-0016 生活模式：固定日子式周期 + 事项级逾期策略）
+// ---------------------------------------------------------------------------
+
+/** 固定日子式周期单位：day=每天；week=每周指定星期几；month=每月指定几号；year=每年指定某月某日。 */
+export type ChoreCycleUnit = "day" | "week" | "month" | "year";
+
+/** 生活事项逾期策略：skip=放弃（缺省，不落盘）；postpone=往后延（挂账到补做）。 */
+export type ChoreOverdue = "skip" | "postpone";
+
+/** ADR-0016 固定日子式周期（生活事项）。 */
+export interface GoalCycle {
+	unit: ChoreCycleUnit;
+	/**
+	 * unit 语义下的「日子」集合：
+	 * - day: 忽略（恒 []）
+	 * - week: 星期几 0~6（0=周日，同 Date.getDay）
+	 * - month: 几号 1~31（当月无此号落到当月最后一天）
+	 * - year: 恰两个 [月(1~12), 日(1~31)]（当月无此日如 2/29 落到当月最后一天）
+	 */
+	days: number[];
+}
+
+const CHORE_UNIT_ALIASES: [RegExp, ChoreCycleUnit][] = [
+	[/^(day|daily|每天|每日|天天)$/, "day"],
+	[/^(week|weekly|每周|周)$/, "week"],
+	[/^(month|monthly|每月|月)$/, "month"],
+	[/^(year|yearly|annual|每年|年)$/, "year"],
+];
+
+/** 解析 frontmatter 的 cycle 值（容忍中文单位 / 字符串 days）；非法 → undefined。 */
+export function parseChoreCycle(raw: unknown): GoalCycle | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const rec = raw as Record<string, unknown>;
+	const unitRaw = typeof rec.unit === "string" ? rec.unit : typeof rec["单位"] === "string" ? String(rec["单位"]) : "";
+	const v = unitRaw.trim().toLowerCase();
+	if (!v) return undefined;
+	const unit = CHORE_UNIT_ALIASES.find(([re]) => re.test(v))?.[1];
+	if (!unit) return undefined;
+	const daysRaw: unknown = rec.days ?? rec["日子"];
+	const toInt = (x: unknown): number => (typeof x === "number" ? x : parseInt(String(x).trim(), 10));
+	const list = (Array.isArray(daysRaw) ? daysRaw : String(daysRaw ?? "").replace(/[[\]]/g, "").split(/[,，\s]+/))
+		.map(toInt)
+		.filter((n) => Number.isFinite(n));
+	if (unit === "day") return { unit, days: [] };
+	if (unit === "week") {
+		const days = [...new Set(list.filter((n) => n >= 0 && n <= 6))].sort((a, b) => a - b);
+		return days.length > 0 ? { unit, days } : undefined;
+	}
+	if (unit === "month") {
+		const days = [...new Set(list.filter((n) => n >= 1 && n <= 31))].sort((a, b) => a - b);
+		return days.length > 0 ? { unit, days } : undefined;
+	}
+	// year: 恰两个 [月, 日]
+	if (list.length !== 2) return undefined;
+	const [mm, dd] = list;
+	if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return undefined;
+	return { unit, days: [mm, dd] };
+}
+
+/**
+ * 解析逾期策略（中英文值）；仅 postpone 会落盘——skip / 放弃 / 未知值一律 undefined
+ * （缺省 = 放弃，frontmatter 保持干净）。
+ */
+export function parseChoreOverdue(raw: unknown): "postpone" | undefined {
+	const v = String(raw ?? "").trim().toLowerCase();
+	return /^(postpone|defer|往后延|顺延|延后)$/.test(v) ? "postpone" : undefined;
+}
+
+/** 星期短名（0=周日，同 Date.getDay）——cycleLabel 与周期选择 UI 共用。 */
+export const CHORE_WEEKDAY_SHORT = ["日", "一", "二", "三", "四", "五", "六"];
+
+/** 周期的人类可读文案（徽标 / 管理列表共用）；postpone 追加「 · 漏了往后延」（CONTEXT.md 逾期策略措辞）。 */
+export function choreCycleLabel(cycle: GoalCycle, overdue?: ChoreOverdue): string {
+	let base: string;
+	if (cycle.unit === "day") base = "每天";
+	else if (cycle.unit === "week") {
+		const ds = [...cycle.days].sort((a, b) => a - b);
+		base = `每${ds.map((d) => `周${CHORE_WEEKDAY_SHORT[d] ?? "?"}`).join("、")}`;
+	} else if (cycle.unit === "month") {
+		const ds = [...cycle.days].sort((a, b) => a - b);
+		base = `每月 ${ds.join("、")} 号`;
+	} else {
+		const [mm, dd] = cycle.days;
+		base = `每年 ${mm} 月 ${dd} 日`;
+	}
+	return overdue === "postpone" ? `${base} · 漏了往后延` : base;
+}
+
+/**
+ * 该做日判定：date 是否轮到该周期（month / year 含「无此号月份落到当月最后一天」回落）。
+ */
+export function isChoreDueOn(cycle: GoalCycle, date: string): boolean {
+	const d = parseDateString(date);
+	if (cycle.unit === "day") return true;
+	if (cycle.unit === "week") return cycle.days.includes(d.getDay());
+	const dim = daysInMonth(d.getFullYear(), d.getMonth() + 1);
+	const dayOfMonth = d.getDate();
+	if (cycle.unit === "month") {
+		return cycle.days.some((x) => x === dayOfMonth || (x > dim && dayOfMonth === dim));
+	}
+	// year: days = [月, 日]
+	const [mm, dd] = cycle.days;
+	return d.getMonth() + 1 === mm && (dd === dayOfMonth || (dd > dim && dayOfMonth === dim));
+}
+
+/** 最近一个该做日（≤ date；日历连续，恒存在）。 */
+export function prevChoreOccurrence(cycle: GoalCycle, date: string): string {
+	if (cycle.unit === "day") return date;
+	let cur = parseDateString(date);
+	for (let i = 0; i < 400; i++) {
+		const s = formatDate(cur);
+		if (isChoreDueOn(cycle, s)) return s;
+		cur = addDays(cur, -1);
+	}
+	return date; // 不可达（400 天内必有该做日）
+}
+
+/** 下一个该做日（严格晚于 date）。 */
+export function nextChoreOccurrence(cycle: GoalCycle, date: string): string {
+	let cur = addDays(parseDateString(date), 1);
+	for (let i = 0; i < 400; i++) {
+		const s = formatDate(cur);
+		if (isChoreDueOn(cycle, s)) return s;
+		cur = addDays(cur, 1);
+	}
+	return date; // 不可达
+}
+
+/** [start, end] 内的该做日升序枚举（cap 防失控，默认 400）。 */
+export function choreOccurrences(cycle: GoalCycle, start: string, end: string, cap = 400): string[] {
+	const out: string[] = [];
+	if (start > end) return out;
+	let cur = parseDateString(start);
+	for (let i = 0; i < 800; i++) {
+		const s = formatDate(cur);
+		if (s > end) break;
+		if (isChoreDueOn(cycle, s)) {
+			out.push(s);
+			if (out.length >= cap) break;
+		}
+		cur = addDays(cur, 1);
+	}
+	return out;
+}
+
+/** 生活事项行生成规格（structural，避免依赖 stats）。 */
+export interface ChoreLineSpec {
+	/** 计划标签（日常生活）。 */
+	plan: string;
+	/** 事项名（行文本剥 emoji 前缀后须恰为此名，精确匹配防近名顶替）。 */
+	name: string;
+}
+
+/**
+ * 今日缺失的生活事项行（ADR-0016 惰性生成，幂等）。
+ * 识别既有行 = 同计划标签 + matchesModeLine 精确匹配（floor=0 口径：剥 emoji 后
+ * 整行恰为事项名）——「洗碗机」不顶替「洗碗」，带后缀的历史行不算数。
+ */
+export function missingChoreLines(content: string, specs: ChoreLineSpec[], date: string): string[] {
+	const existing = new Set<string>();
+	const lines = content.split("\n");
+	let inCheck = false;
+	for (const line of lines) {
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (!m?.[3]) continue;
+		existing.add(`${m[3]}|${m[2].trim()}`);
+	}
+	const out: string[] = [];
+	for (const s of specs) {
+		let found = false;
+		for (const key of existing) {
+			const [plan, text] = key.split("|");
+			if (plan === s.plan && matchesModeLine(text, s.name, 0, "")) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) out.push(buildModeCheckLine({ plan: s.plan, name: s.name, label: "", floor: 0, unit: "" }, date));
+	}
+	return out;
+}
+
+/**
+ * ADR-0016: [from, to]（含端点）逐日扫每日文件，找该事项的已勾行（精确匹配：
+ * 同计划 + 剥 emoji 后整行恰为事项名）。文件事实为准，命中即停。
+ * backward=true 从 to 端往回扫——挂账清账判定用：最近勾的先命中，常态只读最近几天。
+ */
+export async function scanChoreHit(
+	app: App,
+	prefix: string,
+	plan: string,
+	name: string,
+	from: string,
+	to: string,
+	backward = false
+): Promise<boolean> {
+	const fmt = (d: Date): string => formatDate(d);
+	let cur = backward ? parseDateString(to) : parseDateString(from);
+	const stopAt = backward ? from : to;
+	for (let i = 0; i < 800; i++) {
+		const ds = fmt(cur);
+		if (backward ? ds < stopAt : ds > stopAt) return false;
+		const f = app.vault.getAbstractFileByPath(`${prefix}${ds}.md`);
+		if (f instanceof TFile) {
+			const content = await app.vault.cachedRead(f);
+			let inCheck = false;
+			for (const line of content.split("\n")) {
+				if (/^##\s/.test(line)) {
+					inCheck = line.startsWith(CHECK_HEADING);
+					continue;
+				}
+				if (!inCheck) continue;
+				const m = TASK_LINE_RE.exec(line);
+				if (!m || m[3] !== plan || m[1] !== "x") continue;
+				if (matchesModeLine(m[2].trim(), name, 0, "")) return true;
+			}
+		}
+		cur = addDays(cur, backward ? -1 : 1);
+	}
+	return false;
 }
 
 // ---------------------------------------------------------------------------
