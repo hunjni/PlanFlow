@@ -2,7 +2,7 @@ import { ButtonComponent, Modal, Notice, Plugin, TFile, TFolder, setIcon } from 
 import { PlanBoardView, VIEW_TYPE_PLANFLOW, writePlansToFile } from "./src/PlanBoardView";
 import { startWeaveRuntime, stopWeaveRuntime } from "./src/weave-runtime";
 import type { PlanFlowSettings } from "./src/settings";
-import { DEFAULT_PLAN_COLORS, DEFAULT_SETTINGS, PlanFlowSettingTab } from "./src/settings";
+import { DEFAULT_PLAN_COLORS, DEFAULT_SETTINGS, LEGACY_REVIEW_TEMPLATE, PlanFlowSettingTab } from "./src/settings";
 import { yearDirName } from "./src/paths";
 
 /** 首次启动引导弹窗：新用户四步上手（新建计划 → 量化目标 → 每日打卡 → 追踪进度）。 */
@@ -276,6 +276,9 @@ plans:
 		if (this.settings.weekCardHeight === 180) this.settings.weekCardHeight = 0;
 		// v1.6: planOrder 默认数组
 		if (!Array.isArray(this.settings.planOrder)) this.settings.planOrder = [];
+		// ADR-0014 迁移：复盘模板与旧默认逐字相同（= 未自定义）→ 静默换新默认（「明日计划」子节拆出，
+		// 次日计划改由独立按钮写入日记「# 次日计划」）；自定义过的模板一律不动
+		if (this.settings.reviewTemplate === LEGACY_REVIEW_TEMPLATE) this.settings.reviewTemplate = DEFAULT_SETTINGS.reviewTemplate;
 	}
 
 	async saveSettings(): Promise<void> {

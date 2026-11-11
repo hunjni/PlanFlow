@@ -323,6 +323,31 @@ export function groupPoolTasksByGoal(tasks: PoolTask[], today: string, knownName
 	return { groups, ungrouped };
 }
 
+/** 份额清空提醒：单本书的清空态条目（快照对比的输入）。 */
+export interface ShareClearEntry {
+	/** 跃迁判定键（计划名||书名）——同一书名在不同计划下互不混淆。 */
+	key: string;
+	/** 书名（通知文案用）。 */
+	name: string;
+	/** 该书今日份额是否已清空（scheduled 书组的 pending 是否为空）。 */
+	cleared: boolean;
+}
+
+/**
+ * 份额清空提醒（CONTEXT.md 术语）：上一轮快照与本轮各书清空态对比，产出跃迁清单。
+ * 触发只认 false → true 跃迁：prev 为 null（首轮基线）或键不存在（书新进分母）不触发；
+ * 每次跃迁都触发，不做当日去重；多书同批跃迁由调用方合并为一条通知。纯函数，无副作用。
+ */
+export function diffShareClear(prev: Map<string, boolean> | null, entries: ShareClearEntry[]): { next: Map<string, boolean>; cleared: string[] } {
+	const next = new Map<string, boolean>();
+	const cleared: string[] = [];
+	for (const e of entries) {
+		next.set(e.key, e.cleared);
+		if (prev?.get(e.key) === false && e.cleared) cleared.push(e.name);
+	}
+	return { next, cleared };
+}
+
 /**
  * ADR-0005 v2 多级结构：部→卷→篇→章→节 之类的任意 1~8 级单位树，叶子 = 逐日可勾选任务。
  * 编号按真书惯例：重排型单位（节/讲/课/回）每上级从 1 重新编号；其余单位（篇/卷/部/章…）

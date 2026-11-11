@@ -44,6 +44,8 @@ export interface PlanFlowSettings {
 	summaryCardHeight: number;
 	/** Achievement pop sound on tier-up (v1.4). */
 	achievementSound: boolean;
+	/** 份额清空提醒：一本书今日份额清空时提示音 + 应用内通知（同批多书合并一条）。 */
+	shareChime: boolean;
 	/** 计划卡拖拽排序（v1.6）：计划名顺序，空数组 = 按年度文件定义顺序。 */
 	planOrder: string[];
 	/** 年度计划卡每卡高度（v1.7.2：拖拽下边缘调整，px）。 */
@@ -72,11 +74,12 @@ export interface PlanFlowSettings {
 	weaveConfirmCheck: boolean;
 }
 
-export const DEFAULT_SETTINGS: PlanFlowSettings = {
-	rootPath: "raw/计划",
-	reviewWorkdays: true,
-	// v1.8: 通用复盘模板（用户可在设置页自定义，如自己的 A 股复盘格式）
-	reviewTemplate: `---
+/**
+ * ADR-0014: 旧版默认复盘模板（含「明日计划」子节）。仅作存量迁移比对：
+ * data.json 里的模板与它逐字相同（= 用户从未自定义）→ 加载时静默换新默认；
+ * 自定义过的一律不动。旧日记「# 当日复盘」里已写进去的「## 明日计划」内容不迁移（文件事实为准）。
+ */
+export const LEGACY_REVIEW_TEMPLATE = `---
 type: review
 date: {date}
 tags: [复盘]
@@ -94,6 +97,28 @@ tags: [复盘]
 
 ## 明日计划
 - 
+`;
+
+export const DEFAULT_SETTINGS: PlanFlowSettings = {
+	rootPath: "raw/计划",
+	reviewWorkdays: true,
+	// v1.8: 通用复盘模板（用户可在设置页自定义，如自己的 A 股复盘格式）
+	// ADR-0014: 「明日计划」子节拆出——次日计划由独立按钮写入日记「# 次日计划」，不再捆在复盘正文里
+	reviewTemplate: `---
+type: review
+date: {date}
+tags: [复盘]
+---
+# 📝 复盘（{date}）
+
+## 今日完成
+- 
+
+## 收获与亮点
+- 
+
+## 不足与改进
+- 
 `,
 	openOnStartup: true,
 	icon: "home",
@@ -103,6 +128,7 @@ tags: [复盘]
 	checkCardHeight: 0,
 	summaryCardHeight: 0,
 	achievementSound: true,
+	shareChime: true,
 	planOrder: [],
 	yearPlanHeights: {},
 	yearGoalBoxHeights: {},
@@ -219,6 +245,12 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				name: "成就音效",
 				desc: "达成新档位（金牌/银牌/铜牌）时播放提示音",
 				control: { type: "toggle", key: "achievementSound" },
+			},
+			{
+				name: "今日计划完成提醒",
+				desc: "一本书的今日阅读份额全部勾完（含欠账清完才算）时，播放提示音并弹出通知；同批多本书合并为一条，每次清空都提醒",
+				aliases: ["shareChime", "份额清空", "完成提醒", "提示音", "阅读完成"],
+				control: { type: "toggle", key: "shareChime" },
 			},
 			{
 				name: "图标主题",

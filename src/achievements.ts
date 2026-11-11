@@ -1,5 +1,5 @@
 import { App, TFile, TFolder } from "obsidian";
-import { addDays, daysInMonth, formatDate, parseDailyContent, parseDateString } from "./daily";
+import { addDays, daysInMonth, formatDate, parseDailyContent, parseDateString, topLevelCheckRows, type CheckItem } from "./daily";
 import { yearDirName } from "./paths";
 
 /**
@@ -272,7 +272,8 @@ export async function readMonthBadges(
 
 /**
  * Consecutive check-in streak: walk backwards from yesterday; a day counts when
- * its daily note exists and every check-in item is checked. Stops on the first
+ * its daily note exists and every top-level check row is done (ADR-0012 大项口径:
+ * mode lines fold into their plan's parent row, ADR-0006). Stops on the first
  * missing/incomplete day. Today itself never counts (reward v3).
  * Reuses daily.ts parsing (DEV.md §6).
  */
@@ -280,7 +281,9 @@ export async function computeStreak(
 	app: App,
 	root: string,
 	year: string,
-	today: string
+	today: string,
+	/** 模式行判定（调用方持有模式目标；缺省视为无模式行，全部平铺）。 */
+	isModeLine?: (item: CheckItem) => boolean
 ): Promise<number> {
 	const rootPath = root.replace(/\/+$/, "");
 	let streak = 0;
@@ -294,7 +297,8 @@ export async function computeStreak(
 		const content = await app.vault.cachedRead(file);
 		const data = parseDailyContent(file, content, ds);
 		if (data.checkItems.length === 0) break;
-		if (!data.checkItems.every((c) => c.checked)) break;
+		const rows = topLevelCheckRows(data.checkItems, isModeLine ?? (() => false));
+		if (!rows.every((r) => r.done)) break;
 		streak++;
 		cur = addDays(cur, -1);
 	}

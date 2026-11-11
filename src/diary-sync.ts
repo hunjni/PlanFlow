@@ -41,6 +41,9 @@ export const DIARY_ESSAY_HEADING = "# 随笔";
 /** 日记「# 当日复盘」标题（ADR-0004 扩展三：写复盘弹窗的写入目标）。 */
 export const DIARY_REVIEW_HEADING = "# 当日复盘";
 
+/** 日记「# 次日计划」标题（ADR-0014：次日计划弹窗的写入目标，与复盘正文分离）。 */
+export const DIARY_NEXTDAY_HEADING = "# 次日计划";
+
 /** 「## 完成情况跟踪」里的计划项镜像行。 */
 export interface TrackingItem {
 	title: string;
@@ -484,6 +487,97 @@ export async function writeReviewToDiary(app: App, diaryDir: string, text: strin
 		return noAnchor ? "no-anchor" : "ok";
 	} catch (e) {
 		console.error("[planflow-diary-sync] 复盘写入失败:", e);
+		return "no-anchor";
+	}
+}
+
+/**
+ * 「# 次日计划」内容变换（纯逻辑，ADR-0014）：次日计划弹窗的写入目标。
+ *  - 已有「# 次日计划」小节（任意位置）→ 原位替换其内容（一天一份，与复盘同语义）。
+ *  - 没有 → 新建标题，插在「# 当日复盘」小节结束处（顺序约定：… → 随笔 → 当日复盘 → 次日计划）；
+ *    无「# 当日复盘」→ 退回「# 随笔」锚点（与复盘同一套插入规则）；两个锚点都缺 → 返回 null。
+ *  - 内容多行原样保留；小节前后空行结构规整为各一。
+ */
+export function nextDayPlanTransform(content: string, text: string): string | null {
+	const lines = content.split("\n");
+	// 段落体：掐掉首尾空行
+	const body: string[] = [];
+	for (const l of text.split("\n")) body.push(l);
+	body.length = trimTrailingBlanks(body);
+	let start = 0;
+	while (start < body.length && body[start].trim() === "") start++;
+	const bodyLines = body.slice(start);
+	// 小节边界 = 下一个一级标题（`# x`）——正文里的 ## 子标题属于本小节，不能截断
+	const nextH1 = (from: number): number => {
+		for (let i = from; i < lines.length; i++) {
+			if (/^#\s/.test(lines[i])) return i;
+		}
+		return lines.length;
+	};
+
+	const planIdx = lines.findIndex((l) => l.trim() === DIARY_NEXTDAY_HEADING);
+	if (planIdx >= 0) {
+		// 已有小节 → 原位替换（到下一个一级标题为止）
+		const end = nextH1(planIdx + 1);
+		lines.splice(planIdx + 1, end - planIdx - 1, "", ...bodyLines, "");
+		return lines.join("\n");
+	}
+
+	// 无小节 → 锚点定位：当日复盘节尾优先，退回随笔节尾
+	const reviewIdx = lines.findIndex((l) => l.trim() === DIARY_REVIEW_HEADING);
+	const anchorIdx = reviewIdx >= 0 ? reviewIdx : lines.findIndex((l) => l.trim() === DIARY_ESSAY_HEADING);
+	if (anchorIdx === -1) return null;
+	lines.splice(nextH1(anchorIdx + 1), 0, DIARY_NEXTDAY_HEADING, "", ...bodyLines, "");
+	return lines.join("\n");
+}
+
+/**
+ * 从日记内容中提取「# 次日计划」小节正文（纯逻辑）。
+ * 已有小节 → 返回正文（掐首尾空行）；没有 → 返回 null（供弹窗预填判断与视图侧读）。
+ */
+export function extractNextDayPlanSection(content: string): string | null {
+	const lines = content.split("\n");
+	const idx = lines.findIndex((l) => l.trim() === DIARY_NEXTDAY_HEADING);
+	if (idx === -1) return null;
+	// 边界 = 下一个一级标题（`# x`）——正文里的 ## 子标题属于本小节
+	let end = lines.length;
+	for (let i = idx + 1; i < lines.length; i++) {
+		if (/^#\s/.test(lines[i])) {
+			end = i;
+			break;
+		}
+	}
+	const body = lines.slice(idx + 1, end);
+	let s = 0;
+	while (s < body.length && body[s].trim() === "") s++;
+	let e = body.length;
+	while (e > s && body[e - 1].trim() === "") e--;
+	return body.slice(s, e).join("\n");
+}
+
+/**
+ * 写次日计划到指定日期日记「# 次日计划」（用户主动触发：失败返回状态码供 Notice 提示）。
+ * `date` 由调用方给出（今天日记 = 主按钮；昨天日记 = 视图只读块的「去修改」入口）。
+ */
+export async function writeNextDayPlanToDiary(app: App, diaryDir: string, text: string, date: string): Promise<ReviewWriteResult> {
+	const dir = diaryDir.replace(/\/+$/, "").trim();
+	if (!dir || text.trim() === "") return "no-diary";
+	const path = `${dir}/${date}.md`;
+	const f = app.vault.getAbstractFileByPath(path);
+	if (!(f instanceof TFile)) return "no-diary";
+	try {
+		let noAnchor = false;
+		await app.vault.process(f, (content) => {
+			const next = nextDayPlanTransform(content, text);
+			if (next === null) {
+				noAnchor = true;
+				return content;
+			}
+			return next;
+		});
+		return noAnchor ? "no-anchor" : "ok";
+	} catch (e) {
+		console.error("[planflow-diary-sync] 次日计划写入失败:", e);
 		return "no-anchor";
 	}
 }

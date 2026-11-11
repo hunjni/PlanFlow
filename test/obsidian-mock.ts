@@ -129,3 +129,13 @@ export function parseYaml(src: string): any {
 export function stringifyYaml(value: any): string {
 	return JSON.stringify(value, null, 2);
 }
+
+/** src/diary-sync.ts 的 moment().format() 用到的两个格式；离线测试不触达写入口，够用即可。 */
+export function moment(): { format: (fmt: string) => string } {
+	const d = new Date();
+	const p = (n: number): string => String(n).padStart(2, "0");
+	return {
+		format: (fmt: string) =>
+			fmt === "YYYY-MM-DD" ? `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` : `${p(d.getHours())}:${p(d.getMinutes())}`,
+	};
+}
