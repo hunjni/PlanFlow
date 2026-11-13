@@ -607,6 +607,66 @@
 	margin-top: 16px;
 }
 
+/* ========== 移动端软键盘避让（写复盘 / 次日计划等弹窗） ========== */
+/* Obsidian 的 .modal-container 挂在 body 上，不随 app-container 收缩；键盘弹出时
+   用 --keyboard-height（Obsidian 自带）与 --pb-keyboard-inset（插件 visualViewport 兜底）
+   取较大值，把弹窗限在键盘上方可视区并整体上移。 */
+body.is-mobile .modal-container.planboard-modal-container {
+	--pb-keyboard-inset-effective: max(var(--keyboard-height, 0px), var(--pb-keyboard-inset, 0px));
+	--dialog-max-height: calc(
+		100vh - var(--pb-keyboard-inset-effective) - var(--safe-area-inset-top, 0px) - 12px
+	);
+	box-sizing: border-box;
+	padding-bottom: var(--pb-keyboard-inset-effective);
+}
+
+/* 输入口弹窗：内容区纵向 flex，输入框撑满剩余高度、自身滚动，按钮行不收缩 */
+body.is-mobile .planboard-review-modal {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+
+body.is-mobile .planboard-review-modal > h2,
+body.is-mobile .planboard-review-modal > .planboard-quota-modal-hint,
+body.is-mobile .planboard-review-modal > .planboard-modal-buttons {
+	flex: 0 0 auto;
+}
+
+body.is-mobile .planboard-review-modal .planboard-review-input {
+	flex: 1 1 auto;
+	min-height: 72px;
+	resize: none;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+	scrollbar-color: var(--background-modifier-border) transparent;
+}
+
+/* 细滚动条：内容区与输入框（安卓 WebView 默认只在滚动时浮现，显式定制更易看见） */
+body.is-mobile .planboard-review-modal::-webkit-scrollbar,
+body.is-mobile .planboard-review-modal .planboard-review-input::-webkit-scrollbar {
+	width: 8px;
+}
+
+body.is-mobile .planboard-review-modal::-webkit-scrollbar-thumb,
+body.is-mobile .planboard-review-modal .planboard-review-input::-webkit-scrollbar-thumb {
+	background: var(--background-modifier-border);
+	border-radius: 4px;
+}
+
+body.is-mobile .planboard-review-modal::-webkit-scrollbar-track,
+body.is-mobile .planboard-review-modal .planboard-review-input::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+/* 键盘收起时才为按钮行留出底部安全区（键盘开着时底部已被键盘占住） */
+body.is-mobile .modal-container.planboard-modal-container:not(.is-keyboard-open) .planboard-review-modal > .planboard-modal-buttons {
+	padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 /* ========== 首次启动欢迎弹窗（v2.7） ========== */
 .planboard-welcome {
 	padding: 8px 4px;
@@ -1031,7 +1091,7 @@
 }
 
 /* v1.7.4: 自由缩放（min 80）后内容承接——卡片缩小到内容以下时：
-   年度卡任务列表内部滚动（占满剩余空间），其余卡溢出裁剪兜底（防内容压到相邻卡） */
+   年度卡内容区内部滚动，其余卡溢出裁剪兜底（防内容压到相邻卡） */
 .planboard-plan-card,
 .planboard-check-card,
 .planboard-summary-card,
@@ -1040,54 +1100,23 @@
 	overflow: hidden;
 }
 
-.planboard-plan-card .planboard-plan-tasks {
-	flex: 1 1 auto;
+/* v2.x: 年度卡内容区单一滚动——量化目标框 + 任务列表并入 .planboard-plan-body，卡头常驻。
+   默认封顶 min(60vh, 480px)，超出即现细滚动条（未溢出时不占位）；范围限定年度 masonry 网格，
+   周/月/首页计划卡不受影响 */
+.planboard-plan-grid.is-masonry .planboard-plan-card .planboard-plan-body {
+	flex: 0 1 auto;
 	min-height: 0;
-	overflow-y: auto;
-}
-
-/* v2.x: 拖过卡高的卡——量化目标框不参与压缩（保持自然高度，书墙已 320 封顶），
-   高度不足全由任务区滚动吸收；要压缩框请拖「框⇆任务」分隔条（.planboard-goals-divider） */
-.planboard-plan-card.is-height-fixed .planboard-goals-box {
-	flex-shrink: 0;
-}
-
-/* v2.x: 拖过框高（分隔条）——框固定高度、内部滚动，任务区吃剩余空间 */
-.planboard-goals-box.is-height-fixed {
-	flex: 0 0 auto;
+	max-height: min(60vh, 480px);
 	overflow-y: auto;
 	scrollbar-width: thin;
+	padding-right: 2px;
 }
 
-/* v2.x: 「框⇆任务区」拖拽分隔条——仅拖过卡高的卡显示（未拖卡高时框/任务各按自然高，无需分配） */
-.planboard-goals-divider {
-	display: none;
-	position: relative;
-	height: 10px;
-	margin: 0;
-	cursor: ns-resize;
-	flex-shrink: 0;
-}
-
-.planboard-goals-divider::before {
-	content: "";
-	position: absolute;
-	top: 50%;
-	left: 12px;
-	right: 12px;
-	height: 3px;
-	transform: translateY(-50%);
-	border-radius: 2px;
-	background: var(--background-modifier-border);
-}
-
-.planboard-goals-divider:hover::before,
-.planboard-goals-divider:active::before {
-	background: var(--interactive-accent);
-}
-
-.planboard-plan-card.is-height-fixed .planboard-goals-divider {
-	display: block;
+/* 拖过卡高（is-height-fixed）：body 吃满剩余高度、解除默认封顶——
+   拖高即用户主动放弃滚动、全量铺开；拖矮则由卡内滚动承接（不再静默裁剪） */
+.planboard-plan-grid.is-masonry .planboard-plan-card.is-height-fixed .planboard-plan-body {
+	flex: 1 1 auto;
+	max-height: none;
 }
 
 /* v1.7.4: 底部收紧——home 卡把手以下只留 4px（原 padding 14px 显得下边框过宽）；
@@ -1244,87 +1273,231 @@
 	color: var(--text-faint);
 }
 
-/* ========== 看板（M3） ========== */
-.planboard-board {
-	display: flex;
-	gap: 12px;
-	align-items: flex-start;
-	overflow-x: auto;
-	padding-bottom: 8px;
-}
-
-.planboard-board-col {
-	flex: 1 1 0; /* v1.6: 均分自适应页面宽度（原来固定 260px 导致宽页面留白/窄页面挤压） */
-	min-width: 240px;
-	background: var(--background-secondary);
-	border: 1px solid var(--background-modifier-border); /* v1.7.4: 去彩色 4px 边框——专业建议"边框弱化，彩色只留点缀"（列头淡彩/任务标签保留彩色） */
-	border-radius: 12px;
-	padding: 10px;
-	display: flex;
-	flex-direction: column;
-	gap: 6px;
-	transition: box-shadow 0.15s ease;
-}
-
-.planboard-board-col.is-col-dragging {
-	z-index: 45;
-	box-shadow: 0 10px 26px rgba(0, 0, 0, 0.2);
-	opacity: 0.96;
-	pointer-events: none;
-}
-
-.planboard-board-col-header {
+/* ========== v1.8 完成情况看板（计划区竖向堆叠 × 子项 × 日格带） ========== */
+.planboard-cb-legend {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
-	padding: 2px 4px 6px;
+	gap: 14px;
+	margin: -4px 0 10px;
+	font-size: 11px;
+	color: var(--text-muted);
+}
+
+.planboard-cb-legend-item {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.planboard-cb-legend-dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 2px;
+	display: inline-block;
+}
+
+.planboard-cb-legend-dot.is-hit {
+	background: var(--pb-accent-dim, #4a6fa5);
+}
+
+.planboard-cb-legend-dot.is-miss {
+	background: rgba(214, 88, 88, 0.35);
+}
+
+.planboard-cb-legend-dot.is-off {
+	background: transparent;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.planboard-cb-section {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	padding: 10px 12px;
+	margin-bottom: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.planboard-cb-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 2px 4px 8px;
 	border-bottom: 1px solid var(--background-modifier-border);
-	margin-bottom: 4px;
 	border-radius: 6px;
-	background: var(--pb-accent-bg, transparent); /* v1.7.3: 列头淡彩 */
-	cursor: grab;
-	user-select: none;
-	transition: background 0.15s ease, box-shadow 0.15s ease;
-}
-
-.planboard-board-col-header:hover {
 	background: var(--pb-accent-bg, transparent);
-	box-shadow: inset 0 0 0 1px var(--pb-accent-dim, var(--background-modifier-border));
 }
 
-.planboard-board-col-header:active {
-	cursor: grabbing;
+.planboard-cb-title {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	flex: 1 1 auto;
 }
 
-.planboard-board-col-title {
+.planboard-cb-name {
 	font-size: 13px;
 	font-weight: 700;
 }
 
-.planboard-board-col-count {
+.planboard-cb-count {
+	font-size: 11px;
+	color: var(--text-muted);
+}
+
+.planboard-cb-rate {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+.planboard-cb-pct {
 	font-size: 11px;
 	font-weight: 600;
 	color: var(--text-muted);
-	background: var(--background-modifier-hover);
+	font-variant-numeric: tabular-nums;
+}
+
+.planboard-cb-rate-bar {
+	width: 80px;
+	height: 4px;
+	background: var(--background-modifier-border);
 	border-radius: 999px;
-	padding: 1px 8px;
+	overflow: hidden;
 }
 
-.planboard-board-col .planboard-check-item {
-	background: var(--background-primary);
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 8px;
-	padding: 6px 8px;
-	transition: background 0.12s ease, border-color 0.12s ease;
+.planboard-cb-rate-fill {
+	height: 100%;
+	background: var(--pb-accent, var(--pb-accent-dim, #4a6fa5));
+	border-radius: 999px;
 }
 
-.planboard-board-col .planboard-check-item:hover {
+.planboard-cb-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 5px 4px;
+	border-radius: 6px;
+}
+
+.planboard-cb-row:hover {
 	background: var(--background-modifier-hover);
-	border-color: var(--background-modifier-border-hover);
 }
 
-.planboard-board-col .planboard-check-item.is-checked {
-	opacity: 0.55;
+.planboard-cb-item-name {
+	flex: 0 0 180px;
+	min-width: 0;
+	font-size: 12.5px;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	overflow: hidden;
+}
+
+.planboard-cb-item-name > span:last-child {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.planboard-cb-item-emoji {
+	flex-shrink: 0;
+}
+
+.planboard-cb-counts {
+	flex: 0 0 110px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	justify-content: flex-end;
+}
+
+.planboard-cb-frac {
+	font-size: 11.5px;
+	color: var(--text-normal);
+	font-variant-numeric: tabular-nums;
+}
+
+.planboard-cb-counts .planboard-cb-pct {
+	min-width: 34px;
+	text-align: right;
+}
+
+/* 日格带：一格 = 一天 / 一次该做；宽度自适应容器，不产生横向滚动 */
+.planboard-cb-strip {
+	flex: 1 1 auto;
+	display: grid;
+	grid-template-columns: repeat(var(--pb-days, 1), minmax(1px, 1fr));
+	gap: 1px;
+	height: 14px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+/* 长周期（>90 天）：去掉格间距，避免 minmax(1px)+gap 把日格带撑出容器 */
+.planboard-cb-strip.is-dense {
+	gap: 0;
+}
+
+.planboard-cb-cell {
+	border-radius: 2px;
+	background: var(--background-modifier-border);
+}
+
+.planboard-cb-cell.is-hit {
+	background: var(--pb-accent, var(--pb-accent-dim, #4a6fa5));
+}
+
+.planboard-cb-cell.is-miss {
+	background: rgba(214, 88, 88, 0.35);
+}
+
+.planboard-cb-cell.is-off {
+	background: transparent;
+}
+
+.planboard-cb-cell:hover {
+	outline: 1px solid var(--text-faint);
+	outline-offset: 1px;
+}
+
+/* 量化目标：无日级事实，用进度条占位 */
+.planboard-cb-bar {
+	flex: 1 1 auto;
+	height: 6px;
+	min-width: 60px;
+	background: var(--background-modifier-border);
+	border-radius: 999px;
+	overflow: hidden;
+}
+
+.planboard-cb-bar-fill {
+	height: 100%;
+	background: var(--pb-accent, var(--pb-accent-dim, #4a6fa5));
+	border-radius: 999px;
+}
+
+@media (max-width: 600px) {
+	.planboard-cb-row {
+		flex-wrap: wrap;
+	}
+
+	.planboard-cb-item-name {
+		flex: 1 1 100%;
+	}
+
+	.planboard-cb-counts {
+		flex: 0 0 auto;
+	}
+
+	.planboard-cb-strip,
+	.planboard-cb-bar {
+		flex: 1 1 100%;
+	}
 }
 
 /* ========== 甘特（M3） ========== */
@@ -1807,17 +1980,14 @@
 	min-width: 0;
 }
 
-/* 章级迷你进度：每章一行（章名 + 迷你条 + x/y） */
+/* 章级迷你进度：每章一行（章名 + 迷你条 + x/y）。
+   v2.x: 不再单独封顶内滚——目录墙并入年度卡内容区单一滚动（.planboard-plan-body），
+   避免一张卡出现嵌套两条滚动条；书行会随滚动离开视野，卡头计划名/进度始终常驻 */
 .planboard-goal-chapters {
 	display: flex;
 	flex-direction: column;
 	gap: 2px;
 	padding: 2px 2px 6px;
-	/* v2.x: 一本书的目录墙封顶内滚——书行（名称/总进度/按钮）常驻，下方目标与同列卡片不再被顶没 */
-	/* 大目录（compact 文本墙同样生效）；≤12 组的逐行模式通常够高不触发 */
-	max-height: 320px;
-	overflow-y: auto;
-	scrollbar-width: thin;
 }
 
 .planboard-goal-chapter {
@@ -2000,37 +2170,6 @@
 	content: "";
 }
 
-/* ========== v1.3 子标签栏（甘特/看板共用） ========== */
-.planboard-subtabs {
-	display: flex;
-	gap: 6px;
-	margin: 4px 0 10px;
-}
-
-.planboard-subtab {
-	padding: 4px 14px;
-	font-size: 12px;
-	font-weight: 500;
-	letter-spacing: 0.01em;
-	color: var(--text-muted);
-	background: transparent;
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 999px;
-	cursor: pointer;
-	transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-.planboard-subtab:hover {
-	color: var(--text-normal);
-	background: var(--background-modifier-hover);
-}
-
-.planboard-subtab.is-active {
-	color: #fff;
-	background: var(--pb-accent-dim);
-	border-color: var(--pb-accent-dim);
-}
-
 /* ========== v1.3 甘特拖拽手柄 ========== */
 .planboard-gantt-handle {
 	position: absolute;
@@ -2082,15 +2221,6 @@
 .planboard-gantt-bar.is-dragging {
 	opacity: 0.75;
 	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-}
-
-/* ========== v1.3 看板状态视图列头配色 ========== */
-.planboard-board-col-status-doing .planboard-board-col-title {
-	color: var(--pb-accent-dim);
-}
-
-.planboard-board-col-status-done .planboard-board-col-title {
-	color: var(--color-green);
 }
 
 /* ========== v1.4 徽章强化（文件末尾，确保覆盖 .planboard-badge 基类）：全站渐变 + 弹出动画 ========== */
@@ -2500,8 +2630,7 @@
 
 /* 文本：统一撑满/可压缩（标题独占第一行） */
 .planboard-plan-grid .planboard-check-text,
-.planboard-tasks-card .planboard-check-text,
-.planboard-board-col .planboard-check-text {
+.planboard-tasks-card .planboard-check-text {
 	flex: 1 1 auto;
 	min-width: 0;
 }
@@ -2956,6 +3085,23 @@
 .planboard-mode-child.is-checked .planboard-check-text {
 	text-decoration: line-through;
 	color: var(--text-faint);
+}
+
+/* ADR-0017: 分次勾选——次行列表（第三层，缩进挂在子项行 li 内） */
+.planboard-subitem .planboard-sublist {
+	flex-basis: 100%;
+	list-style: none;
+	margin: 2px 0 0;
+	padding: 0 0 0 20px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+/* ADR-0017: 全勾子项行的禁点 checkbox（同书行完成态观感，退勾只能退次行） */
+.planboard-mode-child .planboard-subcheckbox:disabled {
+	cursor: not-allowed;
+	opacity: 0.7;
 }
 
 /* ADR-0016: 生活事项——逾期挂账徽标（非该做日出现的补做行） */

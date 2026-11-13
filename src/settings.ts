@@ -50,13 +50,13 @@ export interface PlanFlowSettings {
 	planOrder: string[];
 	/** 年度计划卡每卡高度（v1.7.2：拖拽下边缘调整，px）。 */
 	yearPlanHeights: Record<string, number>;
-	/** 年度卡量化目标框高度（v2.x：拖拽「量化目标⇆任务」分隔条调整，px，按计划名；0/缺省 = 自然高度）。 */
+	/** 已废弃：年度卡旧「量化目标⇆任务」分隔条框高（px，按计划名）。单一滚动体改造后不再读取，字段保留仅为兼容旧 data.json（不迁移）。 */
 	yearGoalBoxHeights: Record<string, number>;
-	/** 看板列顺序（v1.7.3：拖拽列头调整，计划名数组；空 = 按年度定义顺序）。 */
+	/** 已废弃（v1.8 看板重构）：旧任务看板列顺序；新看板沿用 planOrder。保留字段仅为兼容旧 data.json。 */
 	boardColumnOrder: string[];
 	/** 用户手动删除的自动分解任务名（v1.0.4）——防止 ensureAutoTasks 补额时"复活"被删任务。编辑/删除对应量化目标时清空相关条目。 */
 	deletedAutoTasks: string[];
-	/** 日记目录（ADR-0004 打卡联动）：勾选子任务时向 `{diaryDir}/{当天}.md` 的「## 代办事项」投影；空 = 禁用。 */
+	/** 日记目录（ADR-0004/ADR-0018）：今日总结/复盘/次日计划写入 `{diaryDir}/{当天}.md`；空 = 禁用。 */
 	diaryDir: string;
 	/** 今日总结最近一次写入日记「## 备注」的块文本（ADR-0004 扩展五）：替换定位锚点，不在设置页展示。 */
 	summaryDiaryLast: string;
@@ -225,8 +225,8 @@ export class PlanFlowSettingTab extends PluginSettingTab {
 				control: { type: "toggle", key: "weaveEnabled" },
 			},
 			{
-				name: "日记目录（打卡联动）",
-				desc: "勾选打卡子任务时，向当天日记的「## 代办事项」写入完成记录（与待办投影同格式）；留空禁用",
+				name: "日记目录（复盘/次日计划）",
+				desc: "今日总结、复盘、次日计划写入当天日记的这个目录；日程规划三节由 BZG 单点维护，planflow 不再写；留空禁用",
 				aliases: ["diaryDir", "日记", "代办"],
 				render: (setting) => this.renderDiaryDir(setting),
 			},

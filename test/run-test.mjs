@@ -17,4 +17,6 @@ await esbuild.build({
 });
 
 const mod = await import(pathToFileURL(path.join(__dirname, "parse-test.cjs")).href);
-process.exit(mod.default ?? 0);
+// 测试文件自带 process.exit 与 ALL PASSED 汇总；bundle 的 CJS default 是 {} 不是数字，
+// 直接 process.exit(mod.default) 会抛 ERR_INVALID_ARG_TYPE（Node 22）。只在确为数字时透传。
+if (typeof mod.default === "number") process.exit(mod.default);

@@ -10,6 +10,7 @@ import { parseQuotaActual, parseQuotaAmount, buildQuotaCheckLine, missingQuotaLi
 import { parseToc, parseTocLine, tocSummary } from "../src/toc";
 import { parseReviewItems, buildBzgSnapshot, reviewedOn, distinctReviewedInRange, diaryDayWritten, utcToLocalDay } from "../src/bzg";
 import { nextDayPlanTransform, extractNextDayPlanSection } from "../src/diary-sync";
+import { computeBoardSections } from "../src/board-items";
 import { TFile } from "obsidian";
 
 let failed = 0;
@@ -856,7 +857,7 @@ const dailyMd = [
 	"- [ ] 🏃 八段锦 1次 #计划/运动",
 	"- [x] 🏃 平板撑 3组 #计划/运动",
 ].join("\n");
-const dailyFile = new TFile() as any;
+const dailyFile = new TFile();
 dailyFile.path = "2025/每日/2026-11-10.md";
 dailyFile.name = "2026-11-10.md";
 const parsed = parseDailyContent(dailyFile, dailyMd, "2026-11-10");
@@ -892,6 +893,241 @@ const orphanRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanMd, "202
 check("topRows: 无父行模式行保持顶层且计入", orphanRows.length === 1 && orphanRows[0].modeChildren.length === 0 && orphanRows[0].done, JSON.stringify(orphanRows));
 // 无模式行时全部平铺（老口径兼容：谓词恒 false）
 check("topRows: 无模式行 = 全部独立大项", topLevelCheckRows(parsed.checkItems, () => false).length === 9);
+
+
+// --- 分次勾选（ADR-0017：量化子项次行——解析/锚定/聚合/生成/镜像） --------------
+import {
+	parseTickRow,
+	buildTickLine,
+	tickAnchorOf,
+	tickChildrenOf,
+	reconcileTickRows,
+	subItemMirrorTargets,
+	moveTaskBlock,
+	removeLineBlock,
+	modeLineAmount,
+	splitTickCount,
+	splitTicksDone,
+	renameTickRowBase,
+	choreTickLineIndices,
+	type ModeLineSpec,
+} from "../src/daily";
+
+// 1. 次行文本样式（次行带单位：第k{unit}）
+check("tick 样式: 拉伸第2次 → base+2+次", JSON.stringify(parseTickRow("拉伸第2次")) === JSON.stringify({ base: "拉伸", k: 2, unit: "次" }), parseTickRow("拉伸第2次"));
+check("tick 样式: 组单位同样识别", JSON.stringify(parseTickRow("拉伸第2组")) === JSON.stringify({ base: "拉伸", k: 2, unit: "组" }), parseTickRow("拉伸第2组"));
+check("tick 样式: 无单位尾也可（空单位目标）", JSON.stringify(parseTickRow("拉伸第2")) === JSON.stringify({ base: "拉伸", k: 2, unit: "" }), parseTickRow("拉伸第2"));
+check("tick 样式: emoji 前缀容忍", parseTickRow("🏃 拉伸第1次")?.base === "拉伸", parseTickRow("🏃 拉伸第1次"));
+check("tick 样式: 模式行文本不是次行", parseTickRow("拉伸 2次") === null, parseTickRow("拉伸 2次"));
+check("tick 样式: 无 base 不算", parseTickRow("第2次") === null, parseTickRow("第2次"));
+check("tick 样式: 其他量词行不算", parseTickRow("平板撑 3组") === null, parseTickRow("平板撑 3组"));
+check("tick 样式: k=0 非法", parseTickRow("拉伸第0次") === null, parseTickRow("拉伸第0次"));
+check("tick 样式: buildTickLine 缩进+标签+单位+日期", buildTickLine("拉伸", 2, "运动", "2026-11-12", "次") === "\t- [ ] 拉伸第2次 #计划/运动 🛫 2026-11-12 📅 2026-11-12", buildTickLine("拉伸", 2, "运动", "2026-11-12", "次"));
+check("tick 样式: buildTickLine 组单位", buildTickLine("拉伸", 1, "运动", "2026-11-12", "组") === "\t- [ ] 拉伸第1组 #计划/运动 🛫 2026-11-12 📅 2026-11-12", buildTickLine("拉伸", 1, "运动", "2026-11-12", "组"));
+
+// 2. 解析：缩进次行进 checkItems（indent + tick），其余缩进行保持不可见
+const splitMd = [
+	"# 2026-11-12",
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [ ] 🏃 拉伸 2次 #计划/运动",
+	"\t- [x] 拉伸第1次 #计划/运动",
+	"\t- [ ] 拉伸第2次 #计划/运动",
+	"    - [ ] 缩进的普通行 #计划/运动",
+	"	随便写写",
+	"	- [ ] 无标签次行样式的行",
+].join("\n");
+const splitParsed = parseDailyContent(dailyFile, splitMd, "2026-11-12");
+check("tick 解析: 4 行 checkItems（父+子项行+2 次行），非次行缩进行不可见", splitParsed.checkItems.length === 4, splitParsed.checkItems.map((i) => i.text));
+const tickItems = splitParsed.checkItems.filter((it) => it.tick);
+check("tick 解析: 两条次行带 indent+tick", tickItems.length === 2 && tickItems[0].tick?.base === "拉伸" && tickItems[0].tick?.k === 1 && tickItems[0].indent === 1, JSON.stringify(tickItems.map((t) => t.tick)));
+check("tick 解析: 次行勾选态读对", tickItems[0].checked === true && tickItems[1].checked === false);
+check("tick 解析: 缩进行不漏进 tempItems", splitParsed.tempItems.length === 0, splitParsed.tempItems.length);
+
+// 3. matchesModeLine 碰撞记录：「拉伸第2次」includes("2次") 会误中 floor=2 的拉伸——上层须先守卫
+const splitModeGoals = [{ plan: "运动", name: "拉伸", floor: 2, unit: "次" }];
+const isSplitModeLine = (it: CheckItem) =>
+	splitModeGoals.some((g) => g.plan === it.plan && matchesModeLine(it.text, g.name, g.floor, g.unit));
+check("tick 回归: 次行文本确实会撞 matchesModeLine（记录本碰撞）", matchesModeLine("拉伸第2次", "拉伸", 2, "次") === true);
+// 视图守卫口径（modeLineMatch 对 item.tick 恒 null）
+const viewIsModeLine = (it: CheckItem) => !it.tick && isSplitModeLine(it);
+const anchorItem0 = splitParsed.checkItems.find((it) => !it.tick && it.text.includes("拉伸 2次"))!;
+check("tick 回归: 视图守卫——item.tick 恒非模式行、子项行仍是", viewIsModeLine(tickItems[1]) === false && viewIsModeLine(anchorItem0) === true);
+
+// 4. 锚定与三层聚合
+const splitAnchor = splitParsed.checkItems.find((it) => !it.tick && isSplitModeLine(it))!;
+check("tick 锚: 次行锚到拉伸行", tickAnchorOf(splitParsed.checkItems, tickItems[0], isSplitModeLine) === splitAnchor);
+check("tick 锚: tickChildrenOf 挂 2 条", tickChildrenOf(splitParsed.checkItems, splitAnchor, isSplitModeLine).length === 2);
+const splitRows = topLevelCheckRows(splitParsed.checkItems, isSplitModeLine);
+check("tick 聚合: 次行不落顶层（大项 = 1）", splitRows.length === 1, splitRows.length);
+check("tick 聚合: 次行不进 modeChildren（拉伸行 1 条）", splitRows[0].modeChildren.length === 1, splitRows[0].modeChildren.length);
+check("tick 聚合: 部分完成 → 大项未完成", splitRows[0].done === false, splitRows[0].done);
+const allTickRows = topLevelCheckRows(parseDailyContent(dailyFile, splitMd.replace("\t- [ ] 拉伸第2次", "\t- [x] 拉伸第2次"), "2026-11-12").checkItems, isSplitModeLine);
+check("tick 聚合: 次行全勾 → 子行镜像完成 → 大项完成", allTickRows[0].done === true, allTickRows[0].done);
+// 次行缩进丢失 → 独立行兜底（不被吞）
+const orphanTickMd = [
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [ ] 拉伸第1次 #计划/运动",
+].join("\n");
+const orphanTickRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanTickMd, "2026-11-12").checkItems, isSplitModeLine);
+check("tick 兜底: 锚行被删 → 次行独立顶层", orphanTickRows.length === 2, orphanTickRows.length);
+// toggleTaskLine 容忍缩进（次行写回不丢缩进）
+const toggledIndent = toggleTaskLine(splitMd, 5, true, "\t- [ ] 拉伸第2次 #计划/运动");
+check("tick 写回: 缩进次行勾选保留缩进", toggledIndent.split("\n")[5] === "\t- [x] 拉伸第2次 #计划/运动", toggledIndent.split("\n")[5]);
+
+// 5. reconcileTickRows：补缺/清理/幂等
+const recBase = [
+	"# 2026-11-12",
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [ ] 🏃 拉伸 2次 #计划/运动",
+].join("\n");
+const splitSpec: ModeLineSpec = { plan: "运动", name: "拉伸", label: "🏃", floor: 2, unit: "次" };
+const rec1 = reconcileTickRows(recBase, splitSpec, 2, "2026-11-12");
+check("tick 生成: 补出 2 条缩进次行", rec1.split("\n").filter((l) => l.includes("拉伸第")).length === 2, rec1);
+check("tick 生成: 幂等", reconcileTickRows(rec1, splitSpec, 2, "2026-11-12") === rec1);
+const rec2 = reconcileTickRows(recBase + "\n\t- [ ] 拉伸第2次 #计划/运动 🛫 2026-11-12 📅 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick 生成: 补缺保持 k 升序", rec2.indexOf("拉伸第1次") !== -1 && rec2.indexOf("拉伸第1次") < rec2.indexOf("拉伸第2次"), rec2);
+const rec3 = reconcileTickRows(rec1 + "\n\t- [ ] 拉伸第3次 #计划/运动 🛫 2026-11-12 📅 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick 清理: 超量未勾次行删除", !rec3.includes("拉伸第3次"), rec3);
+const rec4 = reconcileTickRows(rec1 + "\n\t- [x] 拉伸第3次 #计划/运动 🛫 2026-11-12 📅 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick 清理: 超量已勾次行保留（完成记录）", rec4.includes("拉伸第3次"), rec4);
+const rec5 = reconcileTickRows(rec1, splitSpec, 0, "2026-11-12");
+check("tick 清理: n=0 清全部未勾次行", !rec5.includes("拉伸第"), rec5);
+const rec6 = reconcileTickRows("# 2026-11-12\n## ✅ 今日打卡\n- [ ] 别的 #计划/别的\n", splitSpec, 2, "2026-11-12");
+check("tick 生成: 无子项行原样返回", !rec6.includes("拉伸第"), rec6);
+const rec7 = reconcileTickRows(rec1 + "\n\t- [ ] 拉伸第1次 #计划/运动 🛫 2026-11-12 📅 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick 清理: 重复未勾次行去重", rec7.split("\n").filter((l) => l.includes("拉伸第1次")).length === 1, rec7);
+check("tick 生成: 次行不掩盖真行缺失（missingModeLines 仍补子项行）", missingModeLines([
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [ ] 拉伸第2次 #计划/运动",
+].join("\n"), [splitSpec], "2026-11-12").length === 1);
+
+// 6. subItemMirrorTargets：次行全勾 ⇔ 子项行勾（双向）
+check("mirror: 全未勾无动作", subItemMirrorTargets(rec1, [splitSpec]).length === 0);
+const mir1 = subItemMirrorTargets(
+	rec1.replace("\t- [ ] 拉伸第1次", "\t- [x] 拉伸第1次").replace("\t- [ ] 拉伸第2次", "\t- [x] 拉伸第2次"),
+	[splitSpec]
+);
+check("mirror: 次行全勾 → 子项行待勾", mir1.length === 1 && mir1[0].checked === true, JSON.stringify(mir1));
+const mir2 = subItemMirrorTargets(rec1.replace("- [ ] 🏃 拉伸 2次", "- [x] 🏃 拉伸 2次"), [splitSpec]);
+check("mirror: 子项行勾但次行未全勾 → 待回退", mir2.length === 1 && mir2[0].checked === false, JSON.stringify(mir2));
+check("mirror: 无次行不动", subItemMirrorTargets(recBase, [splitSpec]).length === 0);
+
+// 7. 块移动/块删除
+const blockStart = rec1.split("\n").findIndex((l) => l.includes("拉伸 2次"));
+check("tick 块: 上移整块跟手", moveTaskBlock(rec1, blockStart, blockStart + 2, -1).split("\n")[blockStart - 1].includes("拉伸 2次"));
+const recBlockDown = rec1 + "\n- [ ] 🏃 八段锦 1次 #计划/运动 🛫 2026-11-12 📅 2026-11-12";
+check("tick 块: 下移整块跟手", moveTaskBlock(recBlockDown, blockStart, blockStart + 2, 1).split("\n")[blockStart + 1].includes("拉伸 2次"));
+check("tick 块: 相邻非任务行不越界（标题上方不动）", moveTaskBlock(rec1, 2, 2, -1) === rec1);
+const removedBlock = removeLineBlock(rec1, blockStart, blockStart + 2);
+check("tick 块: 删除整块（子项行+次行）", !removedBlock.includes("拉伸") && removedBlock.includes("运动 每天半小时"), removedBlock);
+
+// 8. parentCheckTargets：次行跳过（缩进行本就 invisible；守卫兜独立次行）
+const rollTickMd = [
+	"# 2026-11-12",
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [x] 🏃 拉伸 2次 #计划/运动",
+	"\t- [x] 拉伸第1次 #计划/运动",
+	"\t- [x] 拉伸第2次 #计划/运动",
+].join("\n");
+const rollTickFacts: ParentRollupFact[] = [{ plan: "运动", live: true, pendingEmpty: true }];
+const rollTickTargets = parentCheckTargets(
+	rollTickMd,
+	rollTickFacts,
+	(plan, text) => plan === "运动" && matchesModeLine(text, "拉伸", 2, "次"),
+	(plan, text) => plan === "运动" && parseTickRow(text)?.base === "拉伸"
+);
+check("tick 对账: 镜像后子项行勾 → 运动父行入账", rollTickTargets.length === 1 && rollTickTargets[0].plan === "运动", JSON.stringify(rollTickTargets));
+const flatTickMd = rollTickMd.replace("\n\t- [x] 拉伸第2次 #计划/运动", "\n- [ ] 拉伸第2次 #计划/运动");
+check("tick 对账: 无守卫时独立次行会误阻塞父行（记录碰撞）", parentCheckTargets(flatTickMd, rollTickFacts, (plan, text) => plan === "运动" && matchesModeLine(text, "拉伸", 2, "次")).length === 0);
+const flatGuarded = parentCheckTargets(
+	flatTickMd,
+	rollTickFacts,
+	(plan, text) => plan === "运动" && matchesModeLine(text, "拉伸", 2, "次"),
+	(plan, text) => plan === "运动" && parseTickRow(text)?.base === "拉伸"
+);
+check("tick 对账: isTickLineText 守卫兜住独立次行", flatGuarded.length === 1 && flatGuarded[0].plan === "运动", JSON.stringify(flatGuarded));
+
+// 9. repointModeLineAmounts：目标量/单位编辑后旧行重指（用户实测踩坑：拉升 1次 对 floor=2 顶层化）
+import { repointModeLineAmounts } from "../src/daily";
+const rep1 = repointModeLineAmounts([
+	"# 2026-11-12",
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [x] 🏃 拉伸 1次 #计划/运动 🛫 2026-11-12 📅 2026-11-12",
+	"- [ ] 🏃 平板撑 3组 #计划/运动",
+].join("\n"), [splitSpec]);
+check("repoint: 旧量行改到新口径（勾选态/标签/日期保留）", rep1.includes("- [x] 🏃 拉伸 2次 #计划/运动 🛫 2026-11-12 📅 2026-11-12"), rep1);
+check("repoint: 父行与他量行不动", rep1.includes("运动 每天半小时") && rep1.includes("平板撑 3组"));
+check("repoint: 幂等", repointModeLineAmounts(rep1, [splitSpec]) === rep1);
+check("repoint: 实量后缀保留", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 🗣️ 文献复习 5篇（实 9篇） #计划/学习", [{ plan: "学习", name: "文献复习", label: "🗣️", floor: 3, unit: "篇" }]) === "## ✅ 今日打卡\n- [ ] 🗣️ 文献复习 3篇（实 9篇） #计划/学习");
+check("repoint: 缺量行补量", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 拉伸 #计划/运动", [splitSpec]) === "## ✅ 今日打卡\n- [ ] 拉伸 2次 #计划/运动");
+check("repoint: floor=0 剥量回纯打卡", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 拉伸 2次 #计划/运动", [{ plan: "运动", name: "拉伸", label: "", floor: 0, unit: "" }]) === "## ✅ 今日打卡\n- [ ] 拉伸 #计划/运动");
+check("repoint: 次行样式行不动", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 拉伸第2次 #计划/运动", [splitSpec]) === "## ✅ 今日打卡\n- [ ] 拉伸第2次 #计划/运动");
+check("repoint: 名后带其他文本的行不动", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 拉伸计划很重要 #计划/运动", [splitSpec]) === "## ✅ 今日打卡\n- [ ] 拉伸计划很重要 #计划/运动");
+check("repoint: 单位变更跟随（次→组）", repointModeLineAmounts("## ✅ 今日打卡\n- [ ] 🏃 拉伸 2次 #计划/运动", [{ plan: "运动", name: "拉伸", label: "🏃", floor: 2, unit: "组" }]) === "## ✅ 今日打卡\n- [ ] 🏃 拉伸 2组 #计划/运动");
+// 重指后整链贯通：重指 → 次行可锚定生成 → 子项行回到模式行折叠
+const repChain = reconcileTickRows(repointModeLineAmounts([
+	"## ✅ 今日打卡",
+	"- [ ] 🏃 运动 每天半小时 #计划/运动",
+	"- [ ] 🏃 拉伸 1次 #计划/运动",
+].join("\n"), [splitSpec]), splitSpec, 2, "2026-11-12");
+check("repoint: 重指后次行生成、行折叠回父项", repChain.includes("\t- [ ] 拉伸第1次") && topLevelCheckRows(parseDailyContent(dailyFile, repChain, "2026-11-12").checkItems, isSplitModeLine).length === 1, repChain);
+
+// 10. 组单位（用户裁决：组次一样，可数单位都拆）+ 单位切换清理
+const zuSpec: ModeLineSpec = { plan: "运动", name: "拉伸", label: "💪", floor: 2, unit: "组" };
+const zu1 = reconcileTickRows("## ✅ 今日打卡\n- [ ] 💪 拉伸 2组 #计划/运动", zuSpec, 2, "2026-11-12");
+check("tick 组: 生成第1组/第2组", zu1.includes("\t- [ ] 拉伸第1组 #计划/运动") && zu1.includes("\t- [ ] 拉伸第2组 #计划/运动"), zu1);
+check("tick 组: 幂等", reconcileTickRows(zu1, zuSpec, 2, "2026-11-12") === zu1);
+const zuMirror = subItemMirrorTargets(
+	zu1.replace("\t- [ ] 拉伸第1组", "\t- [x] 拉伸第1组").replace("\t- [ ] 拉伸第2组", "\t- [x] 拉伸第2组"),
+	[zuSpec]
+);
+check("tick 组: 全勾镜像待勾子项行", zuMirror.length === 1 && zuMirror[0].checked === true, JSON.stringify(zuMirror));
+// 单位切换（次 → 组）：真实刷新链 = 先重指子项行（2次→2组），再清理旧单位未勾次行 + 生成新单位行
+const switched = reconcileTickRows(repointModeLineAmounts(rec1, [zuSpec]), zuSpec, 2, "2026-11-12");
+check("tick 组: 切单位后旧行重指、旧未勾次行清除、新单位行生成", switched.includes("拉伸 2组") && switched.includes("拉伸第1组") && !switched.includes("拉伸第1次"), switched);
+const switched2 = reconcileTickRows(repointModeLineAmounts(rec1.replace("\t- [ ] 拉伸第1次", "\t- [x] 拉伸第1次"), [zuSpec]), zuSpec, 2, "2026-11-12");
+check("tick 组: 旧单位已勾次行保留（完成记录）", switched2.includes("拉伸 2组") && switched2.includes("拉伸第1次") && switched2.includes("拉伸第1组"), switched2);
+check("tick 组: 异单位次行不进镜像", subItemMirrorTargets(rec1.replace("\t- [ ] 拉伸第1次", "\t- [x] 拉伸第1次").replace("\t- [ ] 拉伸第2次", "\t- [x] 拉伸第2次"), [zuSpec]).length === 0);
+
+// 11. 父行自愈（ensureModeParentLines）：模式行计划缺父行时补模板行（用户实测踩坑：
+//     目标晚于笔记创建 → 父行缺失 → 模式行+次行整组顶层化）
+import { ensureModeParentLines } from "../src/daily";
+const healParents = [{ plan: "运动", line: "- [ ] 💪 运动 #计划/运动 🛫 2026-11-12 📅 2026-11-12" }];
+const healIsMode = (plan: string, text: string): boolean => plan === "运动" && matchesModeLine(text, "拉伸", 2, "次");
+const healBase = [
+	"# 2026-11-12",
+	"## ✅ 今日打卡",
+	"- [ ] 📈 复盘 #计划/复盘",
+	"- [ ] 🏃 拉伸 2次 #计划/运动 🛫 2026-11-12 📅 2026-11-12",
+	"\t- [ ] 拉伸第1次 #计划/运动 🛫 2026-11-12 📅 2026-11-12",
+].join("\n");
+const healed = ensureModeParentLines(healBase, healParents, healIsMode);
+check("heal: 缺父行 → 插到首个模式行之前", healed.includes("\t- [ ] 拉伸第1次") && healed.indexOf("💪 运动") < healed.indexOf("拉伸 2次") && healed.indexOf("拉伸 2次") < healed.indexOf("拉伸第1次"), healed);
+check("heal: 幂等", ensureModeParentLines(healed, healParents, healIsMode) === healed);
+const healed2 = ensureModeParentLines(
+	healBase.replace("- [ ] 🏃 拉伸 2次", "- [ ] 🏃 运动 每天半小时 #计划/运动\n- [ ] 🏃 拉伸 2次"),
+	healParents,
+	healIsMode
+);
+check("heal: 已有非模式父行不重复补", healed2.split("\n").filter((l) => l.includes("#计划/运动") && !l.includes("拉伸")).length === 1, healed2);
+const healed3 = ensureModeParentLines(
+	"# 2026-11-12\n## ✅ 今日打卡\n- [ ] 拉伸第1次 #计划/运动",
+	healParents,
+	healIsMode
+);
+check("heal: 独立次行不算父行、仍补父行", healed3.includes("💪 运动") && healed3.split("\n").filter((l) => l.includes("拉伸第1次")).length === 1, healed3);
+check("heal: 计划无任何模式内容不凭空补卡", ensureModeParentLines(healBase, [{ plan: "阅读", line: "- [ ] 📖 阅读 #计划/阅读" }], healIsMode) === healBase);
+// 日记形态：目标名=计划名的行可兼任大项，永远顶层——不触发补卡（防重复补行）
+const diaryIsMode = (plan: string, text: string): boolean => plan === "日记" && matchesModeLine(text, "日记", 0, "");
+const diaryContent = "# 2026-11-12\n## ✅ 今日打卡\n- [ ] 📝 日记 #计划/日记 🛫 2026-11-12 📅 2026-11-12";
+check("heal: 计划名本身行不触发补卡（日记形态）", ensureModeParentLines(diaryContent, [{ plan: "日记", line: "- [ ] 📝 日记 #计划/日记 🛫 2026-11-12 📅 2026-11-12" }], diaryIsMode) === diaryContent);
+
 
 
 // --- 刷新期父行对账（parentCheckTargets：待办清空 → 勾父，ADR-0013） ----------
@@ -1248,6 +1484,108 @@ check("writing line: 他人名字不认", !matchesWritingLine("✍️ 《球状�
 	check("choreLines: 精确匹配——近名/异计划/带后缀都不顶替", out.length === 2, out);
 }
 
+// --- ADR-0019: 生活事项每日分次（三餐 = 每天 3 餐） --------------------------------------------
+
+// 1. 分次判定与量记号口径
+check("split: 每天 3 餐 → 3", splitTickCount(3, "餐") === 3);
+check("split: 每天 2 餐 → 2", splitTickCount(2, "餐") === 2);
+check("split: 连续量单位不拆（2 分钟）", splitTickCount(2, "分钟") === 0);
+check("split: 1 次不拆", splitTickCount(1, "次") === 0);
+check(
+	"split: 生活事项行识别量记号恒 0（裸名）",
+	modeLineAmount("chore", 3, "餐").floor === 0 && modeLineAmount("chore", 3, "餐").unit === "",
+	modeLineAmount("chore", 3, "餐")
+);
+check(
+	"split: 运动行识别沿用 floor/unit",
+	modeLineAmount("exercise", 2, "次").floor === 2 && modeLineAmount("exercise", 2, "次").unit === "次"
+);
+check("split: 周期文案带次数（每天 3餐）", choreCycleLabel({ unit: "day", days: [] }, undefined, 3, "餐") === "每天 3餐", choreCycleLabel({ unit: "day", days: [] }, undefined, 3, "餐"));
+
+// 2. 分次生活事项的解析 / 三层聚合（父行 > 事项行 > 次行）
+const choreSplitMd = [
+	"## ✅ 今日打卡",
+	"- [ ] 🏠 日常生活 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+	"- [ ] 三餐 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+	"\t- [x] 三餐第1餐 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+	"\t- [ ] 三餐第2餐 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+	"\t- [ ] 三餐第3餐 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+].join("\n");
+const choreSplitGoals = [{ plan: "日常生活", name: "三餐", floor: 3, unit: "餐", mode: "chore" as const }];
+const isChoreSplitModeLine = (it: CheckItem) =>
+	!it.tick &&
+	choreSplitGoals.some((g) => {
+		const amt = modeLineAmount(g.mode, g.floor, g.unit);
+		return g.plan === it.plan && matchesModeLine(it.text, g.name, amt.floor, amt.unit);
+	});
+const choreSplitParsed = parseDailyContent(dailyFile, choreSplitMd, "2026-11-13");
+const choreSplitRows = topLevelCheckRows(choreSplitParsed.checkItems, isChoreSplitModeLine);
+check("chore split: 大项仍 1（次行不落顶层）", choreSplitRows.length === 1, choreSplitRows.length);
+check("chore split: 事项行挂在父行下", choreSplitRows[0].modeChildren.length === 1, choreSplitRows[0].modeChildren.length);
+check("chore split: 2/3 餐 → 大项未完成", choreSplitRows[0].done === false, choreSplitRows[0].done);
+const choreAllMd = choreSplitMd
+	.replace("\t- [ ] 三餐第2餐", "\t- [x] 三餐第2餐")
+	.replace("\t- [ ] 三餐第3餐", "\t- [x] 三餐第3餐");
+const choreAllRows = topLevelCheckRows(parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems, isChoreSplitModeLine);
+check("chore split: 3/3 餐 → 事项行完成 → 大项完成", choreAllRows[0].done === true, choreAllRows[0].done);
+
+// 3. 生成：锚点行保持裸名，次行按 餐 单位补写
+const choreTickSpec: ModeLineSpec = { plan: "日常生活", name: "三餐", label: "🏠", floor: 0, unit: "餐" };
+const choreRecBase = [
+	"## ✅ 今日打卡",
+	"- [ ] 🏠 日常生活 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+	"- [ ] 三餐 #计划/日常生活 🛫 2026-11-13 📅 2026-11-13",
+].join("\n");
+const choreRec1 = reconcileTickRows(choreRecBase, choreTickSpec, 3, "2026-11-13");
+check("chore split 生成: 补出三条「第k餐」次行", choreRec1.split("\n").filter((l) => l.includes("三餐第")).length === 3, choreRec1);
+check("chore split 生成: 事项行保持裸名（不嵌 3餐）", choreRec1.includes("- [ ] 三餐 #计划/日常生活"), choreRec1);
+check("chore split 生成: 幂等", reconcileTickRows(choreRec1, choreTickSpec, 3, "2026-11-13") === choreRec1);
+
+// 4. 镜像：次行全勾 ⇔ 事项行勾（双向，生活事项同样适用）
+check("chore split mirror: 全未勾无动作", subItemMirrorTargets(choreRec1, [choreTickSpec]).length === 0);
+const choreMir = subItemMirrorTargets(
+	choreRec1.replace(/\[ \] 三餐第/g, "[x] 三餐第"),
+	[choreTickSpec]
+);
+check("chore split mirror: 三条全勾 → 事项行待勾", choreMir.length === 1 && choreMir[0].checked === true, choreMir);
+const choreMirBack = subItemMirrorTargets(
+	choreRec1.replace("\t- [ ] 三餐第1餐", "\t- [x] 三餐第1餐").replace("- [ ] 三餐 #", "- [x] 三餐 #"),
+	[choreTickSpec]
+);
+check("chore split mirror: 事项行勾着但次行未勾 → 待退", choreMirBack.length === 1 && choreMirBack[0].checked === false, choreMirBack);
+
+// 5. splitTicksDone：k=1..n 全勾才算（锚点镜像未回写时的统计兜底）
+check("chore split done: 2/3 不算", splitTicksDone(choreSplitParsed.checkItems, "日常生活", "三餐", "餐", 3) === false);
+check(
+	"chore split done: 3/3 算",
+	splitTicksDone(parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems, "日常生活", "三餐", "餐", 3) === true
+);
+check("chore split done: 单位不匹配不算", splitTicksDone(choreAllRows ? parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems : [], "日常生活", "三餐", "次", 3) === false);
+
+// 6. 改名联动：锚点与次行 base 同步改，勾选态/序号/单位/缩进原样保留
+const choreRenamed = renameTickRowBase(choreRec1, "日常生活", "三餐", "正餐");
+check("chore split 改名: 三条次行 base 全改", choreRenamed.split("\n").filter((l) => l.includes("正餐第")).length === 3, choreRenamed);
+check("chore split 改名: 序号/单位/缩进保留", choreRenamed.includes("\t- [ ] 正餐第3餐 #计划/日常生活"), choreRenamed);
+check("chore split 改名: 幂等（旧名不再出现）", !choreRenamed.includes("三餐第"), choreRenamed);
+const choreRenamedChecked = renameTickRowBase(
+	choreRec1.replace(/\[ \] 三餐第/g, "[x] 三餐第"),
+	"日常生活",
+	"三餐",
+	"正餐"
+);
+check("chore split 改名: 已勾态保留", choreRenamedChecked.split("\n").filter((l) => l.includes("[x] 正餐第")).length === 3, choreRenamedChecked);
+const otherPlanTicks = choreRec1
+	.split("\n")
+	.map((l) => (l.startsWith("\t") ? l.replace("#计划/日常生活", "#计划/别的") : l))
+	.join("\n");
+check("chore split 改名: 异计划次行不动", renameTickRowBase(otherPlanTicks, "日常生活", "三餐", "正餐").includes("三餐第1餐"));
+
+// 7. 次行行号收集（删除/陈旧清理共用）
+const choreTickIdx = choreTickLineIndices(choreRec1, "日常生活", "三餐");
+check("chore split 行号: 收满三条次行", choreTickIdx.length === 3, choreTickIdx);
+check("chore split 行号: 不含锚点行", !choreTickIdx.includes(2), choreTickIdx);
+check("chore split 行号: 异名不收", choreTickLineIndices(choreRec1, "日常生活", "洗碗").length === 0);
+
 // --- ADR-0016: scanChoreHit——挂账清账的文件事实回扫 --------------------------------------------
 void (async () => {
 	// 最小 app stub：vault.getAbstractFileByPath + cachedRead（文件须是 mock TFile 实例——实现里有 instanceof 守卫）
@@ -1262,6 +1600,13 @@ void (async () => {
 		day("2026-11-09", ["- [x] 洗碗 #计划/日常生活 🛫 2026-11-09 📅 2026-11-09"]),
 		day("2026-11-10", ["- [ ] 洗碗 #计划/日常生活 🛫 2026-11-10 📅 2026-11-10"]),
 		day("2026-11-11", ["- [x] 洗碗机 #计划/日常生活 🛫 2026-11-11 📅 2026-11-11", "- [ ] 洗碗 #计划/家务 🛫 2026-11-11 📅 2026-11-11"]),
+		// ADR-0019: 锚点行未勾（镜像未回写）但三条次行全勾——文件事实仍算当日完成
+		day("2026-11-12", [
+			"- [ ] 三餐 #计划/日常生活 🛫 2026-11-12 📅 2026-11-12",
+			"\t- [x] 三餐第1餐 #计划/日常生活 🛫 2026-11-12 📅 2026-11-12",
+			"\t- [x] 三餐第2餐 #计划/日常生活 🛫 2026-11-12 📅 2026-11-12",
+			"\t- [x] 三餐第3餐 #计划/日常生活 🛫 2026-11-12 📅 2026-11-12",
+		]),
 	];
 	const app = {
 		vault: {
@@ -1295,6 +1640,169 @@ void (async () => {
 		await scanChoreHit(app as never, prefix, "日常生活", "洗碗", "2026-11-09", "2026-11-10", true),
 		undefined
 	);
+	check(
+		"scanHit split: 锚点未勾但次行全勾 → 命中（floor/unit 口径）",
+		await scanChoreHit(app as never, prefix, "日常生活", "三餐", "2026-11-12", "2026-11-12", false, 3, "餐"),
+		undefined
+	);
+	check(
+		"scanHit split: 不给分次口径时只看锚点行（未勾 = 未命中）",
+		!(await scanChoreHit(app as never, prefix, "日常生活", "三餐", "2026-11-12", "2026-11-12")),
+		undefined
+	);
+
+	// --- v1.8 完成情况看板：computeBoardSections ---------------------------------
+	{
+		const files: TFile[] = [];
+		const contents = new Map<string, string>();
+		const mk = (path: string, text: string): TFile => {
+			const f = new TFile();
+			f.path = path;
+			f.name = path.split("/").pop() ?? "";
+			f.basename = f.name.replace(/\.[^.]+$/, "");
+			files.push(f);
+			contents.set(path, text);
+			return f;
+		};
+		const boardApp = {
+			vault: {
+				getFiles: () => files,
+				getAbstractFileByPath: (p: string) => files.find((f) => f.path === p) ?? null,
+				cachedRead: async (f: { path: string }) => contents.get(f.path) ?? "",
+			},
+		};
+		const annual = `---
+start: 2026-11-09
+end: 2026-11-20
+plans:
+  - name: 日常生活
+    type: 打卡
+    target: 家务
+    goals:
+      - name: 三餐
+        mode: chore
+        floor: 3
+        unit: 餐
+      - name: 洗碗
+        mode: chore
+        cycle:
+          unit: week
+          days: [1]
+      - name: 拉伸
+        mode: chore
+  - name: 阅读
+    type: 打卡
+    target: 每天读书
+  - name: 写作
+    type: 数量
+    target: 2 节
+    goals:
+      - name: 《书》
+        count: 2
+        unit: 节
+        mode: reading
+  - name: 空计划
+    type: 数量
+    target: 0
+---
+`;
+		mk("root/计划2026/年度计划.md", annual);
+		mk(
+			"root/计划2026/任务.md",
+			[
+				"- [x] 《书》（第 1 章第 1 节） #计划/写作 🛫 2026-11-10 📅 2026-11-10",
+				"- [ ] 《书》（第 1 章第 2 节） #计划/写作 🛫 2026-11-11 📅 2026-11-11",
+			].join("\n")
+		);
+		const row = (text: string, plan: string, checked: boolean, date: string, indent = false): string =>
+			`${indent ? "\t" : ""}- [${checked ? "x" : " "}] ${text} #计划/${plan} 🛫 ${date} 📅 ${date}`;
+		const day = (date: string, lines: string[]): void => {
+			mk(`root/计划2026/每日/${date}.md`, [CHECK_HEADING, ...lines].join("\n"));
+		};
+		day("2026-11-09", [
+			// ADR-0019: 三餐锚点未勾但三条次行全勾 → 当日命中
+			row("三餐", "日常生活", false, "2026-11-09"),
+			row("三餐第1餐", "日常生活", true, "2026-11-09", true),
+			row("三餐第2餐", "日常生活", true, "2026-11-09", true),
+			row("三餐第3餐", "日常生活", true, "2026-11-09", true),
+			row("拉伸", "日常生活", true, "2026-11-09"),
+			row("洗碗", "日常生活", true, "2026-11-09"),
+			row("阅读", "阅读", true, "2026-11-09"),
+		]);
+		day("2026-11-10", [
+			// 只勾 2/3 次 → 三餐当日不算完成
+			row("三餐", "日常生活", false, "2026-11-10"),
+			row("三餐第1餐", "日常生活", true, "2026-11-10", true),
+			row("三餐第2餐", "日常生活", true, "2026-11-10", true),
+		]);
+		day("2026-11-11", [
+			row("三餐", "日常生活", true, "2026-11-11"),
+			row("拉伸", "日常生活", true, "2026-11-11"),
+			row("阅读", "阅读", true, "2026-11-11"),
+		]);
+		day("2026-11-12", [
+			row("三餐", "日常生活", false, "2026-11-12"),
+			row("三餐第1餐", "日常生活", true, "2026-11-12", true),
+			row("三餐第2餐", "日常生活", true, "2026-11-12", true),
+			row("三餐第3餐", "日常生活", true, "2026-11-12", true),
+			row("拉伸", "日常生活", true, "2026-11-12"),
+		]);
+		day("2026-11-15", [
+			row("三餐", "日常生活", true, "2026-11-15"),
+			row("拉伸", "日常生活", false, "2026-11-15"),
+			row("阅读", "阅读", true, "2026-11-15"),
+		]);
+
+		const board = await computeBoardSections(boardApp as never, "root", "2026-11-15", true, null);
+		const sec = (name: string) => board.sections.find((s) => s.plan === name);
+		const item = (plan: string, name: string) => sec(plan)?.items.find((i) => i.name === name);
+
+		check(
+			"board: 计划期间取年度 frontmatter 并截至今天",
+			board.start === "2026-11-09" && board.scanEnd === "2026-11-15",
+			{ start: board.start, scanEnd: board.scanEnd }
+		);
+		check("board: 无子项且无事实的计划区被隐藏", !sec("空计划"));
+
+		const san = item("日常生活", "三餐");
+		check("board: 三餐 命中 4/7 天（次行全勾算命中、2/3 不算）", san?.done === 4 && san?.total === 7, {
+			done: san?.done,
+			total: san?.total,
+		});
+		check(
+			"board: 三餐日格 11-09 命中 / 11-10 未完成 / 11-13 未完成",
+			san?.days?.find((d) => d.date === "2026-11-09")?.state === "hit" &&
+				san?.days?.find((d) => d.date === "2026-11-10")?.state === "miss" &&
+				san?.days?.find((d) => d.date === "2026-11-13")?.state === "miss"
+		);
+		const wan = item("日常生活", "洗碗");
+		check("board: 每周一事项 命中 1/1 次、量词为次", wan?.done === 1 && wan?.total === 1 && wan?.unit === "次", {
+			done: wan?.done,
+			total: wan?.total,
+			unit: wan?.unit,
+		});
+		check(
+			"board: 每周一事项非该做日 = off（7 格里 6 个 off）",
+			wan?.days?.filter((d) => d.state === "off").length === 6,
+			wan?.days
+		);
+		check("board: 生活计划聚合率按应做量加权（8/15 = 53%）", sec("日常生活")?.percent === 53, sec("日常生活")?.percent);
+
+		const read = sec("阅读");
+		check(
+			"board: 打卡型计划按天统计 3/7",
+			read?.items[0]?.done === 3 && read?.items[0]?.total === 7 && read?.percent === 43,
+			{ item: read?.items[0], percent: read?.percent }
+		);
+
+		const book = item("写作", "《书》");
+		check(
+			"board: 量化目标只有任务进度、无日格带",
+			book?.done === 1 && book?.total === 2 && book?.unit === "节" && book?.days === undefined,
+			{ done: book?.done, total: book?.total, unit: book?.unit, days: book?.days }
+		);
+		check("board: 量化计划区百分比沿用计划进度", sec("写作")?.percent === 50, sec("写作")?.percent);
+	}
 
 	console.log(failed === 0 ? "\nALL PASSED" : `\n${failed} FAILED`);
 	process.exit(failed === 0 ? 0 : 1);

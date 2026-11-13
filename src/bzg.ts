@@ -13,7 +13,7 @@ import type { App } from "obsidian";
  * 2. `{diaryDirectory}/{YYYY-MM-DD}.md`（默认 `我的/日记`）
  *    日文件打开即预铺骨架，「文件存在 ≠ 写了」。完成事实 = 本人亲手写下的
  *    内容：「# 随笔」或「# 当日触动点」小节里有正文行；投影/勾选不算
- *    （planflow 自己写的是「## 代办事项」「## 完成情况跟踪」，互不重叠，防循环自证）。
+ *    （日记三节由 BZG 单点写入，ADR-0018；planflow 只写随笔/触动点之外的复盘与备注）。
  *
  * 路径以 BZG 自己的 `.obsidian/plugins/BZG/data.json` 为准（用户改了设置也跟得上），
  * 读不到按约定路径兜底；BZG 缺席 → 返回 null，调用方静默降级为手动记录。

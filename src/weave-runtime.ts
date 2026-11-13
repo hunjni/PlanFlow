@@ -20,7 +20,6 @@ import {
 	type PoolTask,
 } from "./tasks";
 import { MANUAL_MARK, markTaskLineManual, toggleTaskLine } from "./daily";
-import { syncPoolTaskToDiary } from "./diary-sync";
 import { parsePlansFromFrontmatter, type PlanDef, type PlanGoal } from "./stats";
 import { yearDirName } from "./paths";
 
@@ -429,7 +428,7 @@ async function confirmLeaves(
 	modal.open();
 }
 
-/** 确认结果写回：勾选（任务池 + 日记投影）或忽略（落 ✋，自动逻辑不再碰）。 */
+/** 确认结果写回：勾选（只写任务池；日记由 BZG 重建）或忽略（落 ✋，自动逻辑不再碰）。 */
 async function applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: PoolTask[], check: boolean, quiet = false): Promise<void> {
 	if (!deps) return;
 	const { app, plugin } = deps;
@@ -437,7 +436,6 @@ async function applyWeaveCheck(hit: { plan: string; goal: PlanGoal }, tasks: Poo
 		for (const t of tasks) {
 			if (check) {
 				await toggleTask(app, t, true);
-				await syncPoolTaskToDiary(app, plugin.settings.diaryDir, t.text, true);
 			} else {
 				await app.vault.process(t.file, (data) => markTaskLineManual(data, t.line, t.raw));
 			}

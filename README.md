@@ -36,7 +36,7 @@ Most planning tools keep "yearly goals, monthly plans, daily check-ins" as three
 | **Year** | Plan overview & goal management | New plans auto-generate daily check-in items; quantified goals auto-decompose into month/week tasks |
 | **Today** | Goal → execution → review | Check items, write daily summary, one-click review note |
 | **Week / Month** | Period task preview & progress | Add ad-hoc tasks, view completion rates |
-| **Kanban** | Execution board grouped by plan | Drag column headers to resize, filter by plan |
+| **Kanban** | Per-item completion over the plan period | Plan sections list every check-in item with hit/target counts and a per-day strip (hover for date + state) |
 | **Gantt** | Timeline scheduling | Drag to reschedule, spot overlaps |
 
 Other features:

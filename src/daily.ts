@@ -33,6 +33,10 @@ export interface CheckItem {
 	raw: string;
 	/** The note file this item lives in. */
 	file: TFile;
+	/** 前导空白字符数（ADR-0017 仅次行携带；顶层行 undefined）。 */
+	indent?: number;
+	/** ADR-0017 分次勾选：次行信息（`{base}第{k}{unit}`）；仅缩进次行携带。 */
+	tick?: { base: string; k: number; unit: string } | null;
 }
 
 /** A temp task coming from the daily note or a week/month note frontmatter. */
@@ -176,6 +180,27 @@ export function parseDailyContent(file: TFile, content: string, date: string): D
 			continue;
 		}
 		if (!inCheckSection) continue;
+		// ADR-0017: 缩进行仅识别「次行」（`{base}第{k}次` + 计划标签）——其余缩进行
+		// 维持解析不可见（TASK_LINE_RE 锚定行首的历史行为，不改任何既有文件的语义）。
+		const indent = /^([ \t]+)/.exec(line);
+		if (indent) {
+			const m = TASK_LINE_RE.exec(line.slice(indent[1].length));
+			if (!m?.[3]) continue;
+			const tick = parseTickRow(m[2].trim());
+			if (!tick) continue;
+			checkItems.push({
+				text: m[2].trim(),
+				plan: m[3],
+				checked: m[1] === "x",
+				due: m[5] ?? m[4] ?? null,
+				raw: line,
+				line: i,
+				file,
+				indent: indent[1].length,
+				tick,
+			});
+			continue;
+		}
 		const m = TASK_LINE_RE.exec(line);
 		if (!m) continue;
 		const checked = m[1] === "x";
@@ -275,8 +300,53 @@ export function toggleTaskLine(content: string, lineIndex: number, checked: bool
 		if (idx === -1) return content;
 	}
 	const line = lines[idx];
-	if (line === undefined || !/^- \[[ x]\]/.test(line)) return content;
-	lines[idx] = line.replace(/^- \[[ x]\]/, checked ? "- [x]" : "- [ ]");
+	if (line === undefined) return content;
+	// ADR-0017: 容忍前导缩进（分次次行）——checkbox 替换保留原缩进
+	const m = /^([ \t]*)- \[[ x]\]/.exec(line);
+	if (!m) return content;
+	lines[idx] = line.replace(/^([ \t]*)- \[[ x]\]/, `${m[1]}- [${checked ? "x" : " "}]`);
+	return lines.join("\n");
+}
+
+/**
+ * ADR-0017: 连块移动——把 [start, end] 行块整体上/下移一格（块外相邻行换位）。
+ * 相邻行须为任务行（防移出打卡区/越过标题）；expectedRaw 定位 start 行（漂移兜底）。
+ */
+export function moveTaskBlock(content: string, start: number, end: number, delta: number, expectedRaw?: string): string {
+	const lines = content.split("\n");
+	let s = start;
+	if (expectedRaw && lines[s] !== expectedRaw) {
+		s = lines.findIndex((l) => l === expectedRaw);
+		if (s === -1) return content;
+	}
+	const e = end < s ? s : end;
+	if (s < 0 || e >= lines.length) return content;
+	if (delta === -1) {
+		if (s === 0 || !/^- \[[ x]\]/.test(lines[s - 1])) return content;
+		const [moved] = lines.splice(s - 1, 1);
+		lines.splice(e, 0, moved); // 删除后块尾前移一位，插回原相邻位置
+		return lines.join("\n");
+	}
+	if (delta === 1) {
+		if (!/^- \[[ x]\]/.test(lines[e + 1] ?? "")) return content;
+		const [moved] = lines.splice(e + 1, 1);
+		lines.splice(s, 0, moved);
+		return lines.join("\n");
+	}
+	return content;
+}
+
+/** ADR-0017: 删除 [start, end] 行块（含端点）；expectedRaw 定位 start 行（漂移兜底）。 */
+export function removeLineBlock(content: string, start: number, end: number, expectedRaw?: string): string {
+	const lines = content.split("\n");
+	let s = start;
+	if (expectedRaw && lines[s] !== expectedRaw) {
+		s = lines.findIndex((l) => l === expectedRaw);
+		if (s === -1) return content;
+	}
+	const e = end < s ? s : end;
+	if (s < 0 || e >= lines.length) return content;
+	lines.splice(s, e - s + 1);
 	return lines.join("\n");
 }
 
@@ -309,7 +379,7 @@ export function moveTaskLine(content: string, lineIndex: number, delta: number, 
 	return lines.join("\n");
 }
 
-/** Append a task line inside the `## ✅ 今日打卡` section (after the last task). */
+/** Append a task line inside the `## ✅ 今日打卡` section (after the last task, 缩进的次行也算任务行——新行不得插进子项行与其次行之间). */
 export function appendCheckItem(content: string, line: string): string {
 	const lines = content.split("\n");
 	const headingIdx = lines.findIndex((l) => l.startsWith(CHECK_HEADING));
@@ -319,7 +389,7 @@ export function appendCheckItem(content: string, line: string): string {
 	let insertIdx = headingIdx + 1;
 	for (let i = headingIdx + 1; i < lines.length; i++) {
 		if (/^##\s/.test(lines[i])) break;
-		if (/^- \[[ x]\]/.test(lines[i])) insertIdx = i + 1;
+		if (/^[ \t]*- \[[ x]\]/.test(lines[i])) insertIdx = i + 1;
 	}
 	lines.splice(insertIdx, 0, line);
 	return lines.join("\n");
@@ -511,6 +581,297 @@ export function matchesModeLine(text: string, name: string, floor: number, unit:
 	return stripped === name;
 }
 
+// ---------------------------------------------------------------------------
+// 分次勾选（ADR-0017 量化子项：每日目标量以「次」计且 ≥2 时按次拆勾；
+// ADR-0019 起同一套引擎也服务「每天」周期的生活事项——三餐 = 每天 3 餐）
+// 次行：`\t- [ ] 拉伸第1次 #计划/运动 🛫 D 📅 D`（缩进挂子项行下，纯手动勾）；
+// 子项行勾选态 = 全部次行勾满的镜像。序号进文本使幂等键 plan|text 天然互异。
+// ---------------------------------------------------------------------------
+
+/**
+ * ADR-0017/0019: 连续量单位不拆勾（单行记量）；次/组/餐/自定义可数单位 ≥2 都拆。
+ * 生活事项（ADR-0019）与运动模式共用这一把尺。
+ */
+export const SPLIT_EXCLUDED_UNITS = ["分钟", "小时", "公里", "千卡"];
+
+/** ADR-0017/0019: 分次形态的当日次行数；0 = 非分次（floor<2 或分钟/小时等连续量单位）。 */
+export function splitTickCount(floor: number, unit: string): number {
+	return floor >= 2 && !SPLIT_EXCLUDED_UNITS.includes(unit) ? Math.floor(floor) : 0;
+}
+
+/**
+ * ADR-0019: 模式行识别的量记号——生活事项行恒为裸事项名（每日次数只存 frontmatter，
+ * 不进行文本，历史行因此永远可识别）；运动/复习/写作等沿用 floor/unit 内嵌口径。
+ */
+export function modeLineAmount(
+	mode: string | undefined,
+	floor: number | undefined,
+	unit: string | undefined
+): { floor: number; unit: string } {
+	return mode === "chore" ? { floor: 0, unit: "" } : { floor: floor ?? 0, unit: unit ?? "" };
+}
+
+/** 次行文本样式：`{base}第{k}{unit}`（剥 emoji 前缀后整行恰为此形；unit 为目标单位，可空）。 */
+export function parseTickRow(text: string): { base: string; k: number; unit: string } | null {
+	const stripped = text
+		.trim()
+		.replace(/^[^\w\u4e00-\u9fff]+/, "")
+		.trim();
+	const m = /^(.+?)第(\d+)(\S*)$/.exec(stripped);
+	if (!m) return null;
+	const k = parseInt(m[2], 10);
+	if (!Number.isFinite(k) || k <= 0) return null;
+	return { base: m[1].trim(), k, unit: m[3] ?? "" };
+}
+
+/** 构建次行：`\t- [ ] {name}第{k}{unit} #计划/{plan} 🛫 D 📅 D`（缩进挂子项行下；unit 可空）。 */
+export function buildTickLine(name: string, k: number, plan: string, date: string, unit = ""): string {
+	return `\t- [ ] ${name}第${k}${unit} #计划/${plan} 🛫 ${date} 📅 ${date}`;
+}
+
+/**
+ * 次行的锚点 = 它前面最近一个同计划、缩进更浅、非次行的行，且须为「本目标自己的」
+ * 模式行——剥 emoji 后文本以次行 base 开头（同 matchesModeLine 的 startsWith 口径）。
+ * 目标校验防兄弟子行的次行块「收养」本目标的次行（平板撑行收养拉伸第N次的事故）；
+ * 非模式行（计划父行等）挡路 → null 兜底为独立行；不匹配的本计划模式行 → 越过继续找。
+ */
+export function tickAnchorOf(
+	checkItems: CheckItem[],
+	tick: CheckItem,
+	isModeLine: (item: CheckItem) => boolean
+): CheckItem | null {
+	const indent = tick.indent ?? 0;
+	if (!tick.plan || indent <= 0) return null;
+	const at = checkItems.indexOf(tick);
+	for (let j = at - 1; j >= 0; j--) {
+		const cand = checkItems[j];
+		if (!cand.plan || cand.plan !== tick.plan) continue;
+		if ((cand.indent ?? 0) >= indent) continue;
+		if (cand.tick) return null; // 次行不嵌次行（只一层）
+		if (!isModeLine(cand)) return null;
+		const stripped = cand.text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+		if (tick.tick && stripped.startsWith(tick.tick.base)) return cand;
+	}
+	return null;
+}
+
+/** 挂在某子项行下的全部次行（保持文件顺序；与 topLevelCheckRows 同一把锚尺）。 */
+export function tickChildrenOf(
+	checkItems: CheckItem[],
+	anchor: CheckItem,
+	isModeLine: (item: CheckItem) => boolean
+): CheckItem[] {
+	return checkItems.filter((it) => it.tick && tickAnchorOf(checkItems, it, isModeLine) === anchor);
+}
+
+/**
+ * ADR-0019: 生活事项改名——今日打卡区里该事项的次行 base 同步改名（序号/单位/勾选态原样保留）。
+ * 只改文本、不动勾选；历史日期文件不碰（调用方只传今日文件内容）。
+ */
+export function renameTickRowBase(content: string, plan: string, oldName: string, newName: string): string {
+	let inCheck = false;
+	return content
+		.split("\n")
+		.map((line) => {
+			if (/^##\s/.test(line)) {
+				inCheck = line.startsWith(CHECK_HEADING);
+				return line;
+			}
+			if (!inCheck) return line;
+			const indent = /^([ \t]+)/.exec(line);
+			if (!indent) return line;
+			const m = TASK_LINE_RE.exec(line.slice(indent[1].length));
+			if (!m || m[3] !== plan) return line;
+			const text = m[2].trim();
+			const t = parseTickRow(text);
+			if (!t || t.base !== oldName) return line;
+			const idx = line.indexOf(text);
+			if (idx === -1) return line;
+			return line.slice(0, idx) + `${newName}第${t.k}${t.unit}` + line.slice(idx + text.length);
+		})
+		.join("\n");
+}
+
+/**
+ * ADR-0019: 生活事项行/次行整体移除——用于「事项被删除」与「陈旧挂账清除」两类今日清理。
+ * 返回要删除的行号集合（锚点行由调用方按 unchecked 口径自行决定，此处只收次行）。
+ */
+export function choreTickLineIndices(content: string, plan: string, name: string): number[] {
+	let inCheck = false;
+	const out: number[] = [];
+	content.split("\n").forEach((line, i) => {
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			return;
+		}
+		if (!inCheck) return;
+		const indent = /^([ \t]+)/.exec(line);
+		if (!indent) return;
+		const m = TASK_LINE_RE.exec(line.slice(indent[1].length));
+		if (!m || m[3] !== plan) return;
+		const t = parseTickRow(m[2].trim());
+		if (t && t.base === name) out.push(i);
+	});
+	return out;
+}
+
+/**
+ * ADR-0017: 分次勾选的次行幂等补写/清理/归位（纯变换）。
+ * - 补：缺的 k=1..n 缩进次行按 k 序生成；
+ * - 清：k>n 的未勾次行、重复 k 的未勾行、旧单位未勾残留删除（已勾 = 完成记录，保留）；
+ * - 归位：本目标全部次行（无论落在文件何处——插入行曾把子项行与次行隔开、导致次行被
+ *   兄弟块「收养」，用户实测事故）统一重建到锚点块内、k 升序，原文本逐字保留。
+ * n=0 = 非分次形态（floor<2 / 连续量单位）：仅清残留未勾次行、已勾归位块尾。
+ * 子项行识别走 matchesModeLine；找不到子项行时原样返回（不凭空造锚点）。
+ */
+export function reconcileTickRows(content: string, spec: ModeLineSpec, n: number, date: string): string {
+	const lines = content.split("\n");
+	let inCheck = false;
+	let anchorIdx = -1;
+	interface TickAt {
+		idx: number;
+		k: number;
+		checked: boolean;
+		raw: string;
+	}
+	const ticks: TickAt[] = [];
+	const removeIdx = new Set<number>();
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const indent = /^([ \t]+)/.exec(line);
+		const m = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+		if (!m || !m[3] || m[3] !== spec.plan) continue;
+		const text = m[2].trim();
+		if (indent) {
+			const t = parseTickRow(text);
+			if (!t || t.base !== spec.name) continue;
+			if (t.unit !== spec.unit) {
+				// 旧单位形态的残留次行（单位切换后）：未勾清除，已勾保留原位（完成记录）
+				if (m[1] === " ") removeIdx.add(i);
+				continue;
+			}
+			ticks.push({ idx: i, k: t.k, checked: m[1] === "x", raw: line });
+			continue;
+		}
+		if (anchorIdx === -1 && matchesModeLine(text, spec.name, spec.floor, spec.unit)) anchorIdx = i;
+	}
+	if (anchorIdx === -1) return content;
+
+	const keepByK = new Map<number, string[]>();
+	const seenK = new Set<number>();
+	const ordered = [...ticks].sort((a, b) => a.k - b.k || a.idx - b.idx);
+	for (const t of ordered) {
+		const dup = seenK.has(t.k);
+		seenK.add(t.k);
+		if (dup && !t.checked) {
+			removeIdx.add(t.idx); // 未勾重复：删
+		} else if (t.k > n && !t.checked) {
+			removeIdx.add(t.idx); // 超量未勾：删
+		} else {
+			const arr = keepByK.get(t.k) ?? [];
+			arr.push(t.raw);
+			keepByK.set(t.k, arr);
+			removeIdx.add(t.idx); // 原位置一律移除——块内重排（原地者逐字归位，幂等）
+		}
+	}
+	if (keepByK.size === 0 && removeIdx.size === 0 && n === 0) return content;
+	const blockLines: string[] = [];
+	for (let k = 1; k <= n; k++) {
+		const arr = keepByK.get(k);
+		if (arr) blockLines.push(...arr);
+		else blockLines.push(buildTickLine(spec.name, k, spec.plan, date, spec.unit));
+	}
+	for (const k of [...keepByK.keys()].sort((a, b) => a - b)) {
+		if (k > n) blockLines.push(...keepByK.get(k)!); // 超量已勾排块尾
+	}
+	const result: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (i === anchorIdx) {
+			result.push(lines[i]);
+			result.push(...blockLines);
+			continue;
+		}
+		if (removeIdx.has(i)) continue;
+		result.push(lines[i]);
+	}
+	return result.join("\n");
+}
+
+/**
+ * ADR-0017: 分次子项行的镜像对账目标——次行全勾 ⇔ 子项行勾（双向）。
+ * 仅当子项行存在 ≥1 条次行时参与（无次行 = 非分次形态或尚未生成，不镜像）。
+ * 返回 checked ≠ derived 的子项行（line + raw 供 toggleTaskLine 定位写回）。
+ */
+export function subItemMirrorTargets(
+	content: string,
+	specs: ModeLineSpec[]
+): { line: number; raw: string; checked: boolean }[] {
+	const lines = content.split("\n");
+	let inCheck = false;
+	const anchorAt: (null | { idx: number; raw: string; checked: boolean })[] = specs.map(() => null);
+	const allChecked: boolean[][] = specs.map(() => []);
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const indent = /^([ \t]+)/.exec(line);
+		const m = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+		if (!m || !m[3]) continue;
+		const text = m[2].trim();
+		if (indent) {
+			const t = parseTickRow(text);
+			if (!t) continue;
+			const si = specs.findIndex(
+				(s, si) => m[3] === s.plan && t.base === s.name && t.unit === (s.unit || "") && anchorAt[si] !== null
+			);
+			if (si !== -1) allChecked[si].push(m[1] === "x");
+			continue;
+		}
+		const si = specs.findIndex((s) => m[3] === s.plan && matchesModeLine(text, s.name, s.floor, s.unit));
+		if (si !== -1 && anchorAt[si] === null) {
+			anchorAt[si] = { idx: i, raw: line, checked: m[1] === "x" };
+		}
+	}
+	const out: { line: number; raw: string; checked: boolean }[] = [];
+	specs.forEach((s, si) => {
+		const at = anchorAt[si];
+		if (!at || allChecked[si].length === 0) return;
+		const derived = allChecked[si].every(Boolean);
+		if (at.checked !== derived) out.push({ line: at.idx, raw: at.raw, checked: derived });
+	});
+	return out;
+}
+
+/**
+ * ADR-0019: 分次生活事项的当日完成态——该 base 的次行 k=1..n 全部存在且全勾。
+ * 供统计扫描用（文件事实口径兜底：锚点行镜像未回写时，次行全勾仍算当日完成）。
+ */
+export function splitTicksDone(
+	checkItems: CheckItem[],
+	plan: string,
+	name: string,
+	unit: string,
+	n: number
+): boolean {
+	if (n < 2) return false;
+	const byK = new Map<number, boolean>();
+	for (const it of checkItems) {
+		if (!it.tick || it.plan !== plan) continue;
+		if (it.tick.base !== name || it.tick.unit !== (unit || "")) continue;
+		byK.set(it.tick.k, it.checked);
+	}
+	for (let k = 1; k <= n; k++) if (!byK.get(k)) return false;
+	return true;
+}
+
 /** 大项口径下的一个顶层打卡行（今日打卡进度 / 连续打卡共用的计数单位）。 */
 export interface TopCheckRow {
 	/** 顶层行自身（非模式子行的打卡行）。 */
@@ -525,23 +886,41 @@ export interface TopCheckRow {
  * 今日打卡大项口径（ADR-0012）：顶层行 = 非模式行；同计划首个非模式行是该计划的
  * 父行，模式行嵌套其下（ADR-0006，与 updateChecklist 的渲染嵌套同一规则）。
  * 父行聚合完成态含「子行全勾」——回填勾子与级联勾父的间隙不吞完成度。
- * 无父行的模式行保持顶层（渲染同款兜底），任务池子任务不进此口径（书叶有自己的今日书进度）。
+ * ADR-0017: 次行先挂锚点（同计划、更浅缩进的子项行），不进模式子行、不落顶层；
+ * 子行完成态含「次行全勾」（分次勾选）。无父行的模式行保持顶层（渲染同款兜底），
+ * 任务池子任务不进此口径（书叶有自己的今日书进度）。
  */
 export function topLevelCheckRows(
 	checkItems: CheckItem[],
 	isModeLine: (item: CheckItem) => boolean
 ): TopCheckRow[] {
 	const childrenOf = new Map<CheckItem, CheckItem[]>();
+	const ticksByAnchor = new Map<CheckItem, CheckItem[]>();
 	const isChild = new Set<CheckItem>();
 	for (const item of checkItems) {
-		if (!item.plan || !isModeLine(item)) continue;
-		const parent = checkItems.find((it) => it.plan === item.plan && !isModeLine(it));
+		if (!item.plan || !item.tick) continue;
+		const anchor = tickAnchorOf(checkItems, item, isModeLine);
+		if (!anchor) continue;
+		isChild.add(item);
+		const arr = ticksByAnchor.get(anchor) ?? [];
+		arr.push(item);
+		ticksByAnchor.set(anchor, arr);
+	}
+	for (const item of checkItems) {
+		if (!item.plan || item.tick || !isModeLine(item)) continue;
+		const parent = checkItems.find((it) => it.plan === item.plan && !it.tick && !isModeLine(it));
 		if (!parent) continue;
 		isChild.add(item);
 		const arr = childrenOf.get(parent) ?? [];
 		arr.push(item);
 		childrenOf.set(parent, arr);
 	}
+	// 子行完成态：自身已勾，或次行全勾（「回填间隙不吞完成度」同一把尺）
+	const childDone = (c: CheckItem): boolean => {
+		if (c.checked) return true;
+		const ticks = ticksByAnchor.get(c) ?? [];
+		return ticks.length > 0 && ticks.every((t) => t.checked);
+	};
 	return checkItems
 		.filter((it) => !isChild.has(it))
 		.map((item) => {
@@ -549,7 +928,7 @@ export function topLevelCheckRows(
 			return {
 				item,
 				modeChildren,
-				done: item.checked || (modeChildren.length > 0 && modeChildren.every((c) => c.checked)),
+				done: item.checked || (modeChildren.length > 0 && modeChildren.every(childDone)),
 			};
 		});
 }
@@ -585,7 +964,9 @@ export function missingModeLines(content: string, specs: ModeLineSpec[], date: s
 		}
 		if (!inCheck) continue;
 		const m = TASK_LINE_RE.exec(line);
-		if (m?.[3]) existing.add(`${m[3]}|${m[2].trim()}`);
+		// ADR-0017: 次行样式文本不进 existing——「拉伸第2次」includes 目标名，
+		// 会掩盖真行（拉伸 2次）被删后的再生成
+		if (m?.[3] && !parseTickRow(m[2].trim())) existing.add(`${m[3]}|${m[2].trim()}`);
 	}
 	const out: string[] = [];
 	for (const s of specs) {
@@ -600,6 +981,115 @@ export function missingModeLines(content: string, specs: ModeLineSpec[], date: s
 		if (!found) out.push(buildModeCheckLine(s, date));
 	}
 	return out;
+}
+
+/**
+ * ADR-0017: 模式行目标量重指——目标编辑每日量/单位后，既有行内嵌的旧量（如「拉升 1次」
+ * 对 floor=2）不再满足 matchesModeLine 的「N{unit}」要求：行被顶层化、统计失配、
+ * 分次次行无从锚定。此变换把「[emoji ]目标名[ 旧量]」形的模式行原位改写到当前口径：
+ * 量不符 → 改量；缺量（floor>0）→ 补量；floor=0 → 剥量。勾选态/（实 N）后缀/✋/
+ * 计划标签/日期原样保留；次行样式行与名后带其他文本的行（计划默认行、手写行）不动。
+ * 幂等：量已一致时原样返回。frontmatter 是目标量唯一事实源，行内量只是其倒影。
+ */
+export function repointModeLineAmounts(content: string, specs: ModeLineSpec[]): string {
+	const lines = content.split("\n");
+	let inCheck = false;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (!m || !m[3]) continue;
+		const text = m[2].trim();
+		const stripped = text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+		if (parseTickRow(stripped)) continue; // 次行样式行不重指
+		// 尾部（实 N{unit}）/ ✋ 后缀先摘下，重指后原样接回
+		const tailMatch = /(?:（实[^）]*）\s*✋?\s*|✋\s*)$/.exec(text);
+		const tail = tailMatch ? tailMatch[0] : "";
+		const base = text.slice(0, text.length - tail.length).trimEnd();
+		const baseStripped = base.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+		const prefixLen = base.length - baseStripped.length;
+		const prefix = base.slice(0, prefixLen);
+		for (const spec of specs) {
+			if (m[3] !== spec.plan) continue;
+			const nameEsc = spec.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			// 整行锚定：恰为「名」或「名 空格 量」，名后带其他文本的行一律不碰
+			const shape = new RegExp(`^${nameEsc}(?: (\\d+(?:\\.\\d+)?)(\\S*))?$`).exec(baseStripped);
+			if (!shape) continue;
+			const hasAmount = shape[1] !== undefined;
+			const amountOk = hasAmount && Number(shape[1]) === spec.floor && shape[2] === (spec.unit || "");
+			let newStripped: string | null = null;
+			if (spec.floor > 0) {
+				if (!amountOk) newStripped = `${spec.name} ${formatQuotaAmount(spec.floor)}${spec.unit || ""}`;
+			} else if (hasAmount) {
+				newStripped = spec.name; // 改回纯打卡：剥量
+			}
+			if (newStripped === null) break; // 量已一致（或无可重指），后续 spec 也不再试
+			let rebuilt = `- [${m[1]}] ${prefix}${newStripped}${tail}`;
+			if (m[3]) rebuilt += ` #计划/${m[3]}`;
+			if (m[4]) rebuilt += ` 🛫 ${m[4]}`;
+			if (m[5]) rebuilt += ` 📅 ${m[5]}`;
+			lines[i] = rebuilt;
+			break;
+		}
+	}
+	return lines.join("\n");
+}
+
+/**
+ * ADR-0017: 模式行计划的父行自愈（ADR-0016 生活计划父行自愈的打卡计划版）。
+ * 父行（同计划第一个非模式行）只在建笔记那一刻由每日模板写入；目标晚于笔记创建、
+ * 或父行被删后，惰性补写的模式行及其分次次行会整组顶层化（大项折叠被破坏）。
+ * 触发条件（每个父行候选计划）：
+ *  - 该计划存在「游离」模式行/次行——剥 emoji 后文本不是计划名本身（「📝 日记」这类
+ *    目标名=计划名的行可兼任大项，永远顶层、不触发补卡，防重复补行）；
+ *  - 且同计划没有任何非模式行（已有父行不重复补）。
+ * 满足时把父行插到首个游离行之前（文件序与折叠一致）。幂等：已补/不需补原样返回。
+ */
+export function ensureModeParentLines(
+	content: string,
+	parents: { plan: string; line: string }[],
+	isModeLineText: (plan: string, text: string) => boolean
+): string {
+	if (parents.length === 0) return content;
+	const lines = content.split("\n");
+	let inCheck = false;
+	const hasNonMode = new Set<string>();
+	const strayIdx = new Map<string, number>();
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^##\s/.test(line)) {
+			inCheck = line.startsWith(CHECK_HEADING);
+			continue;
+		}
+		if (!inCheck) continue;
+		const m = TASK_LINE_RE.exec(line);
+		if (!m || !m[3]) continue;
+		const text = m[2].trim();
+		const stripped = text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+		const modeSide = !!parseTickRow(stripped) || isModeLineText(m[3], text);
+		if (!modeSide) {
+			hasNonMode.add(m[3]);
+			continue;
+		}
+		if (strayIdx.has(m[3])) continue;
+		const own = parents.find((p) => p.plan === m[3]);
+		if (own && stripped !== own.plan) strayIdx.set(m[3], i);
+	}
+	const insertions: { idx: number; line: string }[] = [];
+	for (const p of parents) {
+		if (hasNonMode.has(p.plan)) continue;
+		const idx = strayIdx.get(p.plan);
+		if (idx === undefined) continue;
+		insertions.push({ idx, line: p.line });
+	}
+	// 倒序插入防行号位移；同计划只补一条（strayIdx 首个游离行）
+	insertions.sort((a, b) => b.idx - a.idx);
+	for (const ins of insertions) lines.splice(ins.idx, 0, ins.line);
+	return lines.join("\n");
 }
 
 /** A quota plan flattened for line generation (structural; avoids importing stats). */
@@ -660,11 +1150,14 @@ export interface ParentRollupFact {
  *  - ADR-0015 独立事实：fact.factDone 为真（如复盘 = 日记当日复盘小节非空），
  *    无视窗口与待办——该计划的完成事实由外部文件事实给定，不由任务池聚合。
  * 单向镜像：手动取消不落豁免，刷新即重勾（factDone 同样如此，✋ 是唯一长期豁免）。
+ * ADR-0017: isTickLineText 判定为次的行既不算模式行也不当父行候选，直接跳过
+ *（缩进次行本就进不了 TASK_LINE_RE，此守卫兜住「缩进丢失的独立次行」）。
  */
 export function parentCheckTargets(
 	content: string,
 	facts: ParentRollupFact[],
-	isModeLineText: (plan: string, text: string) => boolean
+	isModeLineText: (plan: string, text: string) => boolean,
+	isTickLineText?: (plan: string, text: string) => boolean
 ): { line: number; raw: string; plan: string }[] {
 	const factByPlan = new Map(facts.map((f) => [f.plan, f]));
 	const modesDone = new Map<string, boolean>();
@@ -684,6 +1177,7 @@ export function parentCheckTargets(
 		const fact = factByPlan.get(plan);
 		if (!fact || (!fact.live && !fact.factDone)) continue;
 		const text = m[2].trim();
+		if (isTickLineText?.(plan, text)) continue;
 		if (isModeLineText(plan, text)) {
 			const checked = m[1] === "x";
 			modesDone.set(plan, (modesDone.get(plan) ?? true) && checked);
@@ -776,11 +1270,16 @@ export function parseChoreOverdue(raw: unknown): "postpone" | undefined {
 /** 星期短名（0=周日，同 Date.getDay）——cycleLabel 与周期选择 UI 共用。 */
 export const CHORE_WEEKDAY_SHORT = ["日", "一", "二", "三", "四", "五", "六"];
 
-/** 周期的人类可读文案（徽标 / 管理列表共用）；postpone 追加「 · 漏了往后延」（CONTEXT.md 逾期策略措辞）。 */
-export function choreCycleLabel(cycle: GoalCycle, overdue?: ChoreOverdue): string {
+/**
+ * 周期的人类可读文案（徽标 / 管理列表共用）；postpone 追加「 · 漏了往后延」（CONTEXT.md 逾期策略措辞）。
+ * ADR-0019: 分次事项（每天 N 次）在「每天」后附次数与单位（如「每天 3餐」）。
+ */
+export function choreCycleLabel(cycle: GoalCycle, overdue?: ChoreOverdue, floor = 0, unit = ""): string {
 	let base: string;
-	if (cycle.unit === "day") base = "每天";
-	else if (cycle.unit === "week") {
+	if (cycle.unit === "day") {
+		const n = splitTickCount(floor, unit);
+		base = n > 0 ? `每天 ${n}${unit || "次"}` : "每天";
+	} else if (cycle.unit === "week") {
 		const ds = [...cycle.days].sort((a, b) => a - b);
 		base = `每${ds.map((d) => `周${CHORE_WEEKDAY_SHORT[d] ?? "?"}`).join("、")}`;
 	} else if (cycle.unit === "month") {
@@ -896,6 +1395,8 @@ export function missingChoreLines(content: string, specs: ChoreLineSpec[], date:
  * ADR-0016: [from, to]（含端点）逐日扫每日文件，找该事项的已勾行（精确匹配：
  * 同计划 + 剥 emoji 后整行恰为事项名）。文件事实为准，命中即停。
  * backward=true 从 to 端往回扫——挂账清账判定用：最近勾的先命中，常态只读最近几天。
+ * ADR-0019: 分次事项（floor≥2 + 可数单位）另认「次行全勾」——锚点行镜像未回写时，
+ * 当日次行 k=1..N 全勾同样算该次命中。
  */
 export async function scanChoreHit(
 	app: App,
@@ -904,9 +1405,12 @@ export async function scanChoreHit(
 	name: string,
 	from: string,
 	to: string,
-	backward = false
+	backward = false,
+	floor = 0,
+	unit = ""
 ): Promise<boolean> {
 	const fmt = (d: Date): string => formatDate(d);
+	const splitN = splitTickCount(floor, unit);
 	let cur = backward ? parseDateString(to) : parseDateString(from);
 	const stopAt = backward ? from : to;
 	for (let i = 0; i < 800; i++) {
@@ -916,15 +1420,35 @@ export async function scanChoreHit(
 		if (f instanceof TFile) {
 			const content = await app.vault.cachedRead(f);
 			let inCheck = false;
+			const ticks = new Map<number, boolean>();
 			for (const line of content.split("\n")) {
 				if (/^##\s/.test(line)) {
 					inCheck = line.startsWith(CHECK_HEADING);
 					continue;
 				}
 				if (!inCheck) continue;
-				const m = TASK_LINE_RE.exec(line);
-				if (!m || m[3] !== plan || m[1] !== "x") continue;
-				if (matchesModeLine(m[2].trim(), name, 0, "")) return true;
+				const indent = /^([ \t]+)/.exec(line);
+				const m = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+				if (!m || m[3] !== plan) continue;
+				const text = m[2].trim();
+				if (indent) {
+					// ADR-0019: 次行只用于「全勾」兜底，本身不算命中
+					if (splitN === 0) continue;
+					const t = parseTickRow(text);
+					if (t && t.base === name && t.unit === (unit || "")) ticks.set(t.k, m[1] === "x");
+					continue;
+				}
+				if (m[1] === "x" && matchesModeLine(text, name, 0, "")) return true;
+			}
+			if (splitN > 0) {
+				let all = true;
+				for (let k = 1; k <= splitN; k++) {
+					if (!ticks.get(k)) {
+						all = false;
+						break;
+					}
+				}
+				if (all) return true;
 			}
 		}
 		cur = addDays(cur, backward ? -1 : 1);

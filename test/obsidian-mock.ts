@@ -4,12 +4,14 @@
  */
 export class App {}
 export class TFile {
-	/** 复现脚本构造 TFile 时需要 path/name（真实 Obsidian 的 TFile 两者都有）。 */
+	/** 复现脚本构造 TFile 时需要 path/name/basename（真实 Obsidian 的 TFile 都有）。 */
 	path: string;
 	name: string;
+	basename: string;
 	constructor(path?: string) {
 		this.path = path ?? "";
 		this.name = this.path.split("/").pop() ?? "";
+		this.basename = this.name.replace(/\.[^.]+$/, "");
 	}
 }
 export class TFolder {}

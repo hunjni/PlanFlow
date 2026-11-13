@@ -16,10 +16,13 @@ import {
 	parseChoreOverdue,
 	parseDailyContent,
 	parseQuotaActual,
+	parseTickRow,
 	parseQuotaAmount,
 	parseTempTasksFromFrontmatter,
 	parseDateString,
 	scanChoreHit,
+	splitTickCount,
+	splitTicksDone,
 	weekRange,
 	type ChoreOverdue,
 	type GoalCycle,
@@ -213,6 +216,11 @@ export interface ModeGoalStats {
 	quotaDaily?: number;
 	quotaExpected?: number;
 	quotaBehind?: boolean;
+	/**
+	 * 看板日格带（本模块内顺带产出）：窗口内逐日的完成事实，date 升序。
+	 * 生活事项（chore）不走这里——其实际勾选日由 PeriodStats.choreHitDates 提供。
+	 */
+	dayStates?: { date: string; hit: boolean }[];
 }
 
 /** Progress of one quota-type plan (ADR-0001). */
@@ -313,6 +321,13 @@ export interface PeriodStats {
 	planProgress: PlanProgress[];
 	/** Quota plan progress (ADR-0001; one entry per quota plan definition). */
 	quotaProgress: QuotaProgress[];
+	/**
+	 * 看板日格带事实（仅 year 口径有意义，week/month 也照常填充窗口内）：
+	 * - planCheckDates：`${plan}|${date}`，该日该计划有已勾的顶层行；
+	 * - choreHitDates：`${plan}|${date}|${item}`，该日该生活事项命中（含次行全勾兜底）。
+	 */
+	planCheckDates: Set<string>;
+	choreHitDates: Set<string>;
 }
 
 export interface PlanPeriod {
@@ -393,6 +408,7 @@ export async function computePeriodStats(
 		.filter((f) => f.path.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}\.md$/.test(f.name));
 
 	const planDays = new Map<string, number>(); // checked days per plan
+	const planCheckDates = new Set<string>(); // `${plan}|${date}`（看板日格带用）
 	const planSeen = new Set<string>();
 	const quotaActual = new Map<string, number>(); // cumulative actual amount per quota plan
 
@@ -404,6 +420,8 @@ export async function computePeriodStats(
 		const checkedPlans = new Set<string>();
 		for (const item of data.checkItems) {
 			if (!item.plan) continue;
+			// ADR-0017: 分次次行不进任何统计闸——部分完成（1/2）不算当日打卡，勾不满不计率
+			if (item.tick) continue;
 			// ADR-0001: quota rows feed actual amounts, not check-in rates.
 			if (quotaPlans.has(item.plan)) {
 				if (item.checked) {
@@ -419,18 +437,25 @@ export async function computePeriodStats(
 				continue;
 			}
 			// ADR-0016: 生活事项行——记录勾选事实（日期+事项名），不进常规逐日打卡率
+			// ADR-0019: 分次事项另认「次行全勾」（锚点镜像未回写时的文件事实兜底）
 			if (chorePlanNames.has(item.plan)) {
-				if (item.checked) {
-					const def = choreDefs.find((d) => d.name === item.plan);
-					const g = def?.goals.find((x) => x.mode === "chore" && matchesModeLine(item.text, x.name, 0, ""));
-					if (g) choreChecks.add(`${item.plan}|${date}|${g.name}`);
+				const def = choreDefs.find((d) => d.name === item.plan);
+				const g = def?.goals.find((x) => x.mode === "chore" && matchesModeLine(item.text, x.name, 0, ""));
+				if (g) {
+					const cycle: GoalCycle = g.cycle ?? { unit: "day", days: [] };
+					const n = cycle.unit === "day" ? splitTickCount(g.floor ?? 0, g.unit || "") : 0;
+					const hit = item.checked || (n > 0 && splitTicksDone(data.checkItems, item.plan, g.name, g.unit || "", n));
+					if (hit) choreChecks.add(`${item.plan}|${date}|${g.name}`);
 				}
 				continue;
 			}
 			planSeen.add(item.plan);
 			if (item.checked) checkedPlans.add(item.plan);
 		}
-		for (const plan of checkedPlans) planDays.set(plan, (planDays.get(plan) ?? 0) + 1);
+		for (const plan of checkedPlans) {
+			planDays.set(plan, (planDays.get(plan) ?? 0) + 1);
+			planCheckDates.add(`${plan}|${date}`);
+		}
 	}
 
 	// 周/月类型：打卡率用"至今"口径（未过的未来天不计入分母，周三看 2 天、月初看本月已过天数）
@@ -551,6 +576,8 @@ export async function computePeriodStats(
 		tasks: windowTasks,
 		planProgress,
 		quotaProgress,
+		planCheckDates,
+		choreHitDates: choreChecks,
 	};
 }
 
@@ -909,6 +936,7 @@ export async function computeModeGoalStats(
 		let cumulative = initial;
 		let hitDays = 0;
 		const days: boolean[] = [];
+		const dayStates: { date: string; hit: boolean }[] = [];
 		for (let d = qStart; d <= scanEnd; ) {
 			let hit = false;
 			const f = app.vault.getAbstractFileByPath(`${prefix}${d}.md`);
@@ -935,6 +963,7 @@ export async function computeModeGoalStats(
 			}
 			if (hit) hitDays++;
 			days.push(hit);
+			dayStates.push({ date: d, hit });
 			// 日期推进（ISO 字符串逐日）
 			const [yy, mm, dd] = d.split("-").map(Number);
 			const next = new Date(yy, mm - 1, dd + 1);
@@ -964,6 +993,7 @@ export async function computeModeGoalStats(
 			quotaDaily: daily,
 			quotaExpected: expected,
 			quotaBehind: cumulative + 1e-9 < expected,
+			dayStates,
 		};
 		return stats;
 	}
@@ -982,7 +1012,9 @@ export async function computeModeGoalStats(
 			const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, dues[i]);
 			const winTo = formatDate(addDays(parseDateString(next), -1));
 			const clampTo = winTo < dueEnd ? winTo : dueEnd;
-			hits.push(await scanChoreHit(app, prefix, planName, goal.name, dues[i], clampTo));
+			hits.push(
+				await scanChoreHit(app, prefix, planName, goal.name, dues[i], clampTo, false, goal.floor ?? 0, goal.unit || "")
+			);
 		}
 		const hitDays = hits.filter(Boolean).length;
 		let streak = 0;
@@ -1032,6 +1064,8 @@ export async function computeModeGoalStats(
 			const m = TASK_LINE_RE.exec(line);
 			if (!m || m[3] !== planName) continue;
 			const text = m[2].trim();
+			// ADR-0017: 次行不冒充模式行（「拉伸第2次」includes 匹配会抢 first-match）
+			if (parseTickRow(text)) continue;
 			if (!matchesModeLine(text, goal.name, goal.floor ?? 0, goal.unit || "")) continue;
 			found = {
 				checked: m[1] === "x",
@@ -1048,6 +1082,7 @@ export async function computeModeGoalStats(
 	let hitDays = 0;
 	let totalAmount = 0;
 	const days: boolean[] = []; // 窗口内逐日是否达标（streak 用，下标 0 = 窗口第一天）
+	const dayStates: { date: string; hit: boolean }[] = [];
 	for (let d = start; d <= dueEnd; ) {
 		const line = await readDayLine(d);
 		const bzgCount = bzg ? reviewedOn(bzg, d) : null;
@@ -1069,6 +1104,7 @@ export async function computeModeGoalStats(
 		}
 		if (hit) hitDays++;
 		days.push(hit);
+		dayStates.push({ date: d, hit });
 		// 日期推进（ISO 字符串逐日）
 		const [yy, mm, dd] = d.split("-").map(Number);
 		const next = new Date(yy, mm - 1, dd + 1);
@@ -1092,6 +1128,7 @@ export async function computeModeGoalStats(
 		hitDays,
 		streak,
 		percent: dueDays > 0 ? Math.min(100, Math.round((hitDays / dueDays) * 100)) : 0,
+		dayStates,
 	};
 	if (mode === "review" && bzg) {
 		stats.covered = distinctReviewedInRange(bzg, start, dueEnd);

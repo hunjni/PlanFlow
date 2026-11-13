@@ -1,9 +1,10 @@
 // test/obsidian-mock.ts
 var TFile = class {
   constructor(path) {
-    var _a56;
+    var _a58;
     this.path = path != null ? path : "";
-    this.name = (_a56 = this.path.split("/").pop()) != null ? _a56 : "";
+    this.name = (_a58 = this.path.split("/").pop()) != null ? _a58 : "";
+    this.basename = this.name.replace(/\.[^.]+$/, "");
   }
 };
 function parseYaml(src) {
@@ -132,6 +133,15 @@ function addDays(d, n) {
   r.setDate(r.getDate() + n);
   return r;
 }
+function getISOWeek(dateStr) {
+  const d = parseDateString(dateStr);
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const week2 = Math.ceil(((date.getTime() - yearStart.getTime()) / 864e5 + 1) / 7);
+  return { year: date.getUTCFullYear(), week: week2 };
+}
 function weekRange(dateStr) {
   const d = parseDateString(dateStr);
   const day = d.getDay() || 7;
@@ -146,8 +156,33 @@ function dayCount(start, end) {
   const e = parseDateString(end);
   return Math.round((e.getTime() - s.getTime()) / 864e5) + 1;
 }
+function countWorkdays(start, end) {
+  const s = parseDateString(start);
+  const e = parseDateString(end);
+  let count = 0;
+  const cur = new Date(s);
+  while (cur <= e) {
+    const day = cur.getDay();
+    if (day !== 0 && day !== 6)
+      count++;
+    cur.setDate(cur.getDate() + 1);
+  }
+  return count;
+}
+function parseTaskLine(line) {
+  var _a58, _b31, _c12;
+  const m2 = TASK_LINE_RE.exec(line.trim());
+  if (!m2)
+    return null;
+  return {
+    text: m2[2].trim(),
+    plan: (_a58 = m2[3]) != null ? _a58 : null,
+    checked: m2[1] === "x",
+    due: (_c12 = (_b31 = m2[5]) != null ? _b31 : m2[4]) != null ? _c12 : null
+  };
+}
 function parseDailyContent(file2, content, date) {
-  var _a56, _b30, _c12, _d5;
+  var _a58, _b31, _c12, _d5, _e4, _f2;
   const lines = content.split("\n");
   const checkItems = [];
   const tempItems = [];
@@ -160,16 +195,37 @@ function parseDailyContent(file2, content, date) {
     }
     if (!inCheckSection)
       continue;
+    const indent = /^([ \t]+)/.exec(line);
+    if (indent) {
+      const m3 = TASK_LINE_RE.exec(line.slice(indent[1].length));
+      if (!(m3 == null ? void 0 : m3[3]))
+        continue;
+      const tick = parseTickRow(m3[2].trim());
+      if (!tick)
+        continue;
+      checkItems.push({
+        text: m3[2].trim(),
+        plan: m3[3],
+        checked: m3[1] === "x",
+        due: (_b31 = (_a58 = m3[5]) != null ? _a58 : m3[4]) != null ? _b31 : null,
+        raw: line,
+        line: i,
+        file: file2,
+        indent: indent[1].length,
+        tick
+      });
+      continue;
+    }
     const m2 = TASK_LINE_RE.exec(line);
     if (!m2)
       continue;
     const checked = m2[1] === "x";
-    const plan = (_a56 = m2[3]) != null ? _a56 : null;
+    const plan = (_c12 = m2[3]) != null ? _c12 : null;
     const base = {
       text: m2[2].trim(),
       plan,
       checked,
-      due: (_c12 = (_b30 = m2[5]) != null ? _b30 : m2[4]) != null ? _c12 : null,
+      due: (_e4 = (_d5 = m2[5]) != null ? _d5 : m2[4]) != null ? _e4 : null,
       raw: line
     };
     if (plan) {
@@ -177,7 +233,7 @@ function parseDailyContent(file2, content, date) {
     } else {
       tempItems.push({
         ...base,
-        start: (_d5 = m2[4]) != null ? _d5 : null,
+        start: (_f2 = m2[4]) != null ? _f2 : null,
         source: "daily",
         file: file2,
         index: i,
@@ -219,9 +275,54 @@ function toggleTaskLine(content, lineIndex, checked, expectedRaw) {
       return content;
   }
   const line = lines[idx];
-  if (line === void 0 || !/^- \[[ x]\]/.test(line))
+  if (line === void 0)
     return content;
-  lines[idx] = line.replace(/^- \[[ x]\]/, checked ? "- [x]" : "- [ ]");
+  const m2 = /^([ \t]*)- \[[ x]\]/.exec(line);
+  if (!m2)
+    return content;
+  lines[idx] = line.replace(/^([ \t]*)- \[[ x]\]/, `${m2[1]}- [${checked ? "x" : " "}]`);
+  return lines.join("\n");
+}
+function moveTaskBlock(content, start, end, delta, expectedRaw) {
+  var _a58;
+  const lines = content.split("\n");
+  let s = start;
+  if (expectedRaw && lines[s] !== expectedRaw) {
+    s = lines.findIndex((l) => l === expectedRaw);
+    if (s === -1)
+      return content;
+  }
+  const e = end < s ? s : end;
+  if (s < 0 || e >= lines.length)
+    return content;
+  if (delta === -1) {
+    if (s === 0 || !/^- \[[ x]\]/.test(lines[s - 1]))
+      return content;
+    const [moved] = lines.splice(s - 1, 1);
+    lines.splice(e, 0, moved);
+    return lines.join("\n");
+  }
+  if (delta === 1) {
+    if (!/^- \[[ x]\]/.test((_a58 = lines[e + 1]) != null ? _a58 : ""))
+      return content;
+    const [moved] = lines.splice(e + 1, 1);
+    lines.splice(s, 0, moved);
+    return lines.join("\n");
+  }
+  return content;
+}
+function removeLineBlock(content, start, end, expectedRaw) {
+  const lines = content.split("\n");
+  let s = start;
+  if (expectedRaw && lines[s] !== expectedRaw) {
+    s = lines.findIndex((l) => l === expectedRaw);
+    if (s === -1)
+      return content;
+  }
+  const e = end < s ? s : end;
+  if (s < 0 || e >= lines.length)
+    return content;
+  lines.splice(s, e - s + 1);
   return lines.join("\n");
 }
 var MANUAL_MARK = "\u270B";
@@ -338,28 +439,282 @@ function matchesModeLine(text, name, floor, unit) {
   }
   return stripped === name;
 }
+var SPLIT_EXCLUDED_UNITS = ["\u5206\u949F", "\u5C0F\u65F6", "\u516C\u91CC", "\u5343\u5361"];
+function splitTickCount(floor, unit) {
+  return floor >= 2 && !SPLIT_EXCLUDED_UNITS.includes(unit) ? Math.floor(floor) : 0;
+}
+function modeLineAmount(mode, floor, unit) {
+  return mode === "chore" ? { floor: 0, unit: "" } : { floor: floor != null ? floor : 0, unit: unit != null ? unit : "" };
+}
+function parseTickRow(text) {
+  var _a58;
+  const stripped = text.trim().replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+  const m2 = /^(.+?)第(\d+)(\S*)$/.exec(stripped);
+  if (!m2)
+    return null;
+  const k = parseInt(m2[2], 10);
+  if (!Number.isFinite(k) || k <= 0)
+    return null;
+  return { base: m2[1].trim(), k, unit: (_a58 = m2[3]) != null ? _a58 : "" };
+}
+function buildTickLine(name, k, plan, date, unit = "") {
+  return `	- [ ] ${name}\u7B2C${k}${unit} #\u8BA1\u5212/${plan} \u{1F6EB} ${date} \u{1F4C5} ${date}`;
+}
+function tickAnchorOf(checkItems, tick, isModeLine2) {
+  var _a58, _b31;
+  const indent = (_a58 = tick.indent) != null ? _a58 : 0;
+  if (!tick.plan || indent <= 0)
+    return null;
+  const at = checkItems.indexOf(tick);
+  for (let j = at - 1; j >= 0; j--) {
+    const cand = checkItems[j];
+    if (!cand.plan || cand.plan !== tick.plan)
+      continue;
+    if (((_b31 = cand.indent) != null ? _b31 : 0) >= indent)
+      continue;
+    if (cand.tick)
+      return null;
+    if (!isModeLine2(cand))
+      return null;
+    const stripped = cand.text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+    if (tick.tick && stripped.startsWith(tick.tick.base))
+      return cand;
+  }
+  return null;
+}
+function tickChildrenOf(checkItems, anchor, isModeLine2) {
+  return checkItems.filter((it) => it.tick && tickAnchorOf(checkItems, it, isModeLine2) === anchor);
+}
+function renameTickRowBase(content, plan, oldName, newName) {
+  let inCheck = false;
+  return content.split("\n").map((line) => {
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      return line;
+    }
+    if (!inCheck)
+      return line;
+    const indent = /^([ \t]+)/.exec(line);
+    if (!indent)
+      return line;
+    const m2 = TASK_LINE_RE.exec(line.slice(indent[1].length));
+    if (!m2 || m2[3] !== plan)
+      return line;
+    const text = m2[2].trim();
+    const t = parseTickRow(text);
+    if (!t || t.base !== oldName)
+      return line;
+    const idx = line.indexOf(text);
+    if (idx === -1)
+      return line;
+    return line.slice(0, idx) + `${newName}\u7B2C${t.k}${t.unit}` + line.slice(idx + text.length);
+  }).join("\n");
+}
+function choreTickLineIndices(content, plan, name) {
+  let inCheck = false;
+  const out = [];
+  content.split("\n").forEach((line, i) => {
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      return;
+    }
+    if (!inCheck)
+      return;
+    const indent = /^([ \t]+)/.exec(line);
+    if (!indent)
+      return;
+    const m2 = TASK_LINE_RE.exec(line.slice(indent[1].length));
+    if (!m2 || m2[3] !== plan)
+      return;
+    const t = parseTickRow(m2[2].trim());
+    if (t && t.base === name)
+      out.push(i);
+  });
+  return out;
+}
+function reconcileTickRows(content, spec2, n, date) {
+  var _a58;
+  const lines = content.split("\n");
+  let inCheck = false;
+  let anchorIdx = -1;
+  const ticks = [];
+  const removeIdx = /* @__PURE__ */ new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const indent = /^([ \t]+)/.exec(line);
+    const m2 = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+    if (!m2 || !m2[3] || m2[3] !== spec2.plan)
+      continue;
+    const text = m2[2].trim();
+    if (indent) {
+      const t = parseTickRow(text);
+      if (!t || t.base !== spec2.name)
+        continue;
+      if (t.unit !== spec2.unit) {
+        if (m2[1] === " ")
+          removeIdx.add(i);
+        continue;
+      }
+      ticks.push({ idx: i, k: t.k, checked: m2[1] === "x", raw: line });
+      continue;
+    }
+    if (anchorIdx === -1 && matchesModeLine(text, spec2.name, spec2.floor, spec2.unit))
+      anchorIdx = i;
+  }
+  if (anchorIdx === -1)
+    return content;
+  const keepByK = /* @__PURE__ */ new Map();
+  const seenK = /* @__PURE__ */ new Set();
+  const ordered = [...ticks].sort((a, b) => a.k - b.k || a.idx - b.idx);
+  for (const t of ordered) {
+    const dup = seenK.has(t.k);
+    seenK.add(t.k);
+    if (dup && !t.checked) {
+      removeIdx.add(t.idx);
+    } else if (t.k > n && !t.checked) {
+      removeIdx.add(t.idx);
+    } else {
+      const arr = (_a58 = keepByK.get(t.k)) != null ? _a58 : [];
+      arr.push(t.raw);
+      keepByK.set(t.k, arr);
+      removeIdx.add(t.idx);
+    }
+  }
+  if (keepByK.size === 0 && removeIdx.size === 0 && n === 0)
+    return content;
+  const blockLines = [];
+  for (let k = 1; k <= n; k++) {
+    const arr = keepByK.get(k);
+    if (arr)
+      blockLines.push(...arr);
+    else
+      blockLines.push(buildTickLine(spec2.name, k, spec2.plan, date, spec2.unit));
+  }
+  for (const k of [...keepByK.keys()].sort((a, b) => a - b)) {
+    if (k > n)
+      blockLines.push(...keepByK.get(k));
+  }
+  const result = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i === anchorIdx) {
+      result.push(lines[i]);
+      result.push(...blockLines);
+      continue;
+    }
+    if (removeIdx.has(i))
+      continue;
+    result.push(lines[i]);
+  }
+  return result.join("\n");
+}
+function subItemMirrorTargets(content, specs) {
+  const lines = content.split("\n");
+  let inCheck = false;
+  const anchorAt = specs.map(() => null);
+  const allChecked = specs.map(() => []);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const indent = /^([ \t]+)/.exec(line);
+    const m2 = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+    if (!m2 || !m2[3])
+      continue;
+    const text = m2[2].trim();
+    if (indent) {
+      const t = parseTickRow(text);
+      if (!t)
+        continue;
+      const si2 = specs.findIndex(
+        (s, si3) => m2[3] === s.plan && t.base === s.name && t.unit === (s.unit || "") && anchorAt[si3] !== null
+      );
+      if (si2 !== -1)
+        allChecked[si2].push(m2[1] === "x");
+      continue;
+    }
+    const si = specs.findIndex((s) => m2[3] === s.plan && matchesModeLine(text, s.name, s.floor, s.unit));
+    if (si !== -1 && anchorAt[si] === null) {
+      anchorAt[si] = { idx: i, raw: line, checked: m2[1] === "x" };
+    }
+  }
+  const out = [];
+  specs.forEach((s, si) => {
+    const at = anchorAt[si];
+    if (!at || allChecked[si].length === 0)
+      return;
+    const derived = allChecked[si].every(Boolean);
+    if (at.checked !== derived)
+      out.push({ line: at.idx, raw: at.raw, checked: derived });
+  });
+  return out;
+}
+function splitTicksDone(checkItems, plan, name, unit, n) {
+  if (n < 2)
+    return false;
+  const byK = /* @__PURE__ */ new Map();
+  for (const it of checkItems) {
+    if (!it.tick || it.plan !== plan)
+      continue;
+    if (it.tick.base !== name || it.tick.unit !== (unit || ""))
+      continue;
+    byK.set(it.tick.k, it.checked);
+  }
+  for (let k = 1; k <= n; k++)
+    if (!byK.get(k))
+      return false;
+  return true;
+}
 function topLevelCheckRows(checkItems, isModeLine2) {
-  var _a56;
+  var _a58, _b31;
   const childrenOf = /* @__PURE__ */ new Map();
+  const ticksByAnchor = /* @__PURE__ */ new Map();
   const isChild = /* @__PURE__ */ new Set();
   for (const item of checkItems) {
-    if (!item.plan || !isModeLine2(item))
+    if (!item.plan || !item.tick)
       continue;
-    const parent = checkItems.find((it) => it.plan === item.plan && !isModeLine2(it));
+    const anchor = tickAnchorOf(checkItems, item, isModeLine2);
+    if (!anchor)
+      continue;
+    isChild.add(item);
+    const arr = (_a58 = ticksByAnchor.get(anchor)) != null ? _a58 : [];
+    arr.push(item);
+    ticksByAnchor.set(anchor, arr);
+  }
+  for (const item of checkItems) {
+    if (!item.plan || item.tick || !isModeLine2(item))
+      continue;
+    const parent = checkItems.find((it) => it.plan === item.plan && !it.tick && !isModeLine2(it));
     if (!parent)
       continue;
     isChild.add(item);
-    const arr = (_a56 = childrenOf.get(parent)) != null ? _a56 : [];
+    const arr = (_b31 = childrenOf.get(parent)) != null ? _b31 : [];
     arr.push(item);
     childrenOf.set(parent, arr);
   }
+  const childDone = (c) => {
+    var _a59;
+    if (c.checked)
+      return true;
+    const ticks = (_a59 = ticksByAnchor.get(c)) != null ? _a59 : [];
+    return ticks.length > 0 && ticks.every((t) => t.checked);
+  };
   return checkItems.filter((it) => !isChild.has(it)).map((item) => {
-    var _a57;
-    const modeChildren = (_a57 = childrenOf.get(item)) != null ? _a57 : [];
+    var _a59;
+    const modeChildren = (_a59 = childrenOf.get(item)) != null ? _a59 : [];
     return {
       item,
       modeChildren,
-      done: item.checked || modeChildren.length > 0 && modeChildren.every((c) => c.checked)
+      done: item.checked || modeChildren.length > 0 && modeChildren.every(childDone)
     };
   });
 }
@@ -382,7 +737,7 @@ function missingModeLines(content, specs, date) {
     if (!inCheck)
       continue;
     const m2 = TASK_LINE_RE.exec(line);
-    if (m2 == null ? void 0 : m2[3])
+    if ((m2 == null ? void 0 : m2[3]) && !parseTickRow(m2[2].trim()))
       existing.add(`${m2[3]}|${m2[2].trim()}`);
   }
   const out = [];
@@ -399,6 +754,106 @@ function missingModeLines(content, specs, date) {
       out.push(buildModeCheckLine(s, date));
   }
   return out;
+}
+function repointModeLineAmounts(content, specs) {
+  const lines = content.split("\n");
+  let inCheck = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const m2 = TASK_LINE_RE.exec(line);
+    if (!m2 || !m2[3])
+      continue;
+    const text = m2[2].trim();
+    const stripped = text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+    if (parseTickRow(stripped))
+      continue;
+    const tailMatch = /(?:（实[^）]*）\s*✋?\s*|✋\s*)$/.exec(text);
+    const tail = tailMatch ? tailMatch[0] : "";
+    const base = text.slice(0, text.length - tail.length).trimEnd();
+    const baseStripped = base.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+    const prefixLen = base.length - baseStripped.length;
+    const prefix = base.slice(0, prefixLen);
+    for (const spec2 of specs) {
+      if (m2[3] !== spec2.plan)
+        continue;
+      const nameEsc = spec2.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const shape = new RegExp(`^${nameEsc}(?: (\\d+(?:\\.\\d+)?)(\\S*))?$`).exec(baseStripped);
+      if (!shape)
+        continue;
+      const hasAmount = shape[1] !== void 0;
+      const amountOk = hasAmount && Number(shape[1]) === spec2.floor && shape[2] === (spec2.unit || "");
+      let newStripped = null;
+      if (spec2.floor > 0) {
+        if (!amountOk)
+          newStripped = `${spec2.name} ${formatQuotaAmount(spec2.floor)}${spec2.unit || ""}`;
+      } else if (hasAmount) {
+        newStripped = spec2.name;
+      }
+      if (newStripped === null)
+        break;
+      let rebuilt2 = `- [${m2[1]}] ${prefix}${newStripped}${tail}`;
+      if (m2[3])
+        rebuilt2 += ` #\u8BA1\u5212/${m2[3]}`;
+      if (m2[4])
+        rebuilt2 += ` \u{1F6EB} ${m2[4]}`;
+      if (m2[5])
+        rebuilt2 += ` \u{1F4C5} ${m2[5]}`;
+      lines[i] = rebuilt2;
+      break;
+    }
+  }
+  return lines.join("\n");
+}
+function ensureModeParentLines(content, parents, isModeLineText) {
+  if (parents.length === 0)
+    return content;
+  const lines = content.split("\n");
+  let inCheck = false;
+  const hasNonMode = /* @__PURE__ */ new Set();
+  const strayIdx = /* @__PURE__ */ new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      inCheck = line.startsWith(CHECK_HEADING);
+      continue;
+    }
+    if (!inCheck)
+      continue;
+    const m2 = TASK_LINE_RE.exec(line);
+    if (!m2 || !m2[3])
+      continue;
+    const text = m2[2].trim();
+    const stripped = text.replace(/^[^\w\u4e00-\u9fff]+/, "").trim();
+    const modeSide = !!parseTickRow(stripped) || isModeLineText(m2[3], text);
+    if (!modeSide) {
+      hasNonMode.add(m2[3]);
+      continue;
+    }
+    if (strayIdx.has(m2[3]))
+      continue;
+    const own = parents.find((p) => p.plan === m2[3]);
+    if (own && stripped !== own.plan)
+      strayIdx.set(m2[3], i);
+  }
+  const insertions = [];
+  for (const p of parents) {
+    if (hasNonMode.has(p.plan))
+      continue;
+    const idx = strayIdx.get(p.plan);
+    if (idx === void 0)
+      continue;
+    insertions.push({ idx, line: p.line });
+  }
+  insertions.sort((a, b) => b.idx - a.idx);
+  for (const ins of insertions)
+    lines.splice(ins.idx, 0, ins.line);
+  return lines.join("\n");
 }
 function missingQuotaLines(content, quotas, date) {
   const existing = /* @__PURE__ */ new Set();
@@ -423,8 +878,8 @@ function missingQuotaLines(content, quotas, date) {
   }
   return out;
 }
-function parentCheckTargets(content, facts, isModeLineText) {
-  var _a56, _b30;
+function parentCheckTargets(content, facts, isModeLineText, isTickLineText) {
+  var _a58, _b31;
   const factByPlan = new Map(facts.map((f) => [f.plan, f]));
   const modesDone = /* @__PURE__ */ new Map();
   const parentAt = /* @__PURE__ */ new Map();
@@ -446,9 +901,11 @@ function parentCheckTargets(content, facts, isModeLineText) {
     if (!fact || !fact.live && !fact.factDone)
       continue;
     const text = m2[2].trim();
+    if (isTickLineText == null ? void 0 : isTickLineText(plan, text))
+      continue;
     if (isModeLineText(plan, text)) {
       const checked = m2[1] === "x";
-      modesDone.set(plan, ((_a56 = modesDone.get(plan)) != null ? _a56 : true) && checked);
+      modesDone.set(plan, ((_a58 = modesDone.get(plan)) != null ? _a58 : true) && checked);
       continue;
     }
     if (!parentAt.has(plan))
@@ -463,7 +920,7 @@ function parentCheckTargets(content, facts, isModeLineText) {
       out.push({ line: at.line, raw: at.raw, plan });
       continue;
     }
-    if (((_b30 = modesDone.get(plan)) != null ? _b30 : true) && fact.pendingEmpty)
+    if (((_b31 = modesDone.get(plan)) != null ? _b31 : true) && fact.pendingEmpty)
       out.push({ line: at.line, raw: at.raw, plan });
   }
   return out;
@@ -475,7 +932,7 @@ var CHORE_UNIT_ALIASES = [
   [/^(year|yearly|annual|每年|年)$/, "year"]
 ];
 function parseChoreCycle(raw) {
-  var _a56, _b30;
+  var _a58, _b31;
   if (!raw || typeof raw !== "object")
     return void 0;
   const rec = raw;
@@ -483,10 +940,10 @@ function parseChoreCycle(raw) {
   const v = unitRaw.trim().toLowerCase();
   if (!v)
     return void 0;
-  const unit = (_a56 = CHORE_UNIT_ALIASES.find(([re]) => re.test(v))) == null ? void 0 : _a56[1];
+  const unit = (_a58 = CHORE_UNIT_ALIASES.find(([re]) => re.test(v))) == null ? void 0 : _a58[1];
   if (!unit)
     return void 0;
-  const daysRaw = (_b30 = rec.days) != null ? _b30 : rec["\u65E5\u5B50"];
+  const daysRaw = (_b31 = rec.days) != null ? _b31 : rec["\u65E5\u5B50"];
   const toInt = (x) => typeof x === "number" ? x : parseInt(String(x).trim(), 10);
   const list = (Array.isArray(daysRaw) ? daysRaw : String(daysRaw != null ? daysRaw : "").replace(/[[\]]/g, "").split(/[,，\s]+/)).map(toInt).filter((n) => Number.isFinite(n));
   if (unit === "day")
@@ -511,15 +968,16 @@ function parseChoreOverdue(raw) {
   return /^(postpone|defer|往后延|顺延|延后)$/.test(v) ? "postpone" : void 0;
 }
 var CHORE_WEEKDAY_SHORT = ["\u65E5", "\u4E00", "\u4E8C", "\u4E09", "\u56DB", "\u4E94", "\u516D"];
-function choreCycleLabel(cycle, overdue) {
+function choreCycleLabel(cycle, overdue, floor = 0, unit = "") {
   let base;
-  if (cycle.unit === "day")
-    base = "\u6BCF\u5929";
-  else if (cycle.unit === "week") {
+  if (cycle.unit === "day") {
+    const n = splitTickCount(floor, unit);
+    base = n > 0 ? `\u6BCF\u5929 ${n}${unit || "\u6B21"}` : "\u6BCF\u5929";
+  } else if (cycle.unit === "week") {
     const ds = [...cycle.days].sort((a, b) => a - b);
     base = `\u6BCF${ds.map((d) => {
-      var _a56;
-      return `\u5468${(_a56 = CHORE_WEEKDAY_SHORT[d]) != null ? _a56 : "?"}`;
+      var _a58;
+      return `\u5468${(_a58 = CHORE_WEEKDAY_SHORT[d]) != null ? _a58 : "?"}`;
     }).join("\u3001")}`;
   } else if (cycle.unit === "month") {
     const ds = [...cycle.days].sort((a, b) => a - b);
@@ -615,8 +1073,9 @@ function missingChoreLines(content, specs, date) {
   }
   return out;
 }
-async function scanChoreHit(app, prefix, plan, name, from, to, backward = false) {
+async function scanChoreHit(app, prefix, plan, name, from, to, backward = false, floor = 0, unit = "") {
   const fmt = (d) => formatDate(d);
+  const splitN = splitTickCount(floor, unit);
   let cur = backward ? parseDateString(to) : parseDateString(from);
   const stopAt = backward ? from : to;
   for (let i = 0; i < 800; i++) {
@@ -627,6 +1086,7 @@ async function scanChoreHit(app, prefix, plan, name, from, to, backward = false)
     if (f instanceof TFile) {
       const content = await app.vault.cachedRead(f);
       let inCheck = false;
+      const ticks = /* @__PURE__ */ new Map();
       for (const line of content.split("\n")) {
         if (/^##\s/.test(line)) {
           inCheck = line.startsWith(CHECK_HEADING);
@@ -634,10 +1094,31 @@ async function scanChoreHit(app, prefix, plan, name, from, to, backward = false)
         }
         if (!inCheck)
           continue;
-        const m2 = TASK_LINE_RE.exec(line);
-        if (!m2 || m2[3] !== plan || m2[1] !== "x")
+        const indent = /^([ \t]+)/.exec(line);
+        const m2 = TASK_LINE_RE.exec(indent ? line.slice(indent[1].length) : line);
+        if (!m2 || m2[3] !== plan)
           continue;
-        if (matchesModeLine(m2[2].trim(), name, 0, ""))
+        const text = m2[2].trim();
+        if (indent) {
+          if (splitN === 0)
+            continue;
+          const t = parseTickRow(text);
+          if (t && t.base === name && t.unit === (unit || ""))
+            ticks.set(t.k, m2[1] === "x");
+          continue;
+        }
+        if (m2[1] === "x" && matchesModeLine(text, name, 0, ""))
+          return true;
+      }
+      if (splitN > 0) {
+        let all = true;
+        for (let k = 1; k <= splitN; k++) {
+          if (!ticks.get(k)) {
+            all = false;
+            break;
+          }
+        }
+        if (all)
           return true;
       }
     }
@@ -645,10 +1126,99 @@ async function scanChoreHit(app, prefix, plan, name, from, to, backward = false)
   }
   return false;
 }
+function parseTempTasksFromFrontmatter(content, file2, source) {
+  const fmMatch = /^---\n([\s\S]*?)\n---/.exec(content);
+  if (!fmMatch)
+    return [];
+  let data;
+  try {
+    const parsed2 = parseYaml(fmMatch[1]);
+    data = parsed2 && typeof parsed2 === "object" ? parsed2 : null;
+  } catch (e) {
+    return [];
+  }
+  const raw = data == null ? void 0 : data["temp-tasks"];
+  if (raw === void 0 || raw === null)
+    return [];
+  const tasks2 = [];
+  if (typeof raw === "string") {
+    raw.split("\n").forEach((line, i) => {
+      const t = parseTaskLine(line);
+      if (!t)
+        return;
+      tasks2.push({
+        text: t.text,
+        plan: t.plan,
+        checked: t.checked,
+        due: t.due,
+        start: null,
+        source,
+        file: file2,
+        index: i,
+        line: -1,
+        raw: line.trim(),
+        togglable: true
+      });
+    });
+  } else if (Array.isArray(raw)) {
+    raw.forEach((el, i) => {
+      var _a58;
+      if (typeof el === "string") {
+        const t = parseTaskLine(el);
+        if (!t)
+          return;
+        tasks2.push({
+          text: t.text,
+          plan: t.plan,
+          checked: t.checked,
+          due: t.due,
+          start: null,
+          source,
+          file: file2,
+          index: i,
+          line: -1,
+          raw: el.trim(),
+          togglable: true
+        });
+      } else if (el && typeof el === "object") {
+        const obj = el;
+        const start = typeof obj.start === "string" ? obj.start : null;
+        const end = typeof obj.end === "string" ? obj.end : null;
+        tasks2.push({
+          text: typeof obj.name === "string" ? obj.name : JSON.stringify(obj),
+          plan: null,
+          checked: false,
+          due: (_a58 = end != null ? end : start) != null ? _a58 : null,
+          start,
+          source,
+          file: file2,
+          index: i,
+          line: -1,
+          raw: "",
+          togglable: false
+        });
+      }
+    });
+  }
+  return tasks2;
+}
+
+// src/paths.ts
+var YEAR_DIR_PREFIX = "\u8BA1\u5212";
+function yearDirName(year) {
+  return `${YEAR_DIR_PREFIX}${year}`;
+}
+function bareYear(yearDir) {
+  return yearDir.startsWith(YEAR_DIR_PREFIX) ? yearDir.slice(YEAR_DIR_PREFIX.length) : yearDir;
+}
 
 // src/tasks.ts
+function poolPath(rootPath, year) {
+  const root = rootPath.replace(/\/+$/, "");
+  return `${root}/${yearDirName(year)}/\u4EFB\u52A1.md`;
+}
 function parseTaskPool(file2, content) {
-  var _a56, _b30, _c12;
+  var _a58, _b31, _c12;
   const tasks2 = [];
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -657,9 +1227,9 @@ function parseTaskPool(file2, content) {
       continue;
     tasks2.push({
       text: m2[2].trim(),
-      plan: (_a56 = m2[3]) != null ? _a56 : null,
+      plan: (_a58 = m2[3]) != null ? _a58 : null,
       checked: m2[1] === "x",
-      start: (_b30 = m2[4]) != null ? _b30 : null,
+      start: (_b31 = m2[4]) != null ? _b31 : null,
       due: (_c12 = m2[5]) != null ? _c12 : null,
       line: i,
       raw: lines[i],
@@ -667,6 +1237,13 @@ function parseTaskPool(file2, content) {
     });
   }
   return tasks2;
+}
+async function listTasks(app, rootPath, year) {
+  const f = app.vault.getAbstractFileByPath(poolPath(rootPath, year));
+  if (!(f instanceof TFile))
+    return [];
+  const content = await app.vault.cachedRead(f);
+  return parseTaskPool(f, content);
 }
 function buildPoolLine({ text, plan, start, due, checked }) {
   let line = `- [${checked ? "x" : " "}] ${text.trim()}`;
@@ -710,18 +1287,18 @@ function groupPoolTasksByGoal(tasks2, today, knownNames) {
       byName.set(name, [t]);
   }
   const coversToday = (t) => {
-    var _a56, _b30;
-    const s = (_a56 = t.start) != null ? _a56 : t.due;
-    const d = (_b30 = t.due) != null ? _b30 : t.start;
+    var _a58, _b31;
+    const s = (_a58 = t.start) != null ? _a58 : t.due;
+    const d = (_b31 = t.due) != null ? _b31 : t.start;
     return !!s && !!d && s <= today && today <= d;
   };
   const groups = [];
   for (const [name, groupTasks] of byName) {
     const pending = groupTasks.filter((t) => {
-      var _a56;
+      var _a58;
       if (t.checked)
         return false;
-      const effStart = (_a56 = t.start) != null ? _a56 : t.due;
+      const effStart = (_a58 = t.start) != null ? _a58 : t.due;
       return !!effStart && effStart <= today;
     });
     const todayDone = groupTasks.filter((t) => t.checked && coversToday(t));
@@ -782,15 +1359,15 @@ var UNIT_SUCCESSORS = {
   \u6761: []
 };
 function suggestNextUnit(prevUnit) {
-  var _a56;
+  var _a58;
   const list = UNIT_SUCCESSORS[prevUnit.trim()];
-  return (_a56 = list == null ? void 0 : list[0]) != null ? _a56 : "\u8282";
+  return (_a58 = list == null ? void 0 : list[0]) != null ? _a58 : "\u8282";
 }
 function isRestartUnit(word) {
   return RESTART_UNITS.has(word.trim());
 }
 function expandGoalStructure(goalName, levels) {
-  var _a56, _b30, _c12;
+  var _a58, _b31, _c12;
   const clean = (v) => {
     const n = typeof v === "number" ? Math.floor(v) : parseInt(String(v), 10);
     return Number.isFinite(n) && n >= 0 ? n : 0;
@@ -798,13 +1375,13 @@ function expandGoalStructure(goalName, levels) {
   if (!Array.isArray(levels) || levels.length === 0 || levels.length > 8)
     return [];
   const labelAt = (li, g) => {
-    var _a57, _b31, _c13;
-    return String((_c13 = (_b31 = (_a57 = levels[li]) == null ? void 0 : _a57.labels) == null ? void 0 : _b31[g - 1]) != null ? _c13 : "").trim();
+    var _a59, _b32, _c13;
+    return String((_c13 = (_b32 = (_a59 = levels[li]) == null ? void 0 : _a59.labels) == null ? void 0 : _b32[g - 1]) != null ? _c13 : "").trim();
   };
   let level = [];
   let roots = [];
   for (let li = 0; li < levels.length; li++) {
-    const unit = String((_b30 = (_a56 = levels[li]) == null ? void 0 : _a56.unit) != null ? _b30 : "").trim();
+    const unit = String((_b31 = (_a58 = levels[li]) == null ? void 0 : _a58.unit) != null ? _b31 : "").trim();
     if (!unit)
       return [];
     const restart = RESTART_UNITS.has(unit);
@@ -904,10 +1481,10 @@ function chaptersToStructure(chapters) {
   ];
 }
 function expandGoalLeaves(goalName, goal) {
-  var _a56, _b30;
-  if ((_a56 = goal.structure) == null ? void 0 : _a56.length)
+  var _a58, _b31;
+  if ((_a58 = goal.structure) == null ? void 0 : _a58.length)
     return expandGoalStructure(goalName, goal.structure);
-  if ((_b30 = goal.chapters) == null ? void 0 : _b30.length)
+  if ((_b31 = goal.chapters) == null ? void 0 : _b31.length)
     return expandGoalStructure(goalName, chaptersToStructure(goal.chapters));
   return null;
 }
@@ -1052,8 +1629,8 @@ function buildBzgSnapshot(items2, cfg) {
   };
 }
 function reviewedOn(snap2, localDay) {
-  var _a56, _b30;
-  return (_b30 = (_a56 = snap2.byDay.get(localDay)) == null ? void 0 : _a56.size) != null ? _b30 : 0;
+  var _a58, _b31;
+  return (_b31 = (_a58 = snap2.byDay.get(localDay)) == null ? void 0 : _a58.size) != null ? _b31 : 0;
 }
 function distinctReviewedInRange(snap2, start, end) {
   let count = 0;
@@ -1066,6 +1643,12 @@ function distinctReviewedInRange(snap2, start, end) {
     }
   }
   return count;
+}
+function reviewPoolSize(app, snap2) {
+  if (!snap2.poolFolder)
+    return 0;
+  const prefix = `${snap2.poolFolder.replace(/\/+$/, "")}/`;
+  return app.vault.getFiles().filter((f) => f.path.startsWith(prefix) && f.path.endsWith(".md")).length;
 }
 var DIARY_WRITE_SECTIONS = /* @__PURE__ */ new Set(["\u968F\u7B14", "\u5F53\u65E5\u89E6\u52A8\u70B9"]);
 function diaryDayWritten(content) {
@@ -1087,6 +1670,17 @@ function diaryDayWritten(content) {
   }
   return false;
 }
+async function readBzgDiaryText(app, snap2, date) {
+  const path = `${snap2.diaryDir}/${date}.md`;
+  try {
+    const f = app.vault.getAbstractFileByPath(path);
+    if (!f)
+      return null;
+    return await app.vault.cachedRead(f);
+  } catch (e) {
+    return null;
+  }
+}
 
 // src/stats.ts
 function computeQuotaDaily(total, start, end) {
@@ -1104,11 +1698,215 @@ function quotaExpected(dailyQuota, start, end, today) {
   const until = today > end ? end : today;
   return Math.round(dailyQuota * dayCount(start, until) * 10) / 10;
 }
+async function readPlanPeriod(app, rootPath, year) {
+  var _a58, _b31;
+  const root = rootPath.replace(/\/+$/, "");
+  for (const path of [`${root}/${yearDirName(year)}/\u5E74\u5EA6\u8BA1\u5212.md`, `${root}/\u5E74\u5EA6\u8BA1\u5212.md`]) {
+    const f = app.vault.getAbstractFileByPath(path);
+    if (!(f instanceof TFile))
+      continue;
+    const fm = parseYaml((_b31 = (_a58 = (await app.vault.cachedRead(f)).match(/^---\n([\s\S]*?)\n---/)) == null ? void 0 : _a58[1]) != null ? _b31 : "");
+    if (typeof (fm == null ? void 0 : fm.start) === "string" && typeof (fm == null ? void 0 : fm.end) === "string") {
+      return { start: fm.start, end: fm.end };
+    }
+    return null;
+  }
+  return null;
+}
+async function readAnnualDefs(app, rootPath, year) {
+  const root = rootPath.replace(/\/+$/, "");
+  for (const path of [`${root}/${yearDirName(year)}/\u5E74\u5EA6\u8BA1\u5212.md`, `${root}/\u5E74\u5EA6\u8BA1\u5212.md`]) {
+    const f = app.vault.getAbstractFileByPath(path);
+    if (f instanceof TFile) {
+      return parsePlansFromFrontmatter(await app.vault.cachedRead(f));
+    }
+  }
+  return [];
+}
+async function computePeriodStats(app, rootPath, today, type, reviewWorkdays, bzg) {
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2, _h2, _i2;
+  const period = resolvePeriod(today, type);
+  let { start, end, label, yearDir } = period;
+  const year = bareYear(yearDir);
+  if (type === "year") {
+    const planPeriod = await readPlanPeriod(app, rootPath, year);
+    if (planPeriod) {
+      start = planPeriod.start;
+      end = planPeriod.end;
+    }
+  }
+  const defs = await readAnnualDefs(app, rootPath, year);
+  const quotaDefs = defs.filter((d) => d.type === "quota" && d.quota);
+  const quotaPlans = new Set(quotaDefs.map((d) => d.name));
+  const choreDefs = defs.filter((d) => hasChoreGoal(d));
+  const chorePlanNames = new Set(choreDefs.map((d) => d.name));
+  const choreChecks = /* @__PURE__ */ new Set();
+  const prefix = `${rootPath}/${yearDir}/\u6BCF\u65E5/`;
+  const dailyFiles = app.vault.getFiles().filter((f) => f.path.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}\.md$/.test(f.name));
+  const planDays = /* @__PURE__ */ new Map();
+  const planCheckDates = /* @__PURE__ */ new Set();
+  const planSeen = /* @__PURE__ */ new Set();
+  const quotaActual = /* @__PURE__ */ new Map();
+  for (const file2 of dailyFiles) {
+    const date = file2.basename;
+    if (date < start || date > end)
+      continue;
+    const content = await app.vault.cachedRead(file2);
+    const data = parseDailyContent(file2, content, date);
+    const checkedPlans = /* @__PURE__ */ new Set();
+    for (const item of data.checkItems) {
+      if (!item.plan)
+        continue;
+      if (item.tick)
+        continue;
+      if (quotaPlans.has(item.plan)) {
+        if (item.checked) {
+          const q = (_a58 = quotaDefs.find((d) => d.name === item.plan)) == null ? void 0 : _a58.quota;
+          if (!q)
+            continue;
+          const qStart = (_b31 = q.start) != null ? _b31 : start;
+          const actual = (_d5 = (_c12 = parseQuotaActual(item.text)) != null ? _c12 : parseQuotaAmount(item.text)) != null ? _d5 : computeQuotaDaily(q.total, qStart, q.end);
+          quotaActual.set(item.plan, ((_e4 = quotaActual.get(item.plan)) != null ? _e4 : 0) + actual);
+        }
+        continue;
+      }
+      if (chorePlanNames.has(item.plan)) {
+        const def = choreDefs.find((d) => d.name === item.plan);
+        const g = def == null ? void 0 : def.goals.find((x) => x.mode === "chore" && matchesModeLine(item.text, x.name, 0, ""));
+        if (g) {
+          const cycle = (_f2 = g.cycle) != null ? _f2 : { unit: "day", days: [] };
+          const n = cycle.unit === "day" ? splitTickCount((_g2 = g.floor) != null ? _g2 : 0, g.unit || "") : 0;
+          const hit = item.checked || n > 0 && splitTicksDone(data.checkItems, item.plan, g.name, g.unit || "", n);
+          if (hit)
+            choreChecks.add(`${item.plan}|${date}|${g.name}`);
+        }
+        continue;
+      }
+      planSeen.add(item.plan);
+      if (item.checked)
+        checkedPlans.add(item.plan);
+    }
+    for (const plan of checkedPlans) {
+      planDays.set(plan, ((_h2 = planDays.get(plan)) != null ? _h2 : 0) + 1);
+      planCheckDates.add(`${plan}|${date}`);
+    }
+  }
+  let rateEnd = end;
+  if ((type === "week" || type === "month") && today < end)
+    rateEnd = today;
+  const totalDays = dayCount(start, rateEnd);
+  const workdays = countWorkdays(start, rateEnd);
+  const workdayPlans = /* @__PURE__ */ new Set();
+  for (const d of defs) {
+    if (d.name === "\u590D\u76D8") {
+      if (reviewWorkdays)
+        workdayPlans.add(d.name);
+    } else if (d.tradingDay === true) {
+      workdayPlans.add(d.name);
+    }
+  }
+  const choreRates = [];
+  for (const d of choreDefs) {
+    let done = 0;
+    let total = 0;
+    for (const g of d.goals) {
+      if (g.mode !== "chore")
+        continue;
+      const cycle = (_i2 = g.cycle) != null ? _i2 : { unit: "day", days: [] };
+      const gStart = g.start || start;
+      const gEnd = g.end || end;
+      const dues = choreOccurrences(cycle, gStart, gEnd, 800);
+      for (let i = 0; i < dues.length; i++) {
+        if (dues[i] > rateEnd)
+          break;
+        total++;
+        const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, dues[i]);
+        const winTo = formatDate(addDays(parseDateString(next), -1));
+        const scanTo = [winTo, rateEnd, today].reduce((a, b) => b < a ? b : a);
+        for (let dd = dues[i]; dd <= scanTo; ) {
+          if (choreChecks.has(`${d.name}|${dd}|${g.name}`)) {
+            done++;
+            break;
+          }
+          dd = formatDate(addDays(parseDateString(dd), 1));
+        }
+      }
+    }
+    choreRates.push({ plan: d.name, done, total, percent: total === 0 ? 0 : Math.round(done / total * 100) });
+  }
+  const planRates = [
+    ...Array.from(planSeen).sort().map((plan) => {
+      var _a59;
+      const total = workdayPlans.has(plan) ? workdays : totalDays;
+      const done = (_a59 = planDays.get(plan)) != null ? _a59 : 0;
+      return { plan, done, total, percent: total === 0 ? 0 : Math.round(done / total * 100) };
+    }),
+    ...choreRates
+  ];
+  const tempFiles = collectTempTaskFiles(app, rootPath, yearDir, label, type);
+  let tempTotal = 0;
+  let tempDone = 0;
+  for (const file2 of tempFiles) {
+    const source = file2.path.includes("/\u5468/") ? "week" : "month";
+    const tasks2 = parseTempTasksFromFrontmatter(await app.vault.cachedRead(file2), file2, source);
+    for (const t of tasks2) {
+      if (!t.text)
+        continue;
+      tempTotal++;
+      if (t.checked)
+        tempDone++;
+    }
+  }
+  const quotaProgress = quotaDefs.map((d) => {
+    var _a59, _b32;
+    const q = d.quota;
+    const qStart = (_a59 = q.start) != null ? _a59 : start;
+    const dailyQuota = computeQuotaDaily(q.total, qStart, q.end);
+    const actual = (_b32 = quotaActual.get(d.name)) != null ? _b32 : 0;
+    const expected = quotaExpected(dailyQuota, qStart, q.end, today);
+    return {
+      plan: d.name,
+      unit: q.unit,
+      start: qStart,
+      end: q.end,
+      total: q.total,
+      dailyQuota,
+      actual,
+      expected,
+      percent: Math.min(100, Math.round(actual / q.total * 100)),
+      behind: actual + 1e-9 < expected
+    };
+  });
+  const poolTasks = await listTasks(app, rootPath, year);
+  const windowTasks = filterTasksInRange(poolTasks, start, end);
+  const taskSummary = summarizeTasks(windowTasks);
+  let planProgress = [];
+  if (type === "year") {
+    planProgress = await computeAnnualPlanProgress(app, rootPath, today, poolTasks, planRates, quotaProgress, bzg != null ? bzg : null);
+  }
+  return {
+    type,
+    label,
+    rangeLabel: `${start.slice(5)} ~ ${end.slice(5)}`,
+    planRates,
+    tempTotal,
+    tempDone,
+    tempPercent: tempTotal === 0 ? 0 : Math.round(tempDone / tempTotal * 100),
+    taskTotal: taskSummary.total,
+    taskDone: taskSummary.done,
+    taskPercent: taskSummary.percent,
+    tasks: windowTasks,
+    planProgress,
+    quotaProgress,
+    planCheckDates,
+    choreHitDates: choreChecks
+  };
+}
 function filterTasksInRange(tasks2, start, end) {
   return tasks2.filter((t) => {
-    var _a56, _b30;
-    const s = (_a56 = t.start) != null ? _a56 : t.due;
-    const e = (_b30 = t.due) != null ? _b30 : t.start;
+    var _a58, _b31;
+    const s = (_a58 = t.start) != null ? _a58 : t.due;
+    const e = (_b31 = t.due) != null ? _b31 : t.start;
     if (!s || !e)
       return false;
     return s <= end && e >= start;
@@ -1120,7 +1918,7 @@ function summarizeTasks(tasks2) {
   return { total, done, percent: total === 0 ? 0 : Math.round(done / total * 100) };
 }
 function parsePlansFromFrontmatter(content) {
-  var _a56, _b30, _c12;
+  var _a58, _b31, _c12;
   const fmMatch = /^---\n([\s\S]*?)\n---/.exec(content);
   if (!fmMatch)
     return [];
@@ -1136,7 +1934,7 @@ function parsePlansFromFrontmatter(content) {
     return [];
   const defs = [];
   const push = (name, obj) => {
-    var _a57;
+    var _a59;
     const trimmed = name.trim();
     if (!trimmed)
       return;
@@ -1152,7 +1950,7 @@ function parsePlansFromFrontmatter(content) {
       targetCount = goals.reduce((acc, g) => acc + g.count, 0);
     } else {
       type = readPlanType(obj, target);
-      const m2 = (_a57 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a57 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
+      const m2 = (_a59 = /(\d+)\s*(?:篇|条|个|部|期|集|次|份|张|幅|本|门|章|节)/.exec(target)) != null ? _a59 : /(?<![0-9/%])(\d+)(?![0-9/%])/.exec(target);
       targetCount = type === "numeric" && m2 ? parseInt(m2[1], 10) : 0;
     }
     defs.push({
@@ -1186,7 +1984,7 @@ function parsePlansFromFrontmatter(content) {
         }
       } else if (el && typeof el === "object") {
         const obj = el;
-        const name = (_c12 = (_b30 = (_a56 = obj.name) != null ? _a56 : obj.plan) != null ? _b30 : obj["\u540D\u79F0"]) != null ? _c12 : obj["\u8BA1\u5212"];
+        const name = (_c12 = (_b31 = (_a58 = obj.name) != null ? _a58 : obj.plan) != null ? _b31 : obj["\u540D\u79F0"]) != null ? _c12 : obj["\u8BA1\u5212"];
         if (typeof name === "string") {
           push(name, obj);
         } else {
@@ -1233,7 +2031,7 @@ function readPlanString(obj, keys) {
   return "";
 }
 function readPlanGoals(obj) {
-  var _a56, _b30, _c12, _d5, _e4, _f2, _g2, _h2, _i2;
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2, _h2, _i2;
   if (!obj || !Array.isArray(obj.goals))
     return [];
   const out = [];
@@ -1241,7 +2039,7 @@ function readPlanGoals(obj) {
     if (typeof g === "string") {
       const m2 = /^(.+?)\s+(\d+)\s*(篇|本|条|个|部|期|集|次|份|张|幅|门|天|章|节)?(?:\s+(\d{4}-\d{2}-\d{2})~\s*(\d{4}-\d{2}-\d{2}))?$/.exec(g.trim());
       if (m2) {
-        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a56 = m2[3]) != null ? _a56 : "\u4E2A", start: m2[4], end: m2[5] });
+        out.push({ name: m2[1].trim(), count: parseInt(m2[2], 10), unit: (_a58 = m2[3]) != null ? _a58 : "\u4E2A", start: m2[4], end: m2[5] });
       }
       continue;
     }
@@ -1253,8 +2051,8 @@ function readPlanGoals(obj) {
       continue;
     const mode = parseGoalMode(readPlanString(rec, ["mode", "\u6A21\u5F0F"]));
     const count = typeof rec.count === "number" ? rec.count : typeof rec["\u6570\u91CF"] === "number" ? rec["\u6570\u91CF"] : (() => {
-      var _a57;
-      const cv = (_a57 = rec.count) != null ? _a57 : rec["\u6570\u91CF"];
+      var _a59;
+      const cv = (_a59 = rec.count) != null ? _a59 : rec["\u6570\u91CF"];
       return parseInt(cv == null ? "0" : typeof cv === "string" || typeof cv === "number" ? String(cv) : "0", 10);
     })();
     if (!mode && (!count || Number.isNaN(count) || count <= 0))
@@ -1274,7 +2072,7 @@ function readPlanGoals(obj) {
     const goal = { name: name.trim(), count, unit, start: start || void 0, end: end || void 0 };
     if (mode) {
       goal.mode = mode;
-      const rawFloor = (_c12 = (_b30 = rec.floor) != null ? _b30 : rec["\u4E0B\u9650"]) != null ? _c12 : rec["\u6BCF\u65E5"];
+      const rawFloor = (_c12 = (_b31 = rec.floor) != null ? _b31 : rec["\u4E0B\u9650"]) != null ? _c12 : rec["\u6BCF\u65E5"];
       const floorVal = typeof rawFloor === "number" ? rawFloor : parseFloat(String(rawFloor != null ? rawFloor : ""));
       if (Number.isFinite(floorVal) && floorVal > 0)
         goal.floor = floorVal;
@@ -1363,10 +2161,10 @@ function readPlanGoals(obj) {
   return out;
 }
 function readPlanQuota(obj) {
-  var _a56, _b30, _c12, _d5, _e4;
+  var _a58, _b31, _c12, _d5, _e4;
   if (!obj)
     return null;
-  const raw = (_b30 = (_a56 = obj.quota) != null ? _a56 : obj["\u5B9A\u989D"]) != null ? _b30 : obj["\u65E5\u5B9A\u989D"];
+  const raw = (_b31 = (_a58 = obj.quota) != null ? _a58 : obj["\u5B9A\u989D"]) != null ? _b31 : obj["\u65E5\u5B9A\u989D"];
   let rec = null;
   if (raw && typeof raw === "object") {
     rec = raw;
@@ -1408,6 +2206,225 @@ function parseGoalMode(raw) {
     return "chore";
   return void 0;
 }
+async function computeModeGoalStats(app, rootPath, year, planName, goal, today, bzg) {
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2, _h2, _i2, _j;
+  const mode = goal.mode;
+  const period = (_a58 = await readPlanPeriod(app, rootPath, year)) != null ? _a58 : { start: `${year}-01-01`, end: `${year}-12-31` };
+  const start = goal.start || period.start;
+  const end = goal.end || period.end;
+  const floor = (_b31 = goal.floor) != null ? _b31 : 0;
+  const dueEnd = today < end ? today : end;
+  const dueDays = today < start ? 0 : Math.max(0, dayCount(start, dueEnd));
+  if (mode === "writing" && goal.writingQuota) {
+    const q = goal.writingQuota;
+    const qStart = (_c12 = q.start) != null ? _c12 : start;
+    const qEnd = (_d5 = q.end) != null ? _d5 : end;
+    const initial = (_e4 = q.initial) != null ? _e4 : 0;
+    const daily = floor > 0 ? floor : computeWritingDaily(q.total, initial, qStart, qEnd);
+    const scanEnd = today < qStart ? qStart : today > qEnd ? qEnd : today;
+    const prefix2 = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/\u6BCF\u65E5/`;
+    let cumulative = initial;
+    let hitDays2 = 0;
+    const days2 = [];
+    const dayStates2 = [];
+    for (let d = qStart; d <= scanEnd; ) {
+      let hit = false;
+      const f = app.vault.getAbstractFileByPath(`${prefix2}${d}.md`);
+      if (f instanceof TFile) {
+        const content = await app.vault.cachedRead(f);
+        let inCheck = false;
+        for (const line of content.split("\n")) {
+          if (/^##\s/.test(line)) {
+            inCheck = line.startsWith(CHECK_HEADING);
+            continue;
+          }
+          if (!inCheck)
+            continue;
+          const m2 = TASK_LINE_RE.exec(line);
+          if (!m2 || m2[3] !== planName)
+            continue;
+          const text = m2[2].trim();
+          if (!matchesWritingLine(text, goal.name))
+            continue;
+          const actual = parseQuotaActual(text);
+          const checked = m2[1] === "x";
+          const rowQuota = (_f2 = parseQuotaAmount(text)) != null ? _f2 : daily;
+          cumulative += actual != null ? actual : checked ? rowQuota : 0;
+          hit = checked || actual != null && actual > 0;
+          break;
+        }
+      }
+      if (hit)
+        hitDays2++;
+      days2.push(hit);
+      dayStates2.push({ date: d, hit });
+      const [yy, mm, dd] = d.split("-").map(Number);
+      const next = new Date(yy, mm - 1, dd + 1);
+      d = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}-${String(next.getDate()).padStart(2, "0")}`;
+    }
+    let streak2 = 0;
+    {
+      let i = days2.length - 1;
+      if (i >= 0 && !days2[i])
+        i--;
+      while (i >= 0 && days2[i]) {
+        streak2++;
+        i--;
+      }
+    }
+    const dueWindow = today < qStart ? 0 : Math.max(0, dayCount(qStart, scanEnd));
+    const expected = initial + Math.round(daily * dueWindow * 10) / 10;
+    const stats2 = {
+      mode,
+      dueDays: dueWindow,
+      hitDays: hitDays2,
+      streak: streak2,
+      percent: Math.min(100, Math.round(cumulative / q.total * 100)),
+      totalAmount: Math.round(cumulative * 10) / 10,
+      quotaTotal: q.total,
+      quotaUnit: q.unit || "\u5B57",
+      ...initial > 0 ? { quotaInitial: initial } : {},
+      quotaDaily: daily,
+      quotaExpected: expected,
+      quotaBehind: cumulative + 1e-9 < expected,
+      dayStates: dayStates2
+    };
+    return stats2;
+  }
+  if (mode === "chore") {
+    const cycle = (_g2 = goal.cycle) != null ? _g2 : { unit: "day", days: [] };
+    const prefix2 = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/\u6BCF\u65E5/`;
+    const dues = choreOccurrences(cycle, start, dueEnd);
+    const hits = [];
+    for (let i = 0; i < dues.length; i++) {
+      const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, dues[i]);
+      const winTo = formatDate(addDays(parseDateString(next), -1));
+      const clampTo = winTo < dueEnd ? winTo : dueEnd;
+      hits.push(
+        await scanChoreHit(app, prefix2, planName, goal.name, dues[i], clampTo, false, (_h2 = goal.floor) != null ? _h2 : 0, goal.unit || "")
+      );
+    }
+    const hitDays2 = hits.filter(Boolean).length;
+    let streak2 = 0;
+    {
+      let i = hits.length - 1;
+      if (i >= 0 && !hits[i])
+        i--;
+      while (i >= 0 && hits[i]) {
+        streak2++;
+        i--;
+      }
+    }
+    return {
+      mode,
+      dueDays: dues.length,
+      hitDays: hitDays2,
+      streak: streak2,
+      percent: dues.length > 0 ? Math.min(100, Math.round(hitDays2 / dues.length * 100)) : 0
+    };
+  }
+  const prefix = `${rootPath.replace(/\/+$/, "")}/${yearDirName(year)}/\u6BCF\u65E5/`;
+  const lineOfDay = /* @__PURE__ */ new Map();
+  const NONE = { checked: false, actual: null, manual: false };
+  const readDayLine = async (date) => {
+    var _a59;
+    const cached = lineOfDay.get(date);
+    if (cached)
+      return cached;
+    const f = app.vault.getAbstractFileByPath(`${prefix}${date}.md`);
+    if (!(f instanceof TFile)) {
+      lineOfDay.set(date, NONE);
+      return NONE;
+    }
+    const content = await app.vault.cachedRead(f);
+    let found = null;
+    let inCheck = false;
+    for (const line of content.split("\n")) {
+      if (/^##\s/.test(line)) {
+        inCheck = line.startsWith(CHECK_HEADING);
+        continue;
+      }
+      if (!inCheck)
+        continue;
+      const m2 = TASK_LINE_RE.exec(line);
+      if (!m2 || m2[3] !== planName)
+        continue;
+      const text = m2[2].trim();
+      if (parseTickRow(text))
+        continue;
+      if (!matchesModeLine(text, goal.name, (_a59 = goal.floor) != null ? _a59 : 0, goal.unit || ""))
+        continue;
+      found = {
+        checked: m2[1] === "x",
+        actual: parseQuotaActual(text),
+        manual: line.includes(MANUAL_MARK)
+      };
+      break;
+    }
+    const result = found != null ? found : NONE;
+    lineOfDay.set(date, result);
+    return result;
+  };
+  let hitDays = 0;
+  let totalAmount = 0;
+  const days = [];
+  const dayStates = [];
+  for (let d = start; d <= dueEnd; ) {
+    const line = await readDayLine(d);
+    const bzgCount = bzg ? reviewedOn(bzg, d) : null;
+    let hit = false;
+    if (mode === "review") {
+      const actual = line.manual && line.actual != null ? line.actual : Math.max((_i2 = line.actual) != null ? _i2 : 0, bzgCount != null ? bzgCount : 0);
+      hit = line.checked || actual >= floor;
+    } else if (mode === "diary") {
+      hit = line.checked;
+      if (!hit && bzg) {
+        const diary = await readBzgDiaryText(app, bzg, d);
+        hit = diaryDayWritten(diary);
+      }
+    } else {
+      hit = line.checked;
+      const amount = (_j = line.actual) != null ? _j : line.checked ? floor || 0 : 0;
+      totalAmount += amount;
+    }
+    if (hit)
+      hitDays++;
+    days.push(hit);
+    dayStates.push({ date: d, hit });
+    const [yy, mm, dd] = d.split("-").map(Number);
+    const next = new Date(yy, mm - 1, dd + 1);
+    d = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}-${String(next.getDate()).padStart(2, "0")}`;
+  }
+  let streak = 0;
+  {
+    let i = days.length - 1;
+    if (i >= 0 && !days[i])
+      i--;
+    while (i >= 0 && days[i]) {
+      streak++;
+      i--;
+    }
+  }
+  const stats = {
+    mode,
+    dueDays,
+    hitDays,
+    streak,
+    percent: dueDays > 0 ? Math.min(100, Math.round(hitDays / dueDays * 100)) : 0,
+    dayStates
+  };
+  if (mode === "review" && bzg) {
+    stats.covered = distinctReviewedInRange(bzg, start, dueEnd);
+    stats.pool = reviewPoolSize(app, bzg);
+    stats.todayActual = reviewedOn(bzg, today);
+  }
+  if (mode === "exercise")
+    stats.totalAmount = totalAmount;
+  return stats;
+}
+function hasChoreGoal(def) {
+  return def.goals.some((g) => g.mode === "chore");
+}
 function readPlanType(obj, target) {
   let t = "";
   if (obj) {
@@ -1428,6 +2445,130 @@ function readPlanType(obj, target) {
     return "numeric";
   return "check";
 }
+async function computeAnnualPlanProgress(app, rootPath, today, tasks2, planRates, quotaProgress = [], bzg = null) {
+  const root = rootPath.replace(/\/+$/, "");
+  const year = today.slice(0, 4);
+  const f = app.vault.getAbstractFileByPath(`${root}/${yearDirName(year)}/\u5E74\u5EA6\u8BA1\u5212.md`);
+  if (!(f instanceof TFile))
+    return [];
+  const content = await app.vault.cachedRead(f);
+  const defs = parsePlansFromFrontmatter(content);
+  const rateByName = new Map(planRates.map((r) => [r.plan, r]));
+  const quotaByName = new Map(quotaProgress.map((r) => [r.plan, r]));
+  return Promise.all(
+    defs.map(async (def) => {
+      var _a58, _b31, _c12, _d5, _e4, _f2;
+      const planTasks = tasks2.filter((t) => t.plan === def.name);
+      const rate = rateByName.get(def.name);
+      const goalProgress = await Promise.all(
+        def.goals.map(async (g) => {
+          if (g.mode === "writing" ? !!g.writingQuota : g.mode && g.mode !== "reading") {
+            const stats = await computeModeGoalStats(app, rootPath, year, def.name, g, today, bzg);
+            return { ...g, done: stats.hitDays, total: stats.dueDays, percent: stats.percent, modeStats: stats };
+          }
+          const prefix = `${g.name}\uFF08`;
+          const goalTasks = planTasks.filter((t) => t.text.trim().startsWith(prefix));
+          const done = goalTasks.filter((t) => t.checked).length;
+          const percent = goalTasks.length > 0 ? Math.round(done / goalTasks.length * 100) : 0;
+          return { ...g, done, total: goalTasks.length, percent };
+        })
+      );
+      const base = {
+        plan: def.name,
+        target: def.target,
+        action: def.action,
+        label: def.label,
+        color: def.color,
+        tradingDay: def.tradingDay,
+        goals: goalProgress,
+        tasks: planTasks
+      };
+      if (def.type === "quota") {
+        const qp = (_a58 = quotaByName.get(def.name)) != null ? _a58 : null;
+        return {
+          ...base,
+          isNumeric: false,
+          isQuota: true,
+          quota: qp,
+          targetCount: 0,
+          doneCount: 0,
+          checkDone: 0,
+          checkTotal: 0,
+          checkPercent: 0,
+          percent: (_b31 = qp == null ? void 0 : qp.percent) != null ? _b31 : 0
+        };
+      }
+      if (def.type === "numeric") {
+        const doneCount = planTasks.filter((t) => t.checked).length;
+        const totalCount = planTasks.length;
+        let percent = totalCount > 0 ? Math.round(doneCount / totalCount * 100) : 0;
+        const modePercents = goalProgress.filter((g) => g.modeStats).map((g) => g.percent);
+        if (hasChoreGoal(def) && rate)
+          percent = rate.percent;
+        else if (totalCount === 0 && modePercents.length > 0) {
+          percent = Math.round(modePercents.reduce((a, b) => a + b, 0) / modePercents.length);
+        }
+        return {
+          ...base,
+          isNumeric: true,
+          isQuota: false,
+          quota: null,
+          targetCount: totalCount,
+          doneCount,
+          checkDone: 0,
+          checkTotal: 0,
+          checkPercent: 0,
+          percent
+        };
+      }
+      return {
+        ...base,
+        isNumeric: false,
+        isQuota: false,
+        quota: null,
+        targetCount: 0,
+        doneCount: 0,
+        checkDone: (_c12 = rate == null ? void 0 : rate.done) != null ? _c12 : 0,
+        checkTotal: (_d5 = rate == null ? void 0 : rate.total) != null ? _d5 : 0,
+        checkPercent: (_e4 = rate == null ? void 0 : rate.percent) != null ? _e4 : 0,
+        percent: (_f2 = rate == null ? void 0 : rate.percent) != null ? _f2 : 0
+      };
+    })
+  );
+}
+function resolvePeriod(today, type) {
+  if (type === "week") {
+    const { year, week: week2 } = getISOWeek(today);
+    const { start, end } = weekRange(today);
+    return {
+      start,
+      end,
+      label: `${year}-W${String(week2).padStart(2, "0")}`,
+      yearDir: yearDirName(String(year))
+    };
+  }
+  if (type === "month") {
+    const [y2, m2] = today.split("-").map(Number);
+    const mm = String(m2).padStart(2, "0");
+    const dd = String(daysInMonth(y2, m2)).padStart(2, "0");
+    return { start: `${y2}-${mm}-01`, end: `${y2}-${mm}-${dd}`, label: `${y2}-${mm}`, yearDir: yearDirName(String(y2)) };
+  }
+  const [y] = today.split("-").map(Number);
+  return { start: `${y}-01-01`, end: today, label: String(y), yearDir: yearDirName(String(y)) };
+}
+function collectTempTaskFiles(app, rootPath, yearDir, label, type) {
+  if (type === "week") {
+    const f = app.vault.getAbstractFileByPath(`${rootPath}/${yearDir}/\u5468/${label}.md`);
+    return f instanceof TFile ? [f] : [];
+  }
+  if (type === "month") {
+    const f = app.vault.getAbstractFileByPath(`${rootPath}/${yearDir}/\u6708/${label}.md`);
+    return f instanceof TFile ? [f] : [];
+  }
+  return app.vault.getFiles().filter(
+    (f) => f.name.endsWith(".md") && (f.path.startsWith(`${rootPath}/${yearDir}/\u5468/`) || f.path.startsWith(`${rootPath}/${yearDir}/\u6708/`))
+  );
+}
 
 // src/toc.ts
 var DEFAULT_UNIT_CHAIN = ["\u7AE0", "\u8282", "\u5C0F\u8282", "\u76EE", "\u6761", "\u7EC6\u76EE"];
@@ -1441,7 +2582,7 @@ var CN_ORD_RE = /^[一二三四五六七八九十百]+[、.．]/;
 var MAX_TOC_LEVELS = 8;
 var MAX_TOC_LINES = 500;
 function parseTocLine(rawLine) {
-  var _a56;
+  var _a58;
   let line = rawLine.trim();
   line = line.replace(/^[-*•·]\s*(?:\[[ x]\]\s*)?/, "");
   if (!line)
@@ -1458,7 +2599,7 @@ function parseTocLine(rawLine) {
   const num = /^(\d+)(?:[.、](\d+))?(?:\.(\d+))?/.exec(line);
   if (num) {
     const depth = num[3] ? 2 : num[2] ? 1 : 0;
-    return { title: line, level: depth, family: "N", unit: (_a56 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a56 : `\u7EA7${depth + 1}` };
+    return { title: line, level: depth, family: "N", unit: (_a58 = DEFAULT_UNIT_CHAIN[depth]) != null ? _a58 : `\u7EA7${depth + 1}` };
   }
   if (CN_ORD_RE.test(line)) {
     return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
@@ -1472,7 +2613,7 @@ function parseTocLine(rawLine) {
   return { title: line, level: 0, family: "N", unit: DEFAULT_UNIT_CHAIN[0] };
 }
 function parseToc(text) {
-  var _a56, _b30, _c12, _d5;
+  var _a58, _b31, _c12, _d5;
   const items2 = [];
   let skipped = 0;
   for (const l of text.split(/\r?\n/)) {
@@ -1514,7 +2655,7 @@ function parseToc(text) {
     }
     const depth = parent ? parent.depth + 1 : 0;
     if (depth >= MAX_TOC_LEVELS) {
-      const leafParent = (_b30 = (_a56 = stack[stack.length - 1]) == null ? void 0 : _a56.node) != null ? _b30 : virtualRoot;
+      const leafParent = (_b31 = (_a58 = stack[stack.length - 1]) == null ? void 0 : _a58.node) != null ? _b31 : virtualRoot;
       leafParent.children.push({ depth: leafParent.depth + 1, unit: item.unit, label: item.title, children: [] });
       continue;
     }
@@ -1529,14 +2670,14 @@ function parseToc(text) {
   const depthLabels = [];
   {
     const walk = (nodes) => {
-      var _a57;
+      var _a59;
       for (const n of nodes) {
         while (freq.length <= n.depth)
           freq.push(/* @__PURE__ */ new Map());
         while (depthLabels.length <= n.depth)
           depthLabels.push([]);
         if (n.unit)
-          freq[n.depth].set(n.unit, ((_a57 = freq[n.depth].get(n.unit)) != null ? _a57 : 0) + 1);
+          freq[n.depth].set(n.unit, ((_a59 = freq[n.depth].get(n.unit)) != null ? _a59 : 0) + 1);
         depthLabels[n.depth].push(n.label);
         maxDepth = Math.max(maxDepth, n.depth + 1);
         walk(n.children);
@@ -1641,20 +2782,237 @@ function extractNextDayPlanSection(content) {
   return body.slice(s, e).join("\n");
 }
 
+// src/board-items.ts
+function roundPercent(done, total) {
+  return total === 0 ? 0 : Math.round(done / total * 100);
+}
+function isWeekend(date) {
+  const day = parseDateString(date).getDay();
+  return day === 0 || day === 6;
+}
+function eachDay(from, to, fn) {
+  if (from > to)
+    return;
+  let cur = parseDateString(from);
+  const end = parseDateString(to);
+  while (cur <= end) {
+    fn(formatDate(cur));
+    cur = addDays(cur, 1);
+  }
+}
+function choreDays(cycle, plan, item, gStart, scanEnd, hitDates) {
+  const dues = choreOccurrences(cycle, gStart, scanEnd, 4e3);
+  const dueHit = /* @__PURE__ */ new Map();
+  for (let i = 0; i < dues.length; i++) {
+    const due = dues[i];
+    const next = i + 1 < dues.length ? dues[i + 1] : nextChoreOccurrence(cycle, due);
+    const winTo = formatDate(addDays(parseDateString(next), -1));
+    const scanTo = winTo < scanEnd ? winTo : scanEnd;
+    let hit = false;
+    for (let d = due; d <= scanTo; ) {
+      if (hitDates.has(`${plan}|${d}|${item}`)) {
+        hit = true;
+        break;
+      }
+      d = formatDate(addDays(parseDateString(d), 1));
+    }
+    dueHit.set(due, hit);
+  }
+  const states = [];
+  eachDay(gStart, scanEnd, (d) => {
+    const h = dueHit.get(d);
+    states.push({ date: d, state: h === void 0 ? "off" : h ? "hit" : "miss" });
+  });
+  return states;
+}
+async function computeBoardSections(app, rootPath, today, reviewWorkdays, bzg = null) {
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2;
+  const root = rootPath.replace(/\/+$/, "");
+  const year = today.slice(0, 4);
+  const defs = await readAnnualDefs(app, root, year);
+  const period = (_a58 = await readPlanPeriod(app, root, year)) != null ? _a58 : {
+    start: `${year}-01-01`,
+    end: `${year}-12-31`
+  };
+  const { start, end } = period;
+  const scanEnd = today < start ? start : today > end ? end : today;
+  if (today < start)
+    return { start, end, scanEnd, sections: [] };
+  const stats = await computePeriodStats(app, root, today, "year", reviewWorkdays, bzg);
+  const progByName = new Map(stats.planProgress.map((p) => [p.plan, p]));
+  const quotaByName = new Map(stats.quotaProgress.map((q) => [q.plan, q]));
+  const rateByName = new Map(stats.planRates.map((r) => [r.plan, r]));
+  const sections = [];
+  for (const def of defs) {
+    const items2 = [];
+    const prog = progByName.get(def.name);
+    const goals = (_b31 = prog == null ? void 0 : prog.goals) != null ? _b31 : [];
+    const hasChore = goals.some((g) => g.mode === "chore");
+    const workdayOnly = def.tradingDay === true || def.name === "\u590D\u76D8" && reviewWorkdays;
+    const planTotalDays = workdayOnly ? countWorkdays(start, scanEnd) : dayCount(start, scanEnd);
+    let planCheckDone = 0;
+    eachDay(start, scanEnd, (d) => {
+      if (stats.planCheckDates.has(`${def.name}|${d}`))
+        planCheckDone++;
+    });
+    if (def.type === "quota") {
+      const q = quotaByName.get(def.name);
+      if (q) {
+        items2.push({
+          key: `${def.name}|quota`,
+          name: "\u603B\u91CF\u8FDB\u5EA6",
+          kind: "quota",
+          done: q.actual,
+          total: q.total,
+          percent: q.percent,
+          unit: q.unit || "\u91CF"
+        });
+      }
+    } else {
+      if (def.type === "check") {
+        if (goals.length === 0) {
+          const days = [];
+          eachDay(start, scanEnd, (d) => {
+            const hit = stats.planCheckDates.has(`${def.name}|${d}`);
+            days.push({ date: d, state: hit ? "hit" : workdayOnly && isWeekend(d) ? "off" : "miss" });
+          });
+          const total = workdayOnly ? countWorkdays(start, scanEnd) : dayCount(start, scanEnd);
+          items2.push({
+            key: `${def.name}|check`,
+            name: "\u6BCF\u65E5\u6253\u5361",
+            kind: "plan",
+            done: planCheckDone,
+            total,
+            percent: roundPercent(planCheckDone, total),
+            unit: "\u5929",
+            days
+          });
+        } else {
+          appendGoalItems(items2, def.name, goals, stats.choreHitDates, start, scanEnd);
+        }
+      } else if (def.type === "numeric") {
+        appendGoalItems(items2, def.name, goals, stats.choreHitDates, start, scanEnd);
+        if (goals.length === 0 && prog && prog.targetCount > 0) {
+          items2.push({
+            key: `${def.name}|task`,
+            name: "\u4EFB\u52A1\u5B8C\u6210",
+            kind: "goal",
+            done: prog.doneCount,
+            total: prog.targetCount,
+            percent: prog.percent,
+            unit: "\u9879"
+          });
+        }
+      }
+      if (items2.length === 0 && goals.length > 0) {
+        appendGoalItems(items2, def.name, goals, stats.choreHitDates, start, scanEnd);
+      }
+    }
+    if (items2.length === 0)
+      continue;
+    let percent;
+    if (def.type === "quota") {
+      percent = (_d5 = (_c12 = quotaByName.get(def.name)) == null ? void 0 : _c12.percent) != null ? _d5 : 0;
+    } else if (def.type === "check" && !hasChore) {
+      percent = roundPercent(planCheckDone, planTotalDays);
+    } else if (items2.every((i) => i.days)) {
+      const done = items2.reduce((a, i) => a + i.done, 0);
+      const total = items2.reduce((a, i) => a + i.total, 0);
+      percent = roundPercent(done, total);
+    } else {
+      percent = (_g2 = (_f2 = prog == null ? void 0 : prog.percent) != null ? _f2 : (_e4 = rateByName.get(def.name)) == null ? void 0 : _e4.percent) != null ? _g2 : 0;
+    }
+    sections.push({
+      plan: def.name,
+      label: def.label,
+      percent,
+      items: items2
+    });
+  }
+  return { start, end, scanEnd, sections };
+}
+function appendGoalItems(items2, plan, goals, choreHitDates, start, scanEnd) {
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2, _h2, _i2, _j;
+  for (const g of goals) {
+    if (g.mode === "chore") {
+      const cycle = (_a58 = g.cycle) != null ? _a58 : { unit: "day", days: [] };
+      const gStart = g.start || start;
+      const gScanEnd = g.end && g.end < scanEnd ? g.end : scanEnd;
+      const days = choreDays(cycle, plan, g.name, gStart, gScanEnd, choreHitDates);
+      const ms = g.modeStats;
+      items2.push({
+        key: `${plan}|${g.name}`,
+        name: g.name,
+        kind: "chore",
+        done: (_b31 = ms == null ? void 0 : ms.hitDays) != null ? _b31 : g.done,
+        total: (_c12 = ms == null ? void 0 : ms.dueDays) != null ? _c12 : g.total,
+        percent: g.percent,
+        unit: cycle.unit === "day" ? "\u5929" : "\u6B21",
+        days,
+        streak: ms == null ? void 0 : ms.streak
+      });
+      continue;
+    }
+    if (g.mode === "writing" && g.writingQuota) {
+      const ms = g.modeStats;
+      items2.push({
+        key: `${plan}|${g.name}`,
+        name: g.name,
+        kind: "mode",
+        mode: "writing",
+        done: (_d5 = ms == null ? void 0 : ms.totalAmount) != null ? _d5 : 0,
+        total: (_e4 = ms == null ? void 0 : ms.quotaTotal) != null ? _e4 : g.writingQuota.total,
+        percent: g.percent,
+        unit: (_f2 = ms == null ? void 0 : ms.quotaUnit) != null ? _f2 : "\u5B57",
+        days: (_g2 = ms == null ? void 0 : ms.dayStates) == null ? void 0 : _g2.map((s) => ({ date: s.date, state: s.hit ? "hit" : "miss" })),
+        streak: ms == null ? void 0 : ms.streak
+      });
+      continue;
+    }
+    if (g.mode === "review" || g.mode === "diary" || g.mode === "exercise") {
+      const ms = g.modeStats;
+      items2.push({
+        key: `${plan}|${g.name}`,
+        name: g.name,
+        kind: "mode",
+        mode: g.mode,
+        done: (_h2 = ms == null ? void 0 : ms.hitDays) != null ? _h2 : g.done,
+        total: (_i2 = ms == null ? void 0 : ms.dueDays) != null ? _i2 : g.total,
+        percent: g.percent,
+        unit: "\u5929",
+        days: (_j = ms == null ? void 0 : ms.dayStates) == null ? void 0 : _j.map((s) => ({ date: s.date, state: s.hit ? "hit" : "miss" })),
+        streak: ms == null ? void 0 : ms.streak
+      });
+      continue;
+    }
+    const unit = g.unit || (g.mode === "writing" ? "\u7AE0" : "\u8282");
+    items2.push({
+      key: `${plan}|${g.name}`,
+      name: g.name,
+      kind: "goal",
+      mode: g.mode,
+      done: g.done,
+      total: g.total,
+      percent: g.percent,
+      unit
+    });
+  }
+}
+
 // src/weave-bridge.ts
 function weaveTocToStructure(tree) {
-  var _a56;
+  var _a58;
   if (!tree || tree.length === 0)
     return null;
   const freq = [];
   const walkFreq = (nodes, depth) => {
-    var _a57;
+    var _a59;
     for (const n of nodes) {
       while (freq.length <= depth)
         freq.push(/* @__PURE__ */ new Map());
       const w = extractTocUnitWord(n.label);
       if (w)
-        freq[depth].set(w, ((_a57 = freq[depth].get(w)) != null ? _a57 : 0) + 1);
+        freq[depth].set(w, ((_a59 = freq[depth].get(w)) != null ? _a59 : 0) + 1);
       walkFreq(n.children, depth + 1);
     }
   };
@@ -1709,7 +3067,7 @@ function weaveTocToStructure(tree) {
       visit(n, 0);
   }
   for (let lv = 0; lv < levels.length; lv++) {
-    if ((_a56 = labelRows[lv]) == null ? void 0 : _a56.some((l) => l.trim() !== ""))
+    if ((_a58 = labelRows[lv]) == null ? void 0 : _a58.some((l) => l.trim() !== ""))
       levels[lv].labels = labelRows[lv];
   }
   if (levels[0].counts[0] <= 0)
@@ -2612,6 +3970,197 @@ var orphanMd = [
 var orphanRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanMd, "2026-11-10").checkItems, isModeLine);
 check("topRows: \u65E0\u7236\u884C\u6A21\u5F0F\u884C\u4FDD\u6301\u9876\u5C42\u4E14\u8BA1\u5165", orphanRows.length === 1 && orphanRows[0].modeChildren.length === 0 && orphanRows[0].done, JSON.stringify(orphanRows));
 check("topRows: \u65E0\u6A21\u5F0F\u884C = \u5168\u90E8\u72EC\u7ACB\u5927\u9879", topLevelCheckRows(parsed.checkItems, () => false).length === 9);
+check("tick \u6837\u5F0F: \u62C9\u4F38\u7B2C2\u6B21 \u2192 base+2+\u6B21", JSON.stringify(parseTickRow("\u62C9\u4F38\u7B2C2\u6B21")) === JSON.stringify({ base: "\u62C9\u4F38", k: 2, unit: "\u6B21" }), parseTickRow("\u62C9\u4F38\u7B2C2\u6B21"));
+check("tick \u6837\u5F0F: \u7EC4\u5355\u4F4D\u540C\u6837\u8BC6\u522B", JSON.stringify(parseTickRow("\u62C9\u4F38\u7B2C2\u7EC4")) === JSON.stringify({ base: "\u62C9\u4F38", k: 2, unit: "\u7EC4" }), parseTickRow("\u62C9\u4F38\u7B2C2\u7EC4"));
+check("tick \u6837\u5F0F: \u65E0\u5355\u4F4D\u5C3E\u4E5F\u53EF\uFF08\u7A7A\u5355\u4F4D\u76EE\u6807\uFF09", JSON.stringify(parseTickRow("\u62C9\u4F38\u7B2C2")) === JSON.stringify({ base: "\u62C9\u4F38", k: 2, unit: "" }), parseTickRow("\u62C9\u4F38\u7B2C2"));
+var _a46;
+check("tick \u6837\u5F0F: emoji \u524D\u7F00\u5BB9\u5FCD", ((_a46 = parseTickRow("\u{1F3C3} \u62C9\u4F38\u7B2C1\u6B21")) == null ? void 0 : _a46.base) === "\u62C9\u4F38", parseTickRow("\u{1F3C3} \u62C9\u4F38\u7B2C1\u6B21"));
+check("tick \u6837\u5F0F: \u6A21\u5F0F\u884C\u6587\u672C\u4E0D\u662F\u6B21\u884C", parseTickRow("\u62C9\u4F38 2\u6B21") === null, parseTickRow("\u62C9\u4F38 2\u6B21"));
+check("tick \u6837\u5F0F: \u65E0 base \u4E0D\u7B97", parseTickRow("\u7B2C2\u6B21") === null, parseTickRow("\u7B2C2\u6B21"));
+check("tick \u6837\u5F0F: \u5176\u4ED6\u91CF\u8BCD\u884C\u4E0D\u7B97", parseTickRow("\u5E73\u677F\u6491 3\u7EC4") === null, parseTickRow("\u5E73\u677F\u6491 3\u7EC4"));
+check("tick \u6837\u5F0F: k=0 \u975E\u6CD5", parseTickRow("\u62C9\u4F38\u7B2C0\u6B21") === null, parseTickRow("\u62C9\u4F38\u7B2C0\u6B21"));
+check("tick \u6837\u5F0F: buildTickLine \u7F29\u8FDB+\u6807\u7B7E+\u5355\u4F4D+\u65E5\u671F", buildTickLine("\u62C9\u4F38", 2, "\u8FD0\u52A8", "2026-11-12", "\u6B21") === "	- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", buildTickLine("\u62C9\u4F38", 2, "\u8FD0\u52A8", "2026-11-12", "\u6B21"));
+check("tick \u6837\u5F0F: buildTickLine \u7EC4\u5355\u4F4D", buildTickLine("\u62C9\u4F38", 1, "\u8FD0\u52A8", "2026-11-12", "\u7EC4") === "	- [ ] \u62C9\u4F38\u7B2C1\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", buildTickLine("\u62C9\u4F38", 1, "\u8FD0\u52A8", "2026-11-12", "\u7EC4"));
+var splitMd = [
+  "# 2026-11-12",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "	- [x] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "	- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "    - [ ] \u7F29\u8FDB\u7684\u666E\u901A\u884C #\u8BA1\u5212/\u8FD0\u52A8",
+  "	\u968F\u4FBF\u5199\u5199",
+  "	- [ ] \u65E0\u6807\u7B7E\u6B21\u884C\u6837\u5F0F\u7684\u884C"
+].join("\n");
+var splitParsed = parseDailyContent(dailyFile, splitMd, "2026-11-12");
+check("tick \u89E3\u6790: 4 \u884C checkItems\uFF08\u7236+\u5B50\u9879\u884C+2 \u6B21\u884C\uFF09\uFF0C\u975E\u6B21\u884C\u7F29\u8FDB\u884C\u4E0D\u53EF\u89C1", splitParsed.checkItems.length === 4, splitParsed.checkItems.map((i) => i.text));
+var tickItems = splitParsed.checkItems.filter((it) => it.tick);
+var _a47, _b22;
+check("tick \u89E3\u6790: \u4E24\u6761\u6B21\u884C\u5E26 indent+tick", tickItems.length === 2 && ((_a47 = tickItems[0].tick) == null ? void 0 : _a47.base) === "\u62C9\u4F38" && ((_b22 = tickItems[0].tick) == null ? void 0 : _b22.k) === 1 && tickItems[0].indent === 1, JSON.stringify(tickItems.map((t) => t.tick)));
+check("tick \u89E3\u6790: \u6B21\u884C\u52FE\u9009\u6001\u8BFB\u5BF9", tickItems[0].checked === true && tickItems[1].checked === false);
+check("tick \u89E3\u6790: \u7F29\u8FDB\u884C\u4E0D\u6F0F\u8FDB tempItems", splitParsed.tempItems.length === 0, splitParsed.tempItems.length);
+var splitModeGoals = [{ plan: "\u8FD0\u52A8", name: "\u62C9\u4F38", floor: 2, unit: "\u6B21" }];
+var isSplitModeLine = (it) => splitModeGoals.some((g) => g.plan === it.plan && matchesModeLine(it.text, g.name, g.floor, g.unit));
+check("tick \u56DE\u5F52: \u6B21\u884C\u6587\u672C\u786E\u5B9E\u4F1A\u649E matchesModeLine\uFF08\u8BB0\u5F55\u672C\u78B0\u649E\uFF09", matchesModeLine("\u62C9\u4F38\u7B2C2\u6B21", "\u62C9\u4F38", 2, "\u6B21") === true);
+var viewIsModeLine = (it) => !it.tick && isSplitModeLine(it);
+var anchorItem0 = splitParsed.checkItems.find((it) => !it.tick && it.text.includes("\u62C9\u4F38 2\u6B21"));
+check("tick \u56DE\u5F52: \u89C6\u56FE\u5B88\u536B\u2014\u2014item.tick \u6052\u975E\u6A21\u5F0F\u884C\u3001\u5B50\u9879\u884C\u4ECD\u662F", viewIsModeLine(tickItems[1]) === false && viewIsModeLine(anchorItem0) === true);
+var splitAnchor = splitParsed.checkItems.find((it) => !it.tick && isSplitModeLine(it));
+check("tick \u951A: \u6B21\u884C\u951A\u5230\u62C9\u4F38\u884C", tickAnchorOf(splitParsed.checkItems, tickItems[0], isSplitModeLine) === splitAnchor);
+check("tick \u951A: tickChildrenOf \u6302 2 \u6761", tickChildrenOf(splitParsed.checkItems, splitAnchor, isSplitModeLine).length === 2);
+var splitRows = topLevelCheckRows(splitParsed.checkItems, isSplitModeLine);
+check("tick \u805A\u5408: \u6B21\u884C\u4E0D\u843D\u9876\u5C42\uFF08\u5927\u9879 = 1\uFF09", splitRows.length === 1, splitRows.length);
+check("tick \u805A\u5408: \u6B21\u884C\u4E0D\u8FDB modeChildren\uFF08\u62C9\u4F38\u884C 1 \u6761\uFF09", splitRows[0].modeChildren.length === 1, splitRows[0].modeChildren.length);
+check("tick \u805A\u5408: \u90E8\u5206\u5B8C\u6210 \u2192 \u5927\u9879\u672A\u5B8C\u6210", splitRows[0].done === false, splitRows[0].done);
+var allTickRows = topLevelCheckRows(parseDailyContent(dailyFile, splitMd.replace("	- [ ] \u62C9\u4F38\u7B2C2\u6B21", "	- [x] \u62C9\u4F38\u7B2C2\u6B21"), "2026-11-12").checkItems, isSplitModeLine);
+check("tick \u805A\u5408: \u6B21\u884C\u5168\u52FE \u2192 \u5B50\u884C\u955C\u50CF\u5B8C\u6210 \u2192 \u5927\u9879\u5B8C\u6210", allTickRows[0].done === true, allTickRows[0].done);
+var orphanTickMd = [
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n");
+var orphanTickRows = topLevelCheckRows(parseDailyContent(dailyFile, orphanTickMd, "2026-11-12").checkItems, isSplitModeLine);
+check("tick \u515C\u5E95: \u951A\u884C\u88AB\u5220 \u2192 \u6B21\u884C\u72EC\u7ACB\u9876\u5C42", orphanTickRows.length === 2, orphanTickRows.length);
+var toggledIndent = toggleTaskLine(splitMd, 5, true, "	- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8");
+check("tick \u5199\u56DE: \u7F29\u8FDB\u6B21\u884C\u52FE\u9009\u4FDD\u7559\u7F29\u8FDB", toggledIndent.split("\n")[5] === "	- [x] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", toggledIndent.split("\n")[5]);
+var recBase = [
+  "# 2026-11-12",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n");
+var splitSpec = { plan: "\u8FD0\u52A8", name: "\u62C9\u4F38", label: "\u{1F3C3}", floor: 2, unit: "\u6B21" };
+var rec1 = reconcileTickRows(recBase, splitSpec, 2, "2026-11-12");
+check("tick \u751F\u6210: \u8865\u51FA 2 \u6761\u7F29\u8FDB\u6B21\u884C", rec1.split("\n").filter((l) => l.includes("\u62C9\u4F38\u7B2C")).length === 2, rec1);
+check("tick \u751F\u6210: \u5E42\u7B49", reconcileTickRows(rec1, splitSpec, 2, "2026-11-12") === rec1);
+var rec2 = reconcileTickRows(recBase + "\n	- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick \u751F\u6210: \u8865\u7F3A\u4FDD\u6301 k \u5347\u5E8F", rec2.indexOf("\u62C9\u4F38\u7B2C1\u6B21") !== -1 && rec2.indexOf("\u62C9\u4F38\u7B2C1\u6B21") < rec2.indexOf("\u62C9\u4F38\u7B2C2\u6B21"), rec2);
+var rec3 = reconcileTickRows(rec1 + "\n	- [ ] \u62C9\u4F38\u7B2C3\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick \u6E05\u7406: \u8D85\u91CF\u672A\u52FE\u6B21\u884C\u5220\u9664", !rec3.includes("\u62C9\u4F38\u7B2C3\u6B21"), rec3);
+var rec4 = reconcileTickRows(rec1 + "\n	- [x] \u62C9\u4F38\u7B2C3\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick \u6E05\u7406: \u8D85\u91CF\u5DF2\u52FE\u6B21\u884C\u4FDD\u7559\uFF08\u5B8C\u6210\u8BB0\u5F55\uFF09", rec4.includes("\u62C9\u4F38\u7B2C3\u6B21"), rec4);
+var rec5 = reconcileTickRows(rec1, splitSpec, 0, "2026-11-12");
+check("tick \u6E05\u7406: n=0 \u6E05\u5168\u90E8\u672A\u52FE\u6B21\u884C", !rec5.includes("\u62C9\u4F38\u7B2C"), rec5);
+var rec6 = reconcileTickRows("# 2026-11-12\n## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u522B\u7684 #\u8BA1\u5212/\u522B\u7684\n", splitSpec, 2, "2026-11-12");
+check("tick \u751F\u6210: \u65E0\u5B50\u9879\u884C\u539F\u6837\u8FD4\u56DE", !rec6.includes("\u62C9\u4F38\u7B2C"), rec6);
+var rec7 = reconcileTickRows(rec1 + "\n	- [ ] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12", splitSpec, 2, "2026-11-12");
+check("tick \u6E05\u7406: \u91CD\u590D\u672A\u52FE\u6B21\u884C\u53BB\u91CD", rec7.split("\n").filter((l) => l.includes("\u62C9\u4F38\u7B2C1\u6B21")).length === 1, rec7);
+check("tick \u751F\u6210: \u6B21\u884C\u4E0D\u63A9\u76D6\u771F\u884C\u7F3A\u5931\uFF08missingModeLines \u4ECD\u8865\u5B50\u9879\u884C\uFF09", missingModeLines([
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n"), [splitSpec], "2026-11-12").length === 1);
+check("mirror: \u5168\u672A\u52FE\u65E0\u52A8\u4F5C", subItemMirrorTargets(rec1, [splitSpec]).length === 0);
+var mir1 = subItemMirrorTargets(
+  rec1.replace("	- [ ] \u62C9\u4F38\u7B2C1\u6B21", "	- [x] \u62C9\u4F38\u7B2C1\u6B21").replace("	- [ ] \u62C9\u4F38\u7B2C2\u6B21", "	- [x] \u62C9\u4F38\u7B2C2\u6B21"),
+  [splitSpec]
+);
+check("mirror: \u6B21\u884C\u5168\u52FE \u2192 \u5B50\u9879\u884C\u5F85\u52FE", mir1.length === 1 && mir1[0].checked === true, JSON.stringify(mir1));
+var mir2 = subItemMirrorTargets(rec1.replace("- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21", "- [x] \u{1F3C3} \u62C9\u4F38 2\u6B21"), [splitSpec]);
+check("mirror: \u5B50\u9879\u884C\u52FE\u4F46\u6B21\u884C\u672A\u5168\u52FE \u2192 \u5F85\u56DE\u9000", mir2.length === 1 && mir2[0].checked === false, JSON.stringify(mir2));
+check("mirror: \u65E0\u6B21\u884C\u4E0D\u52A8", subItemMirrorTargets(recBase, [splitSpec]).length === 0);
+var blockStart = rec1.split("\n").findIndex((l) => l.includes("\u62C9\u4F38 2\u6B21"));
+check("tick \u5757: \u4E0A\u79FB\u6574\u5757\u8DDF\u624B", moveTaskBlock(rec1, blockStart, blockStart + 2, -1).split("\n")[blockStart - 1].includes("\u62C9\u4F38 2\u6B21"));
+var recBlockDown = rec1 + "\n- [ ] \u{1F3C3} \u516B\u6BB5\u9526 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12";
+check("tick \u5757: \u4E0B\u79FB\u6574\u5757\u8DDF\u624B", moveTaskBlock(recBlockDown, blockStart, blockStart + 2, 1).split("\n")[blockStart + 1].includes("\u62C9\u4F38 2\u6B21"));
+check("tick \u5757: \u76F8\u90BB\u975E\u4EFB\u52A1\u884C\u4E0D\u8D8A\u754C\uFF08\u6807\u9898\u4E0A\u65B9\u4E0D\u52A8\uFF09", moveTaskBlock(rec1, 2, 2, -1) === rec1);
+var removedBlock = removeLineBlock(rec1, blockStart, blockStart + 2);
+check("tick \u5757: \u5220\u9664\u6574\u5757\uFF08\u5B50\u9879\u884C+\u6B21\u884C\uFF09", !removedBlock.includes("\u62C9\u4F38") && removedBlock.includes("\u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6"), removedBlock);
+var rollTickMd = [
+  "# 2026-11-12",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "	- [x] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  "	- [x] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n");
+var rollTickFacts = [{ plan: "\u8FD0\u52A8", live: true, pendingEmpty: true }];
+var rollTickTargets = parentCheckTargets(
+  rollTickMd,
+  rollTickFacts,
+  (plan, text) => plan === "\u8FD0\u52A8" && matchesModeLine(text, "\u62C9\u4F38", 2, "\u6B21"),
+  (plan, text) => {
+    var _a58;
+    return plan === "\u8FD0\u52A8" && ((_a58 = parseTickRow(text)) == null ? void 0 : _a58.base) === "\u62C9\u4F38";
+  }
+);
+check("tick \u5BF9\u8D26: \u955C\u50CF\u540E\u5B50\u9879\u884C\u52FE \u2192 \u8FD0\u52A8\u7236\u884C\u5165\u8D26", rollTickTargets.length === 1 && rollTickTargets[0].plan === "\u8FD0\u52A8", JSON.stringify(rollTickTargets));
+var flatTickMd = rollTickMd.replace("\n	- [x] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", "\n- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8");
+check("tick \u5BF9\u8D26: \u65E0\u5B88\u536B\u65F6\u72EC\u7ACB\u6B21\u884C\u4F1A\u8BEF\u963B\u585E\u7236\u884C\uFF08\u8BB0\u5F55\u78B0\u649E\uFF09", parentCheckTargets(flatTickMd, rollTickFacts, (plan, text) => plan === "\u8FD0\u52A8" && matchesModeLine(text, "\u62C9\u4F38", 2, "\u6B21")).length === 0);
+var flatGuarded = parentCheckTargets(
+  flatTickMd,
+  rollTickFacts,
+  (plan, text) => plan === "\u8FD0\u52A8" && matchesModeLine(text, "\u62C9\u4F38", 2, "\u6B21"),
+  (plan, text) => {
+    var _a58;
+    return plan === "\u8FD0\u52A8" && ((_a58 = parseTickRow(text)) == null ? void 0 : _a58.base) === "\u62C9\u4F38";
+  }
+);
+check("tick \u5BF9\u8D26: isTickLineText \u5B88\u536B\u515C\u4F4F\u72EC\u7ACB\u6B21\u884C", flatGuarded.length === 1 && flatGuarded[0].plan === "\u8FD0\u52A8", JSON.stringify(flatGuarded));
+var rep1 = repointModeLineAmounts([
+  "# 2026-11-12",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [x] \u{1F3C3} \u62C9\u4F38 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12",
+  "- [ ] \u{1F3C3} \u5E73\u677F\u6491 3\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n"), [splitSpec]);
+check("repoint: \u65E7\u91CF\u884C\u6539\u5230\u65B0\u53E3\u5F84\uFF08\u52FE\u9009\u6001/\u6807\u7B7E/\u65E5\u671F\u4FDD\u7559\uFF09", rep1.includes("- [x] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12"), rep1);
+check("repoint: \u7236\u884C\u4E0E\u4ED6\u91CF\u884C\u4E0D\u52A8", rep1.includes("\u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6") && rep1.includes("\u5E73\u677F\u6491 3\u7EC4"));
+check("repoint: \u5E42\u7B49", repointModeLineAmounts(rep1, [splitSpec]) === rep1);
+check("repoint: \u5B9E\u91CF\u540E\u7F00\u4FDD\u7559", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 5\u7BC7\uFF08\u5B9E 9\u7BC7\uFF09 #\u8BA1\u5212/\u5B66\u4E60", [{ plan: "\u5B66\u4E60", name: "\u6587\u732E\u590D\u4E60", label: "\u{1F5E3}\uFE0F", floor: 3, unit: "\u7BC7" }]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F5E3}\uFE0F \u6587\u732E\u590D\u4E60 3\u7BC7\uFF08\u5B9E 9\u7BC7\uFF09 #\u8BA1\u5212/\u5B66\u4E60");
+check("repoint: \u7F3A\u91CF\u884C\u8865\u91CF", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38 #\u8BA1\u5212/\u8FD0\u52A8", [splitSpec]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8");
+check("repoint: floor=0 \u5265\u91CF\u56DE\u7EAF\u6253\u5361", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", [{ plan: "\u8FD0\u52A8", name: "\u62C9\u4F38", label: "", floor: 0, unit: "" }]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38 #\u8BA1\u5212/\u8FD0\u52A8");
+check("repoint: \u6B21\u884C\u6837\u5F0F\u884C\u4E0D\u52A8", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", [splitSpec]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38\u7B2C2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8");
+check("repoint: \u540D\u540E\u5E26\u5176\u4ED6\u6587\u672C\u7684\u884C\u4E0D\u52A8", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38\u8BA1\u5212\u5F88\u91CD\u8981 #\u8BA1\u5212/\u8FD0\u52A8", [splitSpec]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38\u8BA1\u5212\u5F88\u91CD\u8981 #\u8BA1\u5212/\u8FD0\u52A8");
+check("repoint: \u5355\u4F4D\u53D8\u66F4\u8DDF\u968F\uFF08\u6B21\u2192\u7EC4\uFF09", repointModeLineAmounts("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8", [{ plan: "\u8FD0\u52A8", name: "\u62C9\u4F38", label: "\u{1F3C3}", floor: 2, unit: "\u7EC4" }]) === "## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F3C3} \u62C9\u4F38 2\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8");
+var repChain = reconcileTickRows(repointModeLineAmounts([
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8",
+  "- [ ] \u{1F3C3} \u62C9\u4F38 1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8"
+].join("\n"), [splitSpec]), splitSpec, 2, "2026-11-12");
+check("repoint: \u91CD\u6307\u540E\u6B21\u884C\u751F\u6210\u3001\u884C\u6298\u53E0\u56DE\u7236\u9879", repChain.includes("	- [ ] \u62C9\u4F38\u7B2C1\u6B21") && topLevelCheckRows(parseDailyContent(dailyFile, repChain, "2026-11-12").checkItems, isSplitModeLine).length === 1, repChain);
+var zuSpec = { plan: "\u8FD0\u52A8", name: "\u62C9\u4F38", label: "\u{1F4AA}", floor: 2, unit: "\u7EC4" };
+var zu1 = reconcileTickRows("## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F4AA} \u62C9\u4F38 2\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8", zuSpec, 2, "2026-11-12");
+check("tick \u7EC4: \u751F\u6210\u7B2C1\u7EC4/\u7B2C2\u7EC4", zu1.includes("	- [ ] \u62C9\u4F38\u7B2C1\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8") && zu1.includes("	- [ ] \u62C9\u4F38\u7B2C2\u7EC4 #\u8BA1\u5212/\u8FD0\u52A8"), zu1);
+check("tick \u7EC4: \u5E42\u7B49", reconcileTickRows(zu1, zuSpec, 2, "2026-11-12") === zu1);
+var zuMirror = subItemMirrorTargets(
+  zu1.replace("	- [ ] \u62C9\u4F38\u7B2C1\u7EC4", "	- [x] \u62C9\u4F38\u7B2C1\u7EC4").replace("	- [ ] \u62C9\u4F38\u7B2C2\u7EC4", "	- [x] \u62C9\u4F38\u7B2C2\u7EC4"),
+  [zuSpec]
+);
+check("tick \u7EC4: \u5168\u52FE\u955C\u50CF\u5F85\u52FE\u5B50\u9879\u884C", zuMirror.length === 1 && zuMirror[0].checked === true, JSON.stringify(zuMirror));
+var switched = reconcileTickRows(repointModeLineAmounts(rec1, [zuSpec]), zuSpec, 2, "2026-11-12");
+check("tick \u7EC4: \u5207\u5355\u4F4D\u540E\u65E7\u884C\u91CD\u6307\u3001\u65E7\u672A\u52FE\u6B21\u884C\u6E05\u9664\u3001\u65B0\u5355\u4F4D\u884C\u751F\u6210", switched.includes("\u62C9\u4F38 2\u7EC4") && switched.includes("\u62C9\u4F38\u7B2C1\u7EC4") && !switched.includes("\u62C9\u4F38\u7B2C1\u6B21"), switched);
+var switched2 = reconcileTickRows(repointModeLineAmounts(rec1.replace("	- [ ] \u62C9\u4F38\u7B2C1\u6B21", "	- [x] \u62C9\u4F38\u7B2C1\u6B21"), [zuSpec]), zuSpec, 2, "2026-11-12");
+check("tick \u7EC4: \u65E7\u5355\u4F4D\u5DF2\u52FE\u6B21\u884C\u4FDD\u7559\uFF08\u5B8C\u6210\u8BB0\u5F55\uFF09", switched2.includes("\u62C9\u4F38 2\u7EC4") && switched2.includes("\u62C9\u4F38\u7B2C1\u6B21") && switched2.includes("\u62C9\u4F38\u7B2C1\u7EC4"), switched2);
+check("tick \u7EC4: \u5F02\u5355\u4F4D\u6B21\u884C\u4E0D\u8FDB\u955C\u50CF", subItemMirrorTargets(rec1.replace("	- [ ] \u62C9\u4F38\u7B2C1\u6B21", "	- [x] \u62C9\u4F38\u7B2C1\u6B21").replace("	- [ ] \u62C9\u4F38\u7B2C2\u6B21", "	- [x] \u62C9\u4F38\u7B2C2\u6B21"), [zuSpec]).length === 0);
+var healParents = [{ plan: "\u8FD0\u52A8", line: "- [ ] \u{1F4AA} \u8FD0\u52A8 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12" }];
+var healIsMode = (plan, text) => plan === "\u8FD0\u52A8" && matchesModeLine(text, "\u62C9\u4F38", 2, "\u6B21");
+var healBase = [
+  "# 2026-11-12",
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F4C8} \u590D\u76D8 #\u8BA1\u5212/\u590D\u76D8",
+  "- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12",
+  "	- [ ] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12"
+].join("\n");
+var healed = ensureModeParentLines(healBase, healParents, healIsMode);
+check("heal: \u7F3A\u7236\u884C \u2192 \u63D2\u5230\u9996\u4E2A\u6A21\u5F0F\u884C\u4E4B\u524D", healed.includes("	- [ ] \u62C9\u4F38\u7B2C1\u6B21") && healed.indexOf("\u{1F4AA} \u8FD0\u52A8") < healed.indexOf("\u62C9\u4F38 2\u6B21") && healed.indexOf("\u62C9\u4F38 2\u6B21") < healed.indexOf("\u62C9\u4F38\u7B2C1\u6B21"), healed);
+check("heal: \u5E42\u7B49", ensureModeParentLines(healed, healParents, healIsMode) === healed);
+var healed2 = ensureModeParentLines(
+  healBase.replace("- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21", "- [ ] \u{1F3C3} \u8FD0\u52A8 \u6BCF\u5929\u534A\u5C0F\u65F6 #\u8BA1\u5212/\u8FD0\u52A8\n- [ ] \u{1F3C3} \u62C9\u4F38 2\u6B21"),
+  healParents,
+  healIsMode
+);
+check("heal: \u5DF2\u6709\u975E\u6A21\u5F0F\u7236\u884C\u4E0D\u91CD\u590D\u8865", healed2.split("\n").filter((l) => l.includes("#\u8BA1\u5212/\u8FD0\u52A8") && !l.includes("\u62C9\u4F38")).length === 1, healed2);
+var healed3 = ensureModeParentLines(
+  "# 2026-11-12\n## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u62C9\u4F38\u7B2C1\u6B21 #\u8BA1\u5212/\u8FD0\u52A8",
+  healParents,
+  healIsMode
+);
+check("heal: \u72EC\u7ACB\u6B21\u884C\u4E0D\u7B97\u7236\u884C\u3001\u4ECD\u8865\u7236\u884C", healed3.includes("\u{1F4AA} \u8FD0\u52A8") && healed3.split("\n").filter((l) => l.includes("\u62C9\u4F38\u7B2C1\u6B21")).length === 1, healed3);
+check("heal: \u8BA1\u5212\u65E0\u4EFB\u4F55\u6A21\u5F0F\u5185\u5BB9\u4E0D\u51ED\u7A7A\u8865\u5361", ensureModeParentLines(healBase, [{ plan: "\u9605\u8BFB", line: "- [ ] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB" }], healIsMode) === healBase);
+var diaryIsMode = (plan, text) => plan === "\u65E5\u8BB0" && matchesModeLine(text, "\u65E5\u8BB0", 0, "");
+var diaryContent = "# 2026-11-12\n## \u2705 \u4ECA\u65E5\u6253\u5361\n- [ ] \u{1F4DD} \u65E5\u8BB0 #\u8BA1\u5212/\u65E5\u8BB0 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12";
+check("heal: \u8BA1\u5212\u540D\u672C\u8EAB\u884C\u4E0D\u89E6\u53D1\u8865\u5361\uFF08\u65E5\u8BB0\u5F62\u6001\uFF09", ensureModeParentLines(diaryContent, [{ plan: "\u65E5\u8BB0", line: "- [ ] \u{1F4DD} \u65E5\u8BB0 #\u8BA1\u5212/\u65E5\u8BB0 \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12" }], diaryIsMode) === diaryContent);
 var rollupMd = [
   "# 2026-11-11",
   "## \u2705 \u4ECA\u65E5\u6253\u5361",
@@ -2636,8 +4185,8 @@ check("rollup: \u5F85\u529E\u6E05\u7A7A \u2192 \u9605\u8BFB\u7236\u884C\u5165\u8
 check("rollup: \u6A21\u5F0F\u884C\u5168\u52FE \u2192 \u7B14\u8BB0\u590D\u4E60\u7236\u884C\u5165\u8D26\uFF08\u6A21\u5F0F\u884C\u5728\u524D\u4E0D\u6321\u7236\u884C\u8BC6\u522B\uFF09", rollupTargets.some((t) => t.plan === "\u7B14\u8BB0\u590D\u4E60"));
 check("rollup: \u6A21\u5F0F\u884C\u5168\u52FE \u2192 \u8FD0\u52A8\u7236\u884C\u5165\u8D26", rollupTargets.some((t) => t.plan === "\u8FD0\u52A8"));
 check("rollup: \u7EAF\u6253\u5361\u884C\uFF08\u65E0\u76EE\u6807\uFF09\u4E0D\u81EA\u52A8\u52FE", !rollupTargets.some((t) => t.plan === "\u51A5\u60F3"));
-var _a46;
-check("rollup: \u76EE\u6807\u5E26\u884C\u53F7\u4E0E\u539F\u6587\uFF08\u53EF\u76F4\u843D toggleTaskLine\uFF09", ((_a46 = rollupTargets.find((t) => t.plan === "\u9605\u8BFB")) == null ? void 0 : _a46.line) === 2);
+var _a48;
+check("rollup: \u76EE\u6807\u5E26\u884C\u53F7\u4E0E\u539F\u6587\uFF08\u53EF\u76F4\u843D toggleTaskLine\uFF09", ((_a48 = rollupTargets.find((t) => t.plan === "\u9605\u8BFB")) == null ? void 0 : _a48.line) === 2);
 var applied = rollupTargets.reduce((acc, t) => toggleTaskLine(acc, t.line, true, t.raw), rollupMd);
 check("rollup: \u843D\u52FE\u540E\u7236\u884C\u4E3A [x]", applied.includes("- [x] \u{1F4D6} \u9605\u8BFB #\u8BA1\u5212/\u9605\u8BFB"), applied.split("\n")[2]);
 check("rollup: \u5F85\u529E\u672A\u6E05\u4E0D\u52FE", !parentCheckTargets(rollupMd, rollupFacts.map((f) => f.plan === "\u9605\u8BFB" ? { ...f, pendingEmpty: false } : f), rollupModePredicate).some((t) => t.plan === "\u9605\u8BFB"));
@@ -2711,20 +4260,20 @@ plans:
 ---
 `;
 var defsA3 = parsePlansFromFrontmatter(fmAnchor3);
-var _a47, _b22;
-var a3 = (_b22 = (_a47 = defsA3[0]) == null ? void 0 : _a47.goals[0]) == null ? void 0 : _b22.readerAnchors;
-var _a48, _b23, _c10, _d4, _e3;
-check("anchors3: \u4E09\u6BB5\u89E3\u6790 spine/href/progress", ((_a48 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _a48.spine) === 0 && ((_b23 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _b23.href) === "c1.xhtml" && ((_c10 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _c10.progress) === 0.25, JSON.stringify((_e3 = (_d4 = defsA3[0]) == null ? void 0 : _d4.goals[0]) == null ? void 0 : _e3.readerAnchors));
-var _a49, _b24;
-check("anchors3: \u4E24\u6BB5\u65E7\u683C\u5F0F\u65E0 progress", ((_a49 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _a49.href) === "c2.xhtml" && ((_b24 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _b24.progress) === void 0);
+var _a49, _b23;
+var a3 = (_b23 = (_a49 = defsA3[0]) == null ? void 0 : _a49.goals[0]) == null ? void 0 : _b23.readerAnchors;
+var _a50, _b24, _c10, _d4, _e3;
+check("anchors3: \u4E09\u6BB5\u89E3\u6790 spine/href/progress", ((_a50 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _a50.spine) === 0 && ((_b24 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _b24.href) === "c1.xhtml" && ((_c10 = a3 == null ? void 0 : a3[0]) == null ? void 0 : _c10.progress) === 0.25, JSON.stringify((_e3 = (_d4 = defsA3[0]) == null ? void 0 : _d4.goals[0]) == null ? void 0 : _e3.readerAnchors));
+var _a51, _b25;
+check("anchors3: \u4E24\u6BB5\u65E7\u683C\u5F0F\u65E0 progress", ((_a51 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _a51.href) === "c2.xhtml" && ((_b25 = a3 == null ? void 0 : a3[1]) == null ? void 0 : _b25.progress) === void 0);
 var convF = weaveTocToStructure(bookTree);
 check("anchors3: \u6865\u53F6\u5E8F progress \u6570\u7EC4\u5BF9\u9F50", !!convF && convF.leafProgress.length === convF.leafSpine.length && convF.leafProgress.every((x) => typeof x === "number"));
 var pt = parseToc("\u7B2C1\u7AE0 \u521D\u89C1\n  1.1 \u76F8\u9047\n  1.2 \u79BB\u522B\n\u7B2C2\u7AE0 \u72EC\u767D");
-var _a50, _b25;
-check("paste labels: \u9644\u5E26\u6BCF\u5C42\u6807\u9898", ((_a50 = pt == null ? void 0 : pt.levels[0].labels) == null ? void 0 : _a50[0]) === "\u7B2C1\u7AE0 \u521D\u89C1" && ((_b25 = pt == null ? void 0 : pt.levels[1].labels) == null ? void 0 : _b25[0]) === "1.1 \u76F8\u9047", JSON.stringify(pt == null ? void 0 : pt.levels[1].labels));
+var _a52, _b26;
+check("paste labels: \u9644\u5E26\u6BCF\u5C42\u6807\u9898", ((_a52 = pt == null ? void 0 : pt.levels[0].labels) == null ? void 0 : _a52[0]) === "\u7B2C1\u7AE0 \u521D\u89C1" && ((_b26 = pt == null ? void 0 : pt.levels[1].labels) == null ? void 0 : _b26[0]) === "1.1 \u76F8\u9047", JSON.stringify(pt == null ? void 0 : pt.levels[1].labels));
 var ptLeaves = expandGoalStructure("\u4E66", pt.levels);
-var _a51, _b26;
-check("paste labels: \u53F6\u540D\u5E26\u771F\u5B9E\u6807\u9898", ((_a51 = ptLeaves[0]) == null ? void 0 : _a51.name) === "\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.1 \u76F8\u9047\uFF09", (_b26 = ptLeaves[0]) == null ? void 0 : _b26.name);
+var _a53, _b27;
+check("paste labels: \u53F6\u540D\u5E26\u771F\u5B9E\u6807\u9898", ((_a53 = ptLeaves[0]) == null ? void 0 : _a53.name) === "\u4E66\uFF08\u7B2C1\u7AE0 \u521D\u89C1\xB71.1 \u76F8\u9047\uFF09", (_b27 = ptLeaves[0]) == null ? void 0 : _b27.name);
 var fmWriting = `---
 plans:
   - name: \u5C0F\u8BF4
@@ -2755,17 +4304,17 @@ var wPlan = defsW[0];
 check("writing: \u8BA1\u5212\u4E3A\u6570\u91CF\u578B", (wPlan == null ? void 0 : wPlan.type) === "numeric");
 var wq = wPlan == null ? void 0 : wPlan.goals[0];
 check("writing: mode=writing \u89E3\u6790", (wq == null ? void 0 : wq.mode) === "writing");
-var _a52, _b27;
-check("writing: \u76EE\u6807\u7EA7\u5B57\u6570\u914D\u989D\u89E3\u6790", ((_a52 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a52.total) === 1e5 && ((_b27 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _b27.end) === "2026-12-31", JSON.stringify(wq == null ? void 0 : wq.writingQuota));
-var _a53;
-check("writing: \u63A5\u7EED\u521D\u59CB\u91CF\u89E3\u6790", ((_a53 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a53.initial) === 2e4);
+var _a54, _b28;
+check("writing: \u76EE\u6807\u7EA7\u5B57\u6570\u914D\u989D\u89E3\u6790", ((_a54 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a54.total) === 1e5 && ((_b28 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _b28.end) === "2026-12-31", JSON.stringify(wq == null ? void 0 : wq.writingQuota));
+var _a55;
+check("writing: \u63A5\u7EED\u521D\u59CB\u91CF\u89E3\u6790", ((_a55 = wq == null ? void 0 : wq.writingQuota) == null ? void 0 : _a55.initial) === 2e4);
 check("writing: floor \u51BB\u7ED3\u914D\u989D\u539F\u6837\u4FDD\u7559", (wq == null ? void 0 : wq.floor) === 1166.7);
 var wc = wPlan == null ? void 0 : wPlan.goals[1];
-var _a54, _b28, _c11;
-check("writing: \u6309\u7AE0\u8282 = 1 \u7EA7\u7AE0\u7ED3\u6784\u5E73\u94FA", (wc == null ? void 0 : wc.mode) === "writing" && ((_c11 = (_b28 = (_a54 = wc == null ? void 0 : wc.structure) == null ? void 0 : _a54[0]) == null ? void 0 : _b28.counts) == null ? void 0 : _c11[0]) === 3 && !(wc == null ? void 0 : wc.writingQuota));
+var _a56, _b29, _c11;
+check("writing: \u6309\u7AE0\u8282 = 1 \u7EA7\u7AE0\u7ED3\u6784\u5E73\u94FA", (wc == null ? void 0 : wc.mode) === "writing" && ((_c11 = (_b29 = (_a56 = wc == null ? void 0 : wc.structure) == null ? void 0 : _a56[0]) == null ? void 0 : _b29.counts) == null ? void 0 : _c11[0]) === 3 && !(wc == null ? void 0 : wc.writingQuota));
 var wLeaves = expandGoalLeaves("\u300A\u9ED1\u6697\u68EE\u6797\u300B", wc);
-var _a55, _b29;
-check("writing: \u7AE0\u53F6\u547D\u540D\u300C\u7B2C N \u7AE0\u300D\u5168\u4E66\u8FDE\u7EED", ((_a55 = wLeaves == null ? void 0 : wLeaves[0]) == null ? void 0 : _a55.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 1 \u7AE0\uFF09" && ((_b29 = wLeaves == null ? void 0 : wLeaves[2]) == null ? void 0 : _b29.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 3 \u7AE0\uFF09", JSON.stringify(wLeaves == null ? void 0 : wLeaves.map((l) => l.name)));
+var _a57, _b30;
+check("writing: \u7AE0\u53F6\u547D\u540D\u300C\u7B2C N \u7AE0\u300D\u5168\u4E66\u8FDE\u7EED", ((_a57 = wLeaves == null ? void 0 : wLeaves[0]) == null ? void 0 : _a57.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 1 \u7AE0\uFF09" && ((_b30 = wLeaves == null ? void 0 : wLeaves[2]) == null ? void 0 : _b30.name) === "\u300A\u9ED1\u6697\u68EE\u6797\u300B\uFF08\u7B2C 3 \u7AE0\uFF09", JSON.stringify(wLeaves == null ? void 0 : wLeaves.map((l) => l.name)));
 check("writing daily: 8 \u4E07\u5B57 \xF7 365 \u5929", computeWritingDaily(1e5, 2e4, "2026-01-01", "2026-12-31") === Math.round(8e4 / 365 * 10) / 10, computeWritingDaily(1e5, 2e4, "2026-01-01", "2026-12-31"));
 check("writing daily: initial=0 \u4E0E quota \u540C\u53E3\u5F84", computeWritingDaily(1e5, 0, "2026-01-01", "2026-01-31") === computeQuotaDaily(1e5, "2026-01-01", "2026-01-31"));
 check("writing line: \u8BC6\u522B\u914D\u989D\u884C\u542B\u5B9E\u91CF", matchesWritingLine("\u270D\uFE0F \u300A\u4E09\u4F53\u300B 1166.7\u5B57\uFF08\u5B9E 800\u5B57\uFF09", "\u300A\u4E09\u4F53\u300B"));
@@ -2938,7 +4487,87 @@ check("writing line: \u4ED6\u4EBA\u540D\u5B57\u4E0D\u8BA4", !matchesWritingLine(
   ], "2026-11-11");
   check("choreLines: \u7CBE\u786E\u5339\u914D\u2014\u2014\u8FD1\u540D/\u5F02\u8BA1\u5212/\u5E26\u540E\u7F00\u90FD\u4E0D\u9876\u66FF", out.length === 2, out);
 }
+check("split: \u6BCF\u5929 3 \u9910 \u2192 3", splitTickCount(3, "\u9910") === 3);
+check("split: \u6BCF\u5929 2 \u9910 \u2192 2", splitTickCount(2, "\u9910") === 2);
+check("split: \u8FDE\u7EED\u91CF\u5355\u4F4D\u4E0D\u62C6\uFF082 \u5206\u949F\uFF09", splitTickCount(2, "\u5206\u949F") === 0);
+check("split: 1 \u6B21\u4E0D\u62C6", splitTickCount(1, "\u6B21") === 0);
+check(
+  "split: \u751F\u6D3B\u4E8B\u9879\u884C\u8BC6\u522B\u91CF\u8BB0\u53F7\u6052 0\uFF08\u88F8\u540D\uFF09",
+  modeLineAmount("chore", 3, "\u9910").floor === 0 && modeLineAmount("chore", 3, "\u9910").unit === "",
+  modeLineAmount("chore", 3, "\u9910")
+);
+check(
+  "split: \u8FD0\u52A8\u884C\u8BC6\u522B\u6CBF\u7528 floor/unit",
+  modeLineAmount("exercise", 2, "\u6B21").floor === 2 && modeLineAmount("exercise", 2, "\u6B21").unit === "\u6B21"
+);
+check("split: \u5468\u671F\u6587\u6848\u5E26\u6B21\u6570\uFF08\u6BCF\u5929 3\u9910\uFF09", choreCycleLabel({ unit: "day", days: [] }, void 0, 3, "\u9910") === "\u6BCF\u5929 3\u9910", choreCycleLabel({ unit: "day", days: [] }, void 0, 3, "\u9910"));
+var choreSplitMd = [
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3E0} \u65E5\u5E38\u751F\u6D3B #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13",
+  "- [ ] \u4E09\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13",
+  "	- [x] \u4E09\u9910\u7B2C1\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13",
+  "	- [ ] \u4E09\u9910\u7B2C2\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13",
+  "	- [ ] \u4E09\u9910\u7B2C3\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13"
+].join("\n");
+var choreSplitGoals = [{ plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u4E09\u9910", floor: 3, unit: "\u9910", mode: "chore" }];
+var isChoreSplitModeLine = (it) => !it.tick && choreSplitGoals.some((g) => {
+  const amt = modeLineAmount(g.mode, g.floor, g.unit);
+  return g.plan === it.plan && matchesModeLine(it.text, g.name, amt.floor, amt.unit);
+});
+var choreSplitParsed = parseDailyContent(dailyFile, choreSplitMd, "2026-11-13");
+var choreSplitRows = topLevelCheckRows(choreSplitParsed.checkItems, isChoreSplitModeLine);
+check("chore split: \u5927\u9879\u4ECD 1\uFF08\u6B21\u884C\u4E0D\u843D\u9876\u5C42\uFF09", choreSplitRows.length === 1, choreSplitRows.length);
+check("chore split: \u4E8B\u9879\u884C\u6302\u5728\u7236\u884C\u4E0B", choreSplitRows[0].modeChildren.length === 1, choreSplitRows[0].modeChildren.length);
+check("chore split: 2/3 \u9910 \u2192 \u5927\u9879\u672A\u5B8C\u6210", choreSplitRows[0].done === false, choreSplitRows[0].done);
+var choreAllMd = choreSplitMd.replace("	- [ ] \u4E09\u9910\u7B2C2\u9910", "	- [x] \u4E09\u9910\u7B2C2\u9910").replace("	- [ ] \u4E09\u9910\u7B2C3\u9910", "	- [x] \u4E09\u9910\u7B2C3\u9910");
+var choreAllRows = topLevelCheckRows(parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems, isChoreSplitModeLine);
+check("chore split: 3/3 \u9910 \u2192 \u4E8B\u9879\u884C\u5B8C\u6210 \u2192 \u5927\u9879\u5B8C\u6210", choreAllRows[0].done === true, choreAllRows[0].done);
+var choreTickSpec = { plan: "\u65E5\u5E38\u751F\u6D3B", name: "\u4E09\u9910", label: "\u{1F3E0}", floor: 0, unit: "\u9910" };
+var choreRecBase = [
+  "## \u2705 \u4ECA\u65E5\u6253\u5361",
+  "- [ ] \u{1F3E0} \u65E5\u5E38\u751F\u6D3B #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13",
+  "- [ ] \u4E09\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-13 \u{1F4C5} 2026-11-13"
+].join("\n");
+var choreRec1 = reconcileTickRows(choreRecBase, choreTickSpec, 3, "2026-11-13");
+check("chore split \u751F\u6210: \u8865\u51FA\u4E09\u6761\u300C\u7B2Ck\u9910\u300D\u6B21\u884C", choreRec1.split("\n").filter((l) => l.includes("\u4E09\u9910\u7B2C")).length === 3, choreRec1);
+check("chore split \u751F\u6210: \u4E8B\u9879\u884C\u4FDD\u6301\u88F8\u540D\uFF08\u4E0D\u5D4C 3\u9910\uFF09", choreRec1.includes("- [ ] \u4E09\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B"), choreRec1);
+check("chore split \u751F\u6210: \u5E42\u7B49", reconcileTickRows(choreRec1, choreTickSpec, 3, "2026-11-13") === choreRec1);
+check("chore split mirror: \u5168\u672A\u52FE\u65E0\u52A8\u4F5C", subItemMirrorTargets(choreRec1, [choreTickSpec]).length === 0);
+var choreMir = subItemMirrorTargets(
+  choreRec1.replace(/\[ \] 三餐第/g, "[x] \u4E09\u9910\u7B2C"),
+  [choreTickSpec]
+);
+check("chore split mirror: \u4E09\u6761\u5168\u52FE \u2192 \u4E8B\u9879\u884C\u5F85\u52FE", choreMir.length === 1 && choreMir[0].checked === true, choreMir);
+var choreMirBack = subItemMirrorTargets(
+  choreRec1.replace("	- [ ] \u4E09\u9910\u7B2C1\u9910", "	- [x] \u4E09\u9910\u7B2C1\u9910").replace("- [ ] \u4E09\u9910 #", "- [x] \u4E09\u9910 #"),
+  [choreTickSpec]
+);
+check("chore split mirror: \u4E8B\u9879\u884C\u52FE\u7740\u4F46\u6B21\u884C\u672A\u52FE \u2192 \u5F85\u9000", choreMirBack.length === 1 && choreMirBack[0].checked === false, choreMirBack);
+check("chore split done: 2/3 \u4E0D\u7B97", splitTicksDone(choreSplitParsed.checkItems, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "\u9910", 3) === false);
+check(
+  "chore split done: 3/3 \u7B97",
+  splitTicksDone(parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "\u9910", 3) === true
+);
+check("chore split done: \u5355\u4F4D\u4E0D\u5339\u914D\u4E0D\u7B97", splitTicksDone(choreAllRows ? parseDailyContent(dailyFile, choreAllMd, "2026-11-13").checkItems : [], "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "\u6B21", 3) === false);
+var choreRenamed = renameTickRowBase(choreRec1, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "\u6B63\u9910");
+check("chore split \u6539\u540D: \u4E09\u6761\u6B21\u884C base \u5168\u6539", choreRenamed.split("\n").filter((l) => l.includes("\u6B63\u9910\u7B2C")).length === 3, choreRenamed);
+check("chore split \u6539\u540D: \u5E8F\u53F7/\u5355\u4F4D/\u7F29\u8FDB\u4FDD\u7559", choreRenamed.includes("	- [ ] \u6B63\u9910\u7B2C3\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B"), choreRenamed);
+check("chore split \u6539\u540D: \u5E42\u7B49\uFF08\u65E7\u540D\u4E0D\u518D\u51FA\u73B0\uFF09", !choreRenamed.includes("\u4E09\u9910\u7B2C"), choreRenamed);
+var choreRenamedChecked = renameTickRowBase(
+  choreRec1.replace(/\[ \] 三餐第/g, "[x] \u4E09\u9910\u7B2C"),
+  "\u65E5\u5E38\u751F\u6D3B",
+  "\u4E09\u9910",
+  "\u6B63\u9910"
+);
+check("chore split \u6539\u540D: \u5DF2\u52FE\u6001\u4FDD\u7559", choreRenamedChecked.split("\n").filter((l) => l.includes("[x] \u6B63\u9910\u7B2C")).length === 3, choreRenamedChecked);
+var otherPlanTicks = choreRec1.split("\n").map((l) => l.startsWith("	") ? l.replace("#\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B", "#\u8BA1\u5212/\u522B\u7684") : l).join("\n");
+check("chore split \u6539\u540D: \u5F02\u8BA1\u5212\u6B21\u884C\u4E0D\u52A8", renameTickRowBase(otherPlanTicks, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "\u6B63\u9910").includes("\u4E09\u9910\u7B2C1\u9910"));
+var choreTickIdx = choreTickLineIndices(choreRec1, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910");
+check("chore split \u884C\u53F7: \u6536\u6EE1\u4E09\u6761\u6B21\u884C", choreTickIdx.length === 3, choreTickIdx);
+check("chore split \u884C\u53F7: \u4E0D\u542B\u951A\u70B9\u884C", !choreTickIdx.includes(2), choreTickIdx);
+check("chore split \u884C\u53F7: \u5F02\u540D\u4E0D\u6536", choreTickLineIndices(choreRec1, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897").length === 0);
 void (async () => {
+  var _a58, _b31, _c12, _d5, _e4, _f2, _g2, _h2, _i2, _j, _k, _l, _m;
   const day = (name, lines) => {
     const f = new TFile();
     f.path = `\u8BA1\u52122026/\u6BCF\u65E5/${name}.md`;
@@ -2949,17 +4578,24 @@ void (async () => {
   const files = [
     day("2026-11-09", ["- [x] \u6D17\u7897 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-09 \u{1F4C5} 2026-11-09"]),
     day("2026-11-10", ["- [ ] \u6D17\u7897 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-10 \u{1F4C5} 2026-11-10"]),
-    day("2026-11-11", ["- [x] \u6D17\u7897\u673A #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11", "- [ ] \u6D17\u7897 #\u8BA1\u5212/\u5BB6\u52A1 \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11"])
+    day("2026-11-11", ["- [x] \u6D17\u7897\u673A #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11", "- [ ] \u6D17\u7897 #\u8BA1\u5212/\u5BB6\u52A1 \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11"]),
+    // ADR-0019: 锚点行未勾（镜像未回写）但三条次行全勾——文件事实仍算当日完成
+    day("2026-11-12", [
+      "- [ ] \u4E09\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12",
+      "	- [x] \u4E09\u9910\u7B2C1\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12",
+      "	- [x] \u4E09\u9910\u7B2C2\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12",
+      "	- [x] \u4E09\u9910\u7B2C3\u9910 #\u8BA1\u5212/\u65E5\u5E38\u751F\u6D3B \u{1F6EB} 2026-11-12 \u{1F4C5} 2026-11-12"
+    ])
   ];
   const app = {
     vault: {
       getAbstractFileByPath: (p) => {
-        var _a56;
-        return (_a56 = files.find((f) => f.path === p)) != null ? _a56 : null;
+        var _a59;
+        return (_a59 = files.find((f) => f.path === p)) != null ? _a59 : null;
       },
       cachedRead: async (f) => {
-        var _a56;
-        return (_a56 = contents.get(f.path)) != null ? _a56 : "";
+        var _a59;
+        return (_a59 = contents.get(f.path)) != null ? _a59 : "";
       }
     }
   };
@@ -2989,6 +4625,169 @@ void (async () => {
     await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897", "2026-11-09", "2026-11-10", true),
     void 0
   );
+  check(
+    "scanHit split: \u951A\u70B9\u672A\u52FE\u4F46\u6B21\u884C\u5168\u52FE \u2192 \u547D\u4E2D\uFF08floor/unit \u53E3\u5F84\uFF09",
+    await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "2026-11-12", "2026-11-12", false, 3, "\u9910"),
+    void 0
+  );
+  check(
+    "scanHit split: \u4E0D\u7ED9\u5206\u6B21\u53E3\u5F84\u65F6\u53EA\u770B\u951A\u70B9\u884C\uFF08\u672A\u52FE = \u672A\u547D\u4E2D\uFF09",
+    !await scanChoreHit(app, prefix, "\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910", "2026-11-12", "2026-11-12"),
+    void 0
+  );
+  {
+    const files2 = [];
+    const contents2 = /* @__PURE__ */ new Map();
+    const mk = (path, text) => {
+      var _a59;
+      const f = new TFile();
+      f.path = path;
+      f.name = (_a59 = path.split("/").pop()) != null ? _a59 : "";
+      f.basename = f.name.replace(/\.[^.]+$/, "");
+      files2.push(f);
+      contents2.set(path, text);
+      return f;
+    };
+    const boardApp = {
+      vault: {
+        getFiles: () => files2,
+        getAbstractFileByPath: (p) => {
+          var _a59;
+          return (_a59 = files2.find((f) => f.path === p)) != null ? _a59 : null;
+        },
+        cachedRead: async (f) => {
+          var _a59;
+          return (_a59 = contents2.get(f.path)) != null ? _a59 : "";
+        }
+      }
+    };
+    const annual = `---
+start: 2026-11-09
+end: 2026-11-20
+plans:
+  - name: \u65E5\u5E38\u751F\u6D3B
+    type: \u6253\u5361
+    target: \u5BB6\u52A1
+    goals:
+      - name: \u4E09\u9910
+        mode: chore
+        floor: 3
+        unit: \u9910
+      - name: \u6D17\u7897
+        mode: chore
+        cycle:
+          unit: week
+          days: [1]
+      - name: \u62C9\u4F38
+        mode: chore
+  - name: \u9605\u8BFB
+    type: \u6253\u5361
+    target: \u6BCF\u5929\u8BFB\u4E66
+  - name: \u5199\u4F5C
+    type: \u6570\u91CF
+    target: 2 \u8282
+    goals:
+      - name: \u300A\u4E66\u300B
+        count: 2
+        unit: \u8282
+        mode: reading
+  - name: \u7A7A\u8BA1\u5212
+    type: \u6570\u91CF
+    target: 0
+---
+`;
+    mk("root/\u8BA1\u52122026/\u5E74\u5EA6\u8BA1\u5212.md", annual);
+    mk(
+      "root/\u8BA1\u52122026/\u4EFB\u52A1.md",
+      [
+        "- [x] \u300A\u4E66\u300B\uFF08\u7B2C 1 \u7AE0\u7B2C 1 \u8282\uFF09 #\u8BA1\u5212/\u5199\u4F5C \u{1F6EB} 2026-11-10 \u{1F4C5} 2026-11-10",
+        "- [ ] \u300A\u4E66\u300B\uFF08\u7B2C 1 \u7AE0\u7B2C 2 \u8282\uFF09 #\u8BA1\u5212/\u5199\u4F5C \u{1F6EB} 2026-11-11 \u{1F4C5} 2026-11-11"
+      ].join("\n")
+    );
+    const row = (text, plan, checked, date, indent = false) => `${indent ? "	" : ""}- [${checked ? "x" : " "}] ${text} #\u8BA1\u5212/${plan} \u{1F6EB} ${date} \u{1F4C5} ${date}`;
+    const day2 = (date, lines) => {
+      mk(`root/\u8BA1\u52122026/\u6BCF\u65E5/${date}.md`, [CHECK_HEADING, ...lines].join("\n"));
+    };
+    day2("2026-11-09", [
+      // ADR-0019: 三餐锚点未勾但三条次行全勾 → 当日命中
+      row("\u4E09\u9910", "\u65E5\u5E38\u751F\u6D3B", false, "2026-11-09"),
+      row("\u4E09\u9910\u7B2C1\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-09", true),
+      row("\u4E09\u9910\u7B2C2\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-09", true),
+      row("\u4E09\u9910\u7B2C3\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-09", true),
+      row("\u62C9\u4F38", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-09"),
+      row("\u6D17\u7897", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-09"),
+      row("\u9605\u8BFB", "\u9605\u8BFB", true, "2026-11-09")
+    ]);
+    day2("2026-11-10", [
+      // 只勾 2/3 次 → 三餐当日不算完成
+      row("\u4E09\u9910", "\u65E5\u5E38\u751F\u6D3B", false, "2026-11-10"),
+      row("\u4E09\u9910\u7B2C1\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-10", true),
+      row("\u4E09\u9910\u7B2C2\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-10", true)
+    ]);
+    day2("2026-11-11", [
+      row("\u4E09\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-11"),
+      row("\u62C9\u4F38", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-11"),
+      row("\u9605\u8BFB", "\u9605\u8BFB", true, "2026-11-11")
+    ]);
+    day2("2026-11-12", [
+      row("\u4E09\u9910", "\u65E5\u5E38\u751F\u6D3B", false, "2026-11-12"),
+      row("\u4E09\u9910\u7B2C1\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-12", true),
+      row("\u4E09\u9910\u7B2C2\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-12", true),
+      row("\u4E09\u9910\u7B2C3\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-12", true),
+      row("\u62C9\u4F38", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-12")
+    ]);
+    day2("2026-11-15", [
+      row("\u4E09\u9910", "\u65E5\u5E38\u751F\u6D3B", true, "2026-11-15"),
+      row("\u62C9\u4F38", "\u65E5\u5E38\u751F\u6D3B", false, "2026-11-15"),
+      row("\u9605\u8BFB", "\u9605\u8BFB", true, "2026-11-15")
+    ]);
+    const board = await computeBoardSections(boardApp, "root", "2026-11-15", true, null);
+    const sec = (name) => board.sections.find((s) => s.plan === name);
+    const item = (plan, name) => {
+      var _a59;
+      return (_a59 = sec(plan)) == null ? void 0 : _a59.items.find((i) => i.name === name);
+    };
+    check(
+      "board: \u8BA1\u5212\u671F\u95F4\u53D6\u5E74\u5EA6 frontmatter \u5E76\u622A\u81F3\u4ECA\u5929",
+      board.start === "2026-11-09" && board.scanEnd === "2026-11-15",
+      { start: board.start, scanEnd: board.scanEnd }
+    );
+    check("board: \u65E0\u5B50\u9879\u4E14\u65E0\u4E8B\u5B9E\u7684\u8BA1\u5212\u533A\u88AB\u9690\u85CF", !sec("\u7A7A\u8BA1\u5212"));
+    const san = item("\u65E5\u5E38\u751F\u6D3B", "\u4E09\u9910");
+    check("board: \u4E09\u9910 \u547D\u4E2D 4/7 \u5929\uFF08\u6B21\u884C\u5168\u52FE\u7B97\u547D\u4E2D\u30012/3 \u4E0D\u7B97\uFF09", (san == null ? void 0 : san.done) === 4 && (san == null ? void 0 : san.total) === 7, {
+      done: san == null ? void 0 : san.done,
+      total: san == null ? void 0 : san.total
+    });
+    check(
+      "board: \u4E09\u9910\u65E5\u683C 11-09 \u547D\u4E2D / 11-10 \u672A\u5B8C\u6210 / 11-13 \u672A\u5B8C\u6210",
+      ((_b31 = (_a58 = san == null ? void 0 : san.days) == null ? void 0 : _a58.find((d) => d.date === "2026-11-09")) == null ? void 0 : _b31.state) === "hit" && ((_d5 = (_c12 = san == null ? void 0 : san.days) == null ? void 0 : _c12.find((d) => d.date === "2026-11-10")) == null ? void 0 : _d5.state) === "miss" && ((_f2 = (_e4 = san == null ? void 0 : san.days) == null ? void 0 : _e4.find((d) => d.date === "2026-11-13")) == null ? void 0 : _f2.state) === "miss"
+    );
+    const wan = item("\u65E5\u5E38\u751F\u6D3B", "\u6D17\u7897");
+    check("board: \u6BCF\u5468\u4E00\u4E8B\u9879 \u547D\u4E2D 1/1 \u6B21\u3001\u91CF\u8BCD\u4E3A\u6B21", (wan == null ? void 0 : wan.done) === 1 && (wan == null ? void 0 : wan.total) === 1 && (wan == null ? void 0 : wan.unit) === "\u6B21", {
+      done: wan == null ? void 0 : wan.done,
+      total: wan == null ? void 0 : wan.total,
+      unit: wan == null ? void 0 : wan.unit
+    });
+    check(
+      "board: \u6BCF\u5468\u4E00\u4E8B\u9879\u975E\u8BE5\u505A\u65E5 = off\uFF087 \u683C\u91CC 6 \u4E2A off\uFF09",
+      ((_g2 = wan == null ? void 0 : wan.days) == null ? void 0 : _g2.filter((d) => d.state === "off").length) === 6,
+      wan == null ? void 0 : wan.days
+    );
+    check("board: \u751F\u6D3B\u8BA1\u5212\u805A\u5408\u7387\u6309\u5E94\u505A\u91CF\u52A0\u6743\uFF088/15 = 53%\uFF09", ((_h2 = sec("\u65E5\u5E38\u751F\u6D3B")) == null ? void 0 : _h2.percent) === 53, (_i2 = sec("\u65E5\u5E38\u751F\u6D3B")) == null ? void 0 : _i2.percent);
+    const read = sec("\u9605\u8BFB");
+    check(
+      "board: \u6253\u5361\u578B\u8BA1\u5212\u6309\u5929\u7EDF\u8BA1 3/7",
+      ((_j = read == null ? void 0 : read.items[0]) == null ? void 0 : _j.done) === 3 && ((_k = read == null ? void 0 : read.items[0]) == null ? void 0 : _k.total) === 7 && (read == null ? void 0 : read.percent) === 43,
+      { item: read == null ? void 0 : read.items[0], percent: read == null ? void 0 : read.percent }
+    );
+    const book2 = item("\u5199\u4F5C", "\u300A\u4E66\u300B");
+    check(
+      "board: \u91CF\u5316\u76EE\u6807\u53EA\u6709\u4EFB\u52A1\u8FDB\u5EA6\u3001\u65E0\u65E5\u683C\u5E26",
+      (book2 == null ? void 0 : book2.done) === 1 && (book2 == null ? void 0 : book2.total) === 2 && (book2 == null ? void 0 : book2.unit) === "\u8282" && (book2 == null ? void 0 : book2.days) === void 0,
+      { done: book2 == null ? void 0 : book2.done, total: book2 == null ? void 0 : book2.total, unit: book2 == null ? void 0 : book2.unit, days: book2 == null ? void 0 : book2.days }
+    );
+    check("board: \u91CF\u5316\u8BA1\u5212\u533A\u767E\u5206\u6BD4\u6CBF\u7528\u8BA1\u5212\u8FDB\u5EA6", ((_l = sec("\u5199\u4F5C")) == null ? void 0 : _l.percent) === 50, (_m = sec("\u5199\u4F5C")) == null ? void 0 : _m.percent);
+  }
   console.log(failed === 0 ? "\nALL PASSED" : `
 ${failed} FAILED`);
   process.exit(failed === 0 ? 0 : 1);
